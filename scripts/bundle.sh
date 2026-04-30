@@ -9,11 +9,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "=== Bundling Slopsmith Desktop (Linux) ==="
+echo "=== Bundling Slopsmith Desktop ==="
 
 bash "$SCRIPT_DIR/bundle-slopsmith.sh"
-bash "$SCRIPT_DIR/bundle-python.sh"
-bash "$SCRIPT_DIR/bundle-binaries.sh"
+# Skip Python bundling on non-Linux platforms (handled inline in platform scripts)
+if [[ "$(uname -s)" == "Linux" ]]; then
+  bash "$SCRIPT_DIR/bundle-python.sh"
+fi
+# Skip binary bundling on non-Linux platforms (handled inline in platform scripts)
+if [[ "$(uname -s)" == "Linux" ]]; then
+  bash "$SCRIPT_DIR/bundle-binaries.sh"
+fi
 bash "$SCRIPT_DIR/bundle-soundfont.sh"
 
 # Default IRs — small copy step that doesn't need its own script.
@@ -26,4 +32,4 @@ echo ""
 echo "=== Bundle complete ==="
 echo "  Total resources: $(du -sh "$PROJECT_DIR/resources" | cut -f1)"
 echo ""
-echo "Ready for: npm run dist:linux"
+echo "Ready for: npm run dist"
