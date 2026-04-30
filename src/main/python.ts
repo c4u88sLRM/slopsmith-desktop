@@ -194,6 +194,35 @@ export async function startPython(): Promise<void> {
                 pythonEnv.LD_LIBRARY_PATH = pythonLibDir + path.delimiter + (process.env.LD_LIBRARY_PATH || '');
             }
         }
+
+        // Point stdlib SSL at the bundled certifi CA bundle. `requests`
+        // uses certifi automatically, but Slopsmith's own update checker
+        // (and community plugins like slopsmith-update-manager) call
+        // `urllib.request.urlopen`, which falls back to the platform's
+        // system CA bundle and fails inside the AppImage with
+        // `[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer
+        // certificate` when /etc/ssl/certs isn't reachable from the
+        // mount. SSL_CERT_FILE makes stdlib SSL pick certifi too.
+        const certifiPath = process.platform === 'win32'
+            ? path.join(process.resourcesPath, 'python', 'Lib', 'site-packages', 'certifi', 'cacert.pem')
+            : (() => {
+                const libDir = path.join(process.resourcesPath, 'python', 'runtime', 'lib');
+                if (fs.existsSync(libDir)) {
+                    for (const entry of fs.readdirSync(libDir)) {
+                        if (entry.startsWith('python')) {
+                            const p = path.join(libDir, entry, 'site-packages', 'certifi', 'cacert.pem');
+                            if (fs.existsSync(p)) return p;
+                        }
+                    }
+                }
+                return '';
+            })();
+        if (certifiPath && fs.existsSync(certifiPath)) {
+            pythonEnv.SSL_CERT_FILE = certifiPath;
+            pythonEnv.REQUESTS_CA_BUNDLE = certifiPath;
+        } else {
+            console.warn('[python] certifi cacert.pem not found in bundle — HTTPS verification may fail');
+        }
     }
 
     pythonProcess = spawn(pythonPath, [

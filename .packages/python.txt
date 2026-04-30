@@ -9,3 +9,10 @@ Pillow
 midiutil
 python-multipart
 requests
+# `certifi` is a transitive dep of `requests`, but the desktop main
+# process explicitly points SSL_CERT_FILE at certifi's bundle so
+# stdlib urllib (used by Slopsmith's update checker, the
+# slopsmith-update-manager plugin, etc.) can verify HTTPS without
+# falling back to a missing system CA path. Pin it explicitly so
+# changes to requests' deps don't drop it.
+certifi
