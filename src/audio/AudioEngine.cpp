@@ -315,24 +315,38 @@ void AudioEngine::stopAudio()
 bool AudioEngine::loadBackingTrack(const juce::File& file)
 {
     const juce::ScopedLock sl(backingLock);
-    stopBacking();
+    stopBackingNoLock();
     backingTransport.reset();
     backingSource.reset();
 
     auto* reader = formatManager.createReaderFor(file);
-    if (!reader) return false;
+    if (!reader)
+    {
+        // Transport/source already reset above; clear cached state so the renderer
+        // doesn't keep displaying the previous track's position/duration.
+        cachedBackingPosition.store(0.0);
+        cachedBackingDuration.store(0.0);
+        return false;
+    }
 
     backingSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
     backingTransport = std::make_unique<juce::AudioTransportSource>();
     backingTransport->setSource(backingSource.get(), 0, nullptr, reader->sampleRate);
     backingTransport->prepareToPlay(currentBlockSize, currentSampleRate);
+    cachedBackingDuration.store(backingTransport->getLengthInSeconds());
+    cachedBackingPosition.store(0.0);
     return true;
 }
 
 void AudioEngine::setBackingPosition(double seconds)
 {
     const juce::ScopedLock sl(backingLock);
-    if (backingTransport) backingTransport->setPosition(seconds);
+    if (backingTransport)
+    {
+        backingTransport->setPosition(seconds);
+        // Read back the actual position; the transport may clamp (e.g. negative or past EOF).
+        cachedBackingPosition.store(backingTransport->getCurrentPosition());
+    }
 }
 
 void AudioEngine::startBacking()
@@ -345,9 +359,8 @@ void AudioEngine::startBacking()
     }
 }
 
-void AudioEngine::stopBacking()
+void AudioEngine::stopBackingNoLock()
 {
-    const juce::ScopedLock sl(backingLock);
     if (backingTransport)
     {
         backingTransport->stop();
@@ -355,11 +368,10 @@ void AudioEngine::stopBacking()
     }
 }
 
-double AudioEngine::getBackingPosition() const
+void AudioEngine::stopBacking()
 {
-    if (backingTransport)
-        return backingTransport->getCurrentPosition();
-    return 0.0;
+    const juce::ScopedLock sl(backingLock);
+    stopBackingNoLock();
 }
 
 void AudioEngine::resetPeaks()
@@ -453,6 +465,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             backingBuffer.clear();
             juce::AudioSourceChannelInfo info(&backingBuffer, 0, numSamples);
             backingTransport->getNextAudioBlock(info);
+
+            // Keep cached position and playing state up to date for lock-free polling.
+            // backingTransport is non-null (checked above) and backingLock is held for
+            // this entire block via ScopedTryLock, so these reads are safe.
+            cachedBackingPosition.store(backingTransport->getCurrentPosition());
+
+            // Sync the flag if transport stopped at EOF
+            if (!backingTransport->isPlaying())
+                backingPlaying.store(false);
 
             float bVol = backingVolume.load();
             for (int ch = 0; ch < numOutputChannels; ++ch)

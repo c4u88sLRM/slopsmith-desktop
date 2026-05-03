@@ -62,8 +62,10 @@ public:
     void setBackingPosition(double seconds);
     void startBacking();
     void stopBacking();
+    // Non-blocking reads — do not acquire backingLock and never block the audio callback
     bool isBackingPlaying() const { return backingPlaying.load(); }
-    double getBackingPosition() const;
+    double getBackingPosition() const { return cachedBackingPosition.load(); }
+    double getBackingDuration() const { return cachedBackingDuration.load(); }
 
     // Metering (read from any thread — atomic)
     float getInputLevel() const { return currentInputLevel.load(); }
@@ -84,6 +86,7 @@ private:
                                           const juce::AudioIODeviceCallbackContext& context) override;
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
     void audioDeviceStopped() override;
+    void stopBackingNoLock(); // stop transport without acquiring backingLock (caller holds it)
 
     juce::AudioDeviceManager deviceManager;
     SignalChain signalChain;
@@ -105,6 +108,8 @@ private:
     std::unique_ptr<juce::AudioTransportSource> backingTransport;
     juce::AudioBuffer<float> backingBuffer;
     std::atomic<bool> backingPlaying{false};
+    std::atomic<double> cachedBackingPosition{0.0};
+    std::atomic<double> cachedBackingDuration{0.0};
     juce::CriticalSection backingLock;
 
     bool audioRunning = false;
