@@ -113,13 +113,10 @@ clone_slopsmith() {
 	cd "$clone_dir/plugins"
 	local plugins=(
 		# byrongamatos plugins
-		byrongamatos/slopsmith-plugin-3dhighway
-		byrongamatos/slopsmith-plugin-cf
 		byrongamatos/slopsmith-plugin-drums
 		byrongamatos/slopsmith-plugin-editor
 		byrongamatos/slopsmith-plugin-fretboard
 		byrongamatos/slopsmith-plugin-lyrics-karaoke
-		byrongamatos/slopsmith-plugin-lyrics-sync
 		byrongamatos/slopsmith-plugin-metronome
 		byrongamatos/slopsmith-plugin-midi
 		byrongamatos/slopsmith-plugin-multiplayer
@@ -137,11 +134,8 @@ clone_slopsmith() {
 		byrongamatos/slopsmith-plugin-tones
 		# Community plugins
 		alleexx/slopsmith-plugin-transpose-chords
-		jweibel22/slopsmith-plugin-rs-2d-highway
 		masc0t/slopsmith-plugin-find-more
 		masc0t/slopsmith-plugin-invert-highway
-		masc0t/slopsmith-plugin-midi-capo
-		masc0t/slopsmith-plugin-rooms
 		masc0t/slopsmith-plugin-the-daily
 		masc0t/slopsmith-plugin-themes
 		byrongamatos/slopsmith-plugin-update-manager:update_manager

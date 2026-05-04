@@ -49,6 +49,7 @@ mkdir -p "$BUNDLE_DIR/static" "$BUNDLE_DIR/plugins"
 
 # Server + lib
 cp "$SLOPSMITH_DIR/server.py" "$BUNDLE_DIR/"
+cp "$SLOPSMITH_DIR/VERSION" "$BUNDLE_DIR/"
 cp -r "$SLOPSMITH_DIR/lib" "$BUNDLE_DIR/"
 rm -rf "$BUNDLE_DIR/lib/__pycache__"
 
