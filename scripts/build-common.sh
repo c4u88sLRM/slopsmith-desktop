@@ -308,6 +308,21 @@ verify_bundled_binaries() {
     exit 1
   fi
   echo "  ✓ ffmpeg"
+
+  # Verify ffprobe: demucs spawns it before ffmpeg to read stream
+  # metadata. Required on every platform because falling through to a
+  # host-installed ffprobe makes stem splitting work on the build host
+  # and silently fail on user machines without it.
+  local ffp_path="$bin_dir/ffprobe${ext}"
+  if [[ ! -f "$ffp_path" ]]; then
+    echo_error "Missing bundled binary: $ffp_path"
+    exit 1
+  fi
+  if ! "$ffp_path" -version >/dev/null 2>&1; then
+    echo_error "Binary ffprobe failed to execute"
+    exit 1
+  fi
+  echo "  ✓ ffprobe"
   
   # Verify vgmstream-cli: doesn't have --version, check it produces output with version
   local vgm_path="$bin_dir/vgmstream-cli${ext}"
