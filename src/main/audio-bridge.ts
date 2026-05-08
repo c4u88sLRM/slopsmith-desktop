@@ -74,6 +74,17 @@ export function initAudioBridge(mainWindow: BrowserWindow | null): void {
         return audio?.getBufferSizes() ?? [];
     });
 
+    ipcMain.handle('audio:probeDeviceOptions', (_event, typeName: string, input: string, output: string) => {
+        return audio?.probeDeviceOptions(typeName, input, output) ?? {
+            type: String(typeName || ''),
+            input: String(input || ''),
+            output: String(output || ''),
+            sampleRates: [],
+            bufferSizes: [],
+            error: 'Native audio addon not available',
+        };
+    });
+
     ipcMain.handle('audio:getCurrentDevice', () => {
         return audio?.getCurrentDevice() ?? null;
     });
