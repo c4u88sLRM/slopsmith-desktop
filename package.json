@@ -90,7 +90,13 @@
       "target": [
         "nsis"
       ],
-      "icon": "resources/icons/icon.ico"
+      "icon": "resources/icons/icon.ico",
+      "files": [
+        "build/Release/slopsmith-vst-host.exe"
+      ],
+      "asarUnpack": [
+        "build/Release/slopsmith-vst-host.exe"
+      ]
     },
     "nsis": {
       "oneClick": false,

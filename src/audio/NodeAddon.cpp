@@ -10,8 +10,10 @@
 
 #include "AudioEngine.h"
 #include "VSTHost.h"
+#include "VSTTrace.h"
 #include "NAMProcessor.h"
 #include "IRLoader.h"
+#include "Sandbox/SandboxedProcessor.h"
 
 #include <juce_events/juce_events.h>
 
@@ -19,6 +21,7 @@ static std::unique_ptr<AudioEngine> engine;
 static std::unique_ptr<VSTHost> vstHost;
 static std::thread juceMessageThread;
 static std::atomic<bool> juceRunning{false};
+static std::atomic<bool> alreadyShutDown{false};
 
 // ── JUCE Message Thread ───────────────────────────────────────────────────────
 // JUCE requires a message thread for plugin loading, audio device management, etc.
@@ -76,12 +79,16 @@ static void dispatchOnMessageThread(Func&& func)
     // the one capability we give up until a proper libuv-based pump lands.
     func();
 #else
-    juce::WaitableEvent done;
-    juce::MessageManager::callAsync([&]() {
+    // Heap-allocate the WaitableEvent and capture by value so the queued
+    // callAsync closure can outlive this stack frame. Without this, a 15 s
+    // timeout (rare, but possible during shutdown when the message thread is
+    // busy) leaves the lambda running on freed `done` storage — a real UAF.
+    auto done = std::make_shared<juce::WaitableEvent>();
+    juce::MessageManager::callAsync([func = std::forward<Func>(func), done]() mutable {
         func();
-        done.signal();
+        done->signal();
     });
-    done.wait(15000);
+    done->wait(15000);
 #endif
 }
 
@@ -90,6 +97,11 @@ static void dispatchOnMessageThread(Func&& func)
 static Napi::Value Init(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
+
+    // Reset the shutdown latch so a JS-level init→shutdown→init cycle (e.g.
+    // a test harness recreating the engine) actually runs shutdown again
+    // instead of treating it as already-done.
+    alreadyShutDown.store(false, std::memory_order_release);
 
     // Start JUCE message thread first (no-op on macOS — see startJuceMessageThread)
     startJuceMessageThread();
@@ -116,14 +128,39 @@ static Napi::Value Init(const Napi::CallbackInfo& info)
     return env.Undefined();
 }
 
-static Napi::Value Shutdown(const Napi::CallbackInfo& info)
+static void doShutdown()
 {
-    dispatchOnMessageThread([]() {
-        if (engine) { engine->stopAudio(); engine.reset(); }
-        vstHost.reset();
-    });
+    // The latch is flipped at the TOP rather than the bottom so a
+    // re-entrant call (e.g. env-cleanup-hook firing while a JS-level
+    // shutdown is mid-flight) bails immediately rather than racing on
+    // the same teardown sequence. Assumed serialisation invariants:
+    //   - dispatchOnMessageThread is single-writer to engine/vstHost
+    //     (both unique_ptrs touched only here or from Init);
+    //   - stopJuceMessageThread is idempotent and safe to call when the
+    //     thread was never started (defensive checks inside).
+    // If a future caller mutates engine/vstHost between this latch and
+    // the dispatch (or the dispatch's 15s wait times out), THIS call's
+    // body may not finish before returning — but the re-entrant
+    // cleanup-hook will then no-op via the latch and the dispatch
+    // queue itself unwinds whatever's pending. Net result: at-most-
+    // once execution of the gated body, even under teardown races.
+    bool expected = false;
+    if (!alreadyShutDown.compare_exchange_strong(expected, true)) return;
+
+    if (juceRunning.load() || engine || vstHost)
+    {
+        dispatchOnMessageThread([]() {
+            if (engine) { engine->stopAudio(); engine.reset(); }
+            vstHost.reset();
+        });
+    }
 
     stopJuceMessageThread();
+}
+
+static Napi::Value Shutdown(const Napi::CallbackInfo& info)
+{
+    doShutdown();
     return info.Env().Undefined();
 }
 
@@ -780,22 +817,86 @@ static Napi::Value LoadVST(const Napi::CallbackInfo& info)
     int slotId = -1;
 
     juce::String error;
-    std::unique_ptr<juce::AudioPluginInstance> instance;
+    std::unique_ptr<juce::AudioProcessor> processor;
     auto sr = engine->getCurrentSampleRate();
     auto bs = engine->getCurrentBlockSize();
-    // Instantiate on the JUCE message thread so the plugin's GUI/COM state is
-    // bound to the same thread that will later call createEditor(). On Windows
-    // a mismatch causes an access violation inside the plugin's editor code
-    // (COM apartment-threaded objects accessed from the wrong apartment).
-    dispatchOnMessageThread([&]() {
-        instance = vstHost->loadPlugin(juce::String(pluginPath), sr, bs, error);
-    });
+    VST_TRACE("LoadVST: path='%s' sr=%.0f bs=%d", pluginPath.c_str(), sr, bs);
 
-    if (instance)
+    // 1) Try the out-of-process sandbox path for plugins on the denylist.
+    //    This is a no-op on macOS/Linux until those sandbox PRs land — the
+    //    stub factory returns nullptr and we fall through.
+    bool sandboxRequired = false;
+    juce::String sandboxErr;
     {
-        auto name = instance->getName();
+        juce::PluginDescription probeDesc;
+        probeDesc.fileOrIdentifier = juce::String(pluginPath);
+        // We haven't scanned the plugin yet, so manufacturer/UID matching
+        // isn't available. shouldSandbox() inspects fileOrIdentifier and
+        // falls back to a filename heuristic for the NI denylist (Guitar
+        // Rig / Massive / Kontakt / …). `name` here is synthesised from
+        // the path: it's NOT what shouldSandbox checks today, but it
+        // does flow through `tryLoadSandboxed` into the spawn config's
+        // pluginName (used for diagnostic logging). Once the post-scan
+        // path lands and we have a real PluginDescription with the
+        // plugin's reported name, this synthetic value goes away.
+        probeDesc.name = juce::File(juce::String(pluginPath)).getFileNameWithoutExtension();
+        if (slopsmith::sandbox::shouldSandbox(probeDesc))
+        {
+            sandboxRequired = true;
+            processor = slopsmith::sandbox::tryLoadSandboxed(
+                probeDesc, sr, bs, sandboxErr);
+            if (!processor)
+                VST_TRACE("LoadVST: sandbox path declined/failed: %s",
+                          sandboxErr.toRawUTF8());
+        }
+    }
+
+    // 2) If the plugin is on the denylist, sandboxing is *required* — falling
+    //    back to in-process is what crashed the addon to begin with (the
+    //    motivation for the denylist). Surface the failure to the caller.
+    if (sandboxRequired && !processor)
+    {
+        error = "sandbox load failed: "
+              + (sandboxErr.isEmpty() ? juce::String("unknown error") : sandboxErr);
+        // Mirror the in-process load's stderr format so a JS test harness or
+        // Electron renderer sees the same diagnostics regardless of path.
+        fprintf(stderr, "[LoadVST] Failed: %s\n", error.toRawUTF8());
+        // Throw a Napi::Error so the JS caller gets the actual sandbox-spawn
+        // diagnostic instead of an opaque -1. Renderers must `try/catch
+        // addon.loadVST(...)` to handle this path — `ThrowAsJavaScriptException`
+        // marks the napi call as having thrown, so JS sees a thrown exception
+        // and the numeric return value below is discarded by the binding
+        // layer (callers cannot observe both an exception AND a `-1`
+        // return; if a caller doesn't catch, the exception propagates
+        // uncaught). The Napi::Number::New is kept only to satisfy the
+        // function signature.
+        // Invariant: this `return` MUST happen before any
+        // engine->getSignalChain() mutation. The throw above marks the
+        // napi call as having thrown; if a future edit adds work between
+        // the sandbox decision and this return, that work could partially
+        // mutate the signal chain while JS sees an exception — leaving
+        // a dangling slot that no one will clean up.
+        Napi::Error::New(env, error.toStdString())
+            .ThrowAsJavaScriptException();
+        return Napi::Number::New(env, -1);
+    }
+
+    // 3) Otherwise: in-process JUCE load (today's path). Instantiate on the
+    //    JUCE message thread for the COM-apartment reason documented above.
+    if (!processor)
+    {
+        std::unique_ptr<juce::AudioPluginInstance> instance;
+        dispatchOnMessageThread([&]() {
+            instance = vstHost->loadPlugin(juce::String(pluginPath), sr, bs, error);
+        });
+        processor = std::move(instance);
+    }
+
+    if (processor)
+    {
+        auto name = processor->getName();
         slotId = engine->getSignalChain().addProcessor(
-            std::move(instance),
+            std::move(processor),
             ProcessorSlot::Type::VST,
             name,
             juce::String(pluginPath));
@@ -1436,6 +1537,11 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     exports.Set("savePreset", Napi::Function::New(env, SavePreset));
     exports.Set("loadPreset", Napi::Function::New(env, LoadPreset));
     exports.Set("setMultiBypass", Napi::Function::New(env, SetMultiBypass));
+
+    // Drain JUCE message thread + sandbox subprocesses before DLL unload, so a
+    // JS process exit without an explicit addon.shutdown() doesn't crash in
+    // static destructors.
+    napi_add_env_cleanup_hook(env, [](void*) { doShutdown(); }, nullptr);
 
     return exports;
 }
