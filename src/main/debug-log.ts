@@ -1,10 +1,11 @@
 // Debug logging — opt-in diagnostic capture for bug reports.
 //
 // Enabled by the SLOPSMITH_DEBUG env var or a --verbose / --debug CLI flag.
-// When on, console.* output is routed to stderr and the native addon
-// freopen's stderr to <logs>/slopsmith-debug.log (see audio-bridge.ts), so a
-// single file captures the Electron main process, the native [AudioEngine]
-// diagnostics, and (forwarded as [python] lines) the Python subprocess.
+// When on, console.* output is teed into <logs>/slopsmith-debug.log, and the
+// native addon redirects its stderr into the same file (see audio-bridge.ts /
+// NodeAddon enableFileLogging), so one file captures the Electron main
+// process, the native [AudioEngine] diagnostics, and (forwarded as [python]
+// lines) the Python subprocess.
 
 import { app } from 'electron';
 import * as fs from 'fs';
@@ -31,14 +32,13 @@ export function getDebugLogPath(): string {
     return logFilePath;
 }
 
-// Truncate the log with a fresh header and route console.log/info/debug to
-// stderr (console.warn/error already write there). Once the native addon
-// freopen's stderr to this file, everything funnels into it through one fd.
+// Truncate the log with a fresh header and tee every console.* call into it
+// via fs.appendFileSync. Writing directly to the file (rather than relying on
+// the native stderr redirect) captures the JS-side logs from the moment this
+// runs — the startup banner and early Python output, before the addon is even
+// loaded. The addon separately redirects native stderr into the same file
+// (enableFileLogging) for the [AudioEngine] diagnostics.
 // Returns the log path when debug mode is on, otherwise null.
-//
-// The handful of lines logged before the addon loads land on the real fd 2
-// (a terminal in dev, nowhere on a packaged Windows build) — the audio
-// diagnostics this exists to capture all happen after the addon is up.
 export function initDebugLogging(): string | null {
     if (!isDebugEnabled()) return null;
 
@@ -51,12 +51,21 @@ export function initDebugLogging(): string | null {
         return null;
     }
 
-    const toStderr = (...args: unknown[]) => {
-        process.stderr.write(util.format(...args) + '\n');
+    // Debug mode → console.* goes to the file the tester sends, not a console
+    // a packaged build doesn't have. A transient write failure is swallowed
+    // so logging can never take the app down.
+    const writeLine = (...args: unknown[]) => {
+        try {
+            fs.appendFileSync(file, util.format(...args) + '\n');
+        } catch {
+            /* ignore log-write failures */
+        }
     };
-    console.log = toStderr;
-    console.info = toStderr;
-    console.debug = toStderr;
+    console.log = writeLine;
+    console.info = writeLine;
+    console.debug = writeLine;
+    console.warn = writeLine;
+    console.error = writeLine;
 
     return file;
 }

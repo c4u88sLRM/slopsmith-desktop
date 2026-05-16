@@ -18,7 +18,7 @@ crashReporter.start({
 import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus } from './python';
 import { IPC_STARTUP_STATUS, IPC_STARTUP_GET_STATUS, IPC_STARTUP_REQUEST_STATUS } from './ipc-channels';
 import { initAudioBridge, shutdownAudio } from './audio-bridge';
-import { initDebugLogging } from './debug-log';
+import { initDebugLogging, isDebugEnabled } from './debug-log';
 import { initPluginManager } from './plugin-manager';
 import { initSoundfontManager } from './soundfont-manager';
 
@@ -438,13 +438,16 @@ function installRendererPermissions(rendererPort: number): void {
 }
 
 async function startup(): Promise<void> {
-    // Debug logging first so everything below is captured. When on, also flip
-    // SLOPSMITH_SANDBOX_DEBUG so the addon's VST_TRACE diagnostics turn on —
-    // the addon caches that env var on first read, so it must be set before
+    // Debug logging first so everything below is captured. SLOPSMITH_SANDBOX_DEBUG
+    // gates the addon's VST_TRACE — flip it whenever debug is *requested*, even
+    // if the log file couldn't be opened, so addon tracing isn't silently lost.
+    // The addon caches the var on first read, so it must be set before
     // initAudioBridge() loads the .node.
     const debugLogPath = initDebugLogging();
-    if (debugLogPath) {
+    if (isDebugEnabled()) {
         process.env.SLOPSMITH_SANDBOX_DEBUG = '1';
+    }
+    if (debugLogPath) {
         console.log(`[main] Debug logging enabled → ${debugLogPath}`);
     }
 
