@@ -1,7 +1,7 @@
 // Debug logging — opt-in diagnostic capture for bug reports.
 //
 // Enabled by the SLOPSMITH_DEBUG env var or a --verbose / --debug CLI flag.
-// When on, console.* output is teed into <logs>/slopsmith-debug.log, and the
+// When on, console.* output is routed to <logs>/slopsmith-debug.log, and the
 // native addon redirects its stderr into the same file (see audio-bridge.ts /
 // NodeAddon enableFileLogging), so one file captures the Electron main
 // process, the native [AudioEngine] diagnostics, and (forwarded as [python]
@@ -32,7 +32,7 @@ export function getDebugLogPath(): string {
     return logFilePath;
 }
 
-// Truncate the log with a fresh header and tee every console.* call into it
+// Truncate the log with a fresh header and route every console.* call into it
 // via fs.appendFileSync. Writing directly to the file (rather than relying on
 // the native stderr redirect) captures the JS-side logs from the moment this
 // runs — the startup banner and early Python output, before the addon is even
@@ -51,9 +51,12 @@ export function initDebugLogging(): string | null {
         return null;
     }
 
-    // Debug mode → console.* goes to the file the tester sends, not a console
-    // a packaged build doesn't have. A transient write failure is swallowed
-    // so logging can never take the app down.
+    // Debug mode → console.* is routed to the log file only, NOT also tee'd to
+    // the original console. Deliberate: enableFileLogging dup2's fd 2 onto this
+    // same file, so letting console.error/warn also reach their original
+    // stderr would write those lines into the file twice. A packaged build has
+    // no console anyway; a dev who wants live output can tail the file. A
+    // transient write failure is swallowed so logging can't take the app down.
     const writeLine = (...args: unknown[]) => {
         try {
             fs.appendFileSync(file, util.format(...args) + '\n');
