@@ -1096,19 +1096,115 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     window._aeLoadDefaultPreset = loadDefaultPreset;
     window._aeReplaceChainWithPresetBlob = replaceChainWithPresetBlob;
 
+    /** True when the song has tone-switching configured — a resolvable
+     *  global / per-song bypass mapping, or Tone Automation with a resolvable
+     *  `idle` target — that will actually rebuild the FX chain by loading
+     *  processors. MIDI-PC mappings are deliberately NOT a rebuild trigger:
+     *  they only send program changes to an existing VST slot and load no
+     *  processors. When this returns false, song start must NOT clear the FX
+     *  chain — there is nothing to rebuild in its place, and a hand-built
+     *  chain (e.g. a VST loaded in the Audio Engine panel) would be
+     *  destroyed, leaving the guitar silent. */
+    function songShouldRebuildChain() {
+        try {
+            // A mapping/target only counts when it points at a preset that
+            // still exists: the preset-delete flow scrubs Tone Automation
+            // targets but NOT slopsmith-tone-mappings, so a stale mapping
+            // (e.g. {"solo":"DeletedPreset"}) would otherwise force a clear
+            // that the preload then can't rebuild — back to a silent chain.
+            const presets = getPresets();
+            // A preset counts as resolvable only when it carries a
+            // `nativePreset` blob. That blob is what the no-timeline preload,
+            // manual load, TA's loadPresetByName, and the bypass path's VST
+            // state-restore all consume, and the normal "Save preset" flow
+            // always writes it. A mapping naming a preset with no blob would
+            // pass a bare existence check yet rebuild to nothing, stranding
+            // the chain. `items` is intentionally NOT also required: an
+            // empty-chain preset (blob, items:[]) and a legacy blob-only
+            // preset are both still loadable, and the save flow never
+            // produces an items-only preset.
+            const isLoadablePreset = (p) => !!p && !!p.nativePreset;
+            const hasResolvablePreset = (mappingSet) =>
+                !!mappingSet
+                && typeof mappingSet === 'object'
+                && Object.values(mappingSet).some((name) => {
+                    const presetName = String(name || '').trim();
+                    return !!presetName && isLoadablePreset(presets[presetName]);
+                });
+
+            // Tone Automation, when enabled, takes precedence over manual
+            // tone mappings at playback time (installSwitcherForSong returns
+            // before the manual ToneSwitcher is built). So if TA is enabled
+            // the decision MUST be based on TA targets alone — falling
+            // through to the manual-mapping checks below would clear the
+            // chain on stale global/per-song mappings that TA precedence
+            // then never rebuilds, leaving an empty chain.
+            if (window._aeToneAutomation && window._aeToneAutomation.isEnabled
+                && window._aeToneAutomation.isEnabled()) {
+                const taCfg = (window._aeToneAutomation.getConfig
+                    && window._aeToneAutomation.getConfig()) || {};
+                const taTargets = taCfg.targets || {};
+                // Rebuild only when the `idle` fallback target resolves to an
+                // existing preset. `idle` is what resolveTaPreset() returns
+                // whenever the classifier does not match the current song —
+                // so an `idle` target guarantees TA loads *something* after a
+                // clear. With only unrelated-category targets and no `idle`,
+                // a clear could strand the chain empty, so keep it instead
+                // (a category target still rebuilds on its tone change, just
+                // without the destructive pre-clear).
+                const idleName = String(taTargets.idle || '').trim();
+                return !!idleName && isLoadablePreset(presets[idleName]);
+            }
+            const raw = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}') || {};
+            const key = window._aeGetCurrentSongKey ? window._aeGetCurrentSongKey() : '';
+            // Global / per-song bypass mappings: rebuild only when the
+            // mapping resolves to a loadable preset. Evaluate the MERGED
+            // mapping that playback actually consumes — getToneMappings()
+            // returns {...global, ...songs[key]}, per-song entries overriding
+            // globals — not global and per-song independently. Checking them
+            // separately would pass a resolvable global that is shadowed by a
+            // stale per-song entry for the same key, letting the clear run
+            // while the preload then resolves to the stale preset.
+            const mergedMappings = Object.assign(
+                {}, raw.global || {}, (raw.songs && raw.songs[key]) || {});
+            if (hasResolvablePreset(mergedMappings)) return true;
+            // Note: a slopsmith-tone-mappings midiPC entry is intentionally
+            // NOT a rebuild trigger. A valid MIDI-PC config (mode 'midi' +
+            // vstSlotId >= 0) only sends program changes to an existing VST
+            // slot — no processors are loaded, so a clear would just delete
+            // that slot. An invalid/legacy midiPC entry provides no rebuild
+            // path either: the playback path falls through to bypass
+            // mappings, already covered by the global/per-song checks above.
+        } catch (_) { /* ignore — fall through to false */ }
+        return false;
+    }
+    window._aeSongShouldRebuildChain = songShouldRebuildChain;
+
     /** Clears the native FX chain when a new song starts. Avoid calling getChainState right after
-     *  clearChain — some JUCE bridges crash on that sequence; persist empty chain locally instead. */
+     *  clearChain — some JUCE bridges crash on that sequence; persist empty chain locally instead.
+     *  @returns {Promise<boolean>} true only when the native chain was actually
+     *  cleared. The caller uses this to set window._aeDidClearChainForNewSong —
+     *  which must never be set on a path that preserved the chain, or a later
+     *  preload would treat the preserved chain as already cleared. */
     async function clearChainForNewSong() {
-        if (!api?.clearChain) return;
-        // Keep the dry guitar audible through the empty-chain window that the
-        // preload's rebuild opens; resolveChainRebuildGuard() lifts this once
-        // the chain settles (or leaves it on if the rebuild produced nothing).
+        if (!api?.clearChain) return false;
+        // Don't wipe a hand-built chain when the song has no tone-switching to
+        // replace it with — that would silence the guitar (empty chain + monitor mute).
+        if (!songShouldRebuildChain()) {
+            console.log('[audio-engine] Song has no rebuildable tone-switching — keeping current chain');
+            return false;
+        }
+        // A rebuild is happening: keep the dry guitar audible through the
+        // empty-chain window the preload's rebuild opens. resolveChainRebuildGuard()
+        // lifts this once the chain settles (or leaves it on if the rebuild
+        // produced nothing). Only after the songShouldRebuildChain() gate — the
+        // preserve-chain path above neither clears nor opens a rebuild window.
         if (window._aeBeginChainRebuildGuard) window._aeBeginChainRebuildGuard();
         try {
             await api.clearChain();
         } catch (e) {
             console.warn('[audio-engine] clearChain (native):', e);
-            return;
+            return false;
         }
         try {
             localStorage.setItem('slopsmith-signal-chain', '[]');
@@ -1121,6 +1217,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         if (container) {
             container.innerHTML = '<div class="text-sm text-slate-500 italic">No processors loaded — add a VST, NAM model, or cabinet IR</div>';
         }
+        return true;
     }
     window._aeClearChainForNewSong = clearChainForNewSong;
 
@@ -2770,8 +2867,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         setTimeout(() => {
             if (window._aeClearChainForNewSong) {
                 window._aeClearingChainForNewSong = true;
-                void window._aeClearChainForNewSong().then(() => {
-                    window._aeDidClearChainForNewSong = true;
+                void window._aeClearChainForNewSong().then((cleared) => {
+                    // Only true when the chain was genuinely cleared — the
+                    // skip path (chain preserved) must not set this flag, or
+                    // a later preload would treat the preserved chain as
+                    // already cleared and overlay processors onto it.
+                    window._aeDidClearChainForNewSong = cleared === true;
                 }).catch((e) => {
                     console.warn('[audio-engine] clearChainForNewSong failed:', e);
                 }).finally(() => {
@@ -2836,12 +2937,54 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             // _aeClearingChainForNewSong is set the moment the async clear begins; _aeDidClearChainForNewSong
             // is set on resolution. Checking both prevents a second clearChain racing with a slow first one,
             // which could crash some JUCE bridges. preloadForSong calls clearChain itself anyway.
+            // Also skip when the song has no tone-switching configured —
+            // clearing here would destroy a hand-built chain (e.g. a VST set
+            // up in the Audio Engine panel) with nothing to replace it.
+            const songNeedsRebuild = !window._aeSongShouldRebuildChain
+                || window._aeSongShouldRebuildChain();
             const skipPreflightClear = (midiPreflight?.mode === 'midi' && Number(midiPreflight.vstSlotId) >= 0)
                 || !!window._aeDidClearChainForNewSong
-                || !!window._aeClearingChainForNewSong;
-            // Track whether the chain has been cleared by any path so the bypass preload
-            // below can skip its own clearChain and avoid a redundant second IPC call.
-            let chainClearedForLoad = skipPreflightClear;
+                || !!window._aeClearingChainForNewSong
+                || !songNeedsRebuild;
+            // When the song has no rebuildable tone-switching, skip the
+            // bypass/no-timeline preload — not just the preflight clear.
+            // That path can otherwise fall back to _aeLoadDefaultPreset(
+            // 'tone-none'), which replaces the preserved hand-built chain.
+            // Exemptions — must still run their own install path:
+            //  - MIDI PC mode: talks to an existing VST slot, preload only
+            //    sends program changes (no chain replacement).
+            //  - Tone Automation enabled: installSwitcherForSong must run so
+            //    category-based switching works even when
+            //    songShouldRebuildChain() returned false (e.g. no `idle`
+            //    target). The TA switcher loads presets itself; it does not
+            //    hit the tone-none default-preset fallback below.
+            const isMidiPcPreflight = midiPreflight?.mode === 'midi'
+                && Number(midiPreflight.vstSlotId) >= 0;
+            const taEnabled = window._aeToneAutomation?.isEnabled?.() === true;
+            if (!songNeedsRebuild && !isMidiPcPreflight && !taEnabled) {
+                // Tear down any switcher/monitor left over from a previous
+                // song — mirrors the empty-mapping path in
+                // _applyToneMappingsImpl. Nulling _toneSwitcher alone is not
+                // enough: the tone monitor's 50ms interval would keep calling
+                // the stale switcher against the new song's tone changes.
+                window._toneSwitcher = null;
+                if (window._aeStopToneMonitor) window._aeStopToneMonitor();
+                _preloadedToneCacheKey = null;
+                console.log('[tone-switcher] Song has no rebuildable tone-switching — keeping current chain, skipping preload');
+                return;
+            }
+            // Track whether the chain has actually been cleared, so the bypass
+            // preload below can skip a redundant clearChain. This must mean
+            // "chain is in a cleared state", NOT merely "preflight was
+            // skipped": when skipPreflightClear is true only because the song
+            // has no rebuildable tone-switching (!songNeedsRebuild), nothing
+            // cleared the chain — so a path that still reaches the bypass
+            // preload (e.g. Tone Automation enabled but installSwitcherForSong
+            // fails to install) must do its own clearChain rather than overlay
+            // processors onto the preserved hand-built chain. The genuine
+            // skip reasons (already-cleared / clearing-in-flight) only occur
+            // with songNeedsRebuild true.
+            let chainClearedForLoad = skipPreflightClear && songNeedsRebuild;
             if (!skipPreflightClear) {
                 try {
                     await api.clearChain();
