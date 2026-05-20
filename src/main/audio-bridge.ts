@@ -656,11 +656,16 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:loadPreset', async (_event, presetJson: string) => {
         const result = await audio?.loadPreset(presetJson) ?? { success: false, error: 'No audio' };
-        // loadPreset rebuilds the native chain from scratch, so the cached
-        // slotId→path map no longer reflects it. Clear it — openPluginEditor
-        // then falls back to the live getChainState lookup for these slots
-        // rather than trusting a stale (possibly id-reused) entry.
+        // loadPreset rebuilds the native chain from scratch, destroying every
+        // editor window. Drop ALL per-slot tracking — vstSlotPaths,
+        // openEditors, confirmedEditors, openedAt — and disarm the sentinel.
+        // Otherwise a stale entry for a slot id that now belongs to a
+        // different plugin would misattribute a later crash.
         vstSlotPaths.clear();
+        openEditors.clear();
+        confirmedEditors.clear();
+        openedAt.clear();
+        rearmSentinelForMostRecentEditor();
         return result;
     });
 
