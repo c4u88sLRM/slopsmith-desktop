@@ -182,6 +182,17 @@ export function initAudioBridge(): void {
             if (changed) rearmSentinelForMostRecentEditor();
         }, 3000);
         editorWatcher.unref();
+
+        // Cancel the watcher and any pending downlevel-addon fallback timers
+        // at clean shutdown. The vst-crash-guard's own will-quit handler sets
+        // a shuttingDown flag that already neuters any late arm, but
+        // cancelling the timers here is cheaper and keeps the shutdown
+        // cleaner.
+        app.once('will-quit', () => {
+            clearInterval(editorWatcher);
+            for (const t of noQueryFallbackTimers.values()) clearTimeout(t);
+            noQueryFallbackTimers.clear();
+        });
     }
 
     // Load the Basic Pitch ONNX model for the polyphonic ML note detector.

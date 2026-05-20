@@ -21,6 +21,12 @@ let sentinelPath = '';
 let blocklistPath = '';
 const blocklist = new Set<string>();
 
+// Once will-quit fires the sentinel is intentionally cleared. Any later arm
+// from a still-pending timer / async callback would re-create the file and
+// falsely blocklist the plugin on next launch — gate all writes behind
+// this flag, set by the will-quit handler in initVstCrashGuard.
+let shuttingDown = false;
+
 // Normalise a plugin path for use as a blocklist / armed-path key. Windows
 // paths are case-insensitive, so fold case there to match the addon's
 // case-insensitive lookup. POSIX paths are case-sensitive — lowercasing them
@@ -59,8 +65,13 @@ export function initVstCrashGuard(): string[] {
     // A clean shutdown is, by definition, not a crash. Disarm any sentinel
     // still armed from a still-open editor at quit time so the plugin isn't
     // falsely blocklisted on next launch — only an abrupt termination should
-    // leave a sentinel behind.
-    app.once('will-quit', () => disarmSentinel());
+    // leave a sentinel behind. shuttingDown blocks any later arm from a
+    // still-pending timer / async callback (e.g. the editor watcher rearm
+    // or a downlevel-addon fallback timer) from re-creating the file.
+    app.once('will-quit', () => {
+        shuttingDown = true;
+        disarmSentinel();
+    });
 
     return [...blocklist];
 }
@@ -82,8 +93,11 @@ function clearSentinel(): void {
 // Drop the sentinel just before a risky in-process VST op. A plain
 // writeFileSync is enough: an access violation kills the process but not the
 // OS page cache, so the file survives for the next startup to find.
+//
+// No-op once will-quit has fired, so a late timer/callback can't re-arm
+// after the clean-shutdown disarm.
 export function armSentinel(pluginPath: string, op: 'load' | 'editor'): void {
-    if (!pluginPath || !sentinelPath) return;
+    if (shuttingDown || !pluginPath || !sentinelPath) return;
     try {
         fs.writeFileSync(sentinelPath,
             JSON.stringify({ plugin: pluginPath, op, at: Date.now() }));
@@ -103,9 +117,11 @@ export function disarmSentinel(): void {
 // Arm the sentinel for an editor that's about to open. Unlike a synchronous
 // load, the editor can fault long after open() returns (during user
 // interaction), so the sentinel stays armed until the editor is explicitly
-// closed (disarmSentinelForPath from closePluginEditor / removeProcessor) or
-// the app exits cleanly (disarmSentinel from clearChain / will-quit).
+// closed — audio-bridge's audio:closePluginEditor / audio:removeProcessor
+// (slot match) or audio:clearChain / audio:loadPreset (everything) call
+// disarmSentinel, plus the periodic editor-state watcher and the
+// will-quit handler above.
 export function armEditorSentinel(pluginPath: string): void {
-    if (!pluginPath || !sentinelPath) return;
+    if (shuttingDown || !pluginPath || !sentinelPath) return;
     armSentinel(pluginPath, 'editor');
 }
