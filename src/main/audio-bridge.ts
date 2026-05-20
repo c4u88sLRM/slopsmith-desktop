@@ -153,11 +153,30 @@ export function initAudioBridge(): void {
             if (typeof audio?.isPluginEditorOpen !== 'function') return;
             const now = Date.now();
             let changed = false;
+
+            // Pass 1: prune pending entries past the timeout. No native
+            // call required, so it still runs when the message thread is
+            // stalled (and isPluginEditorOpen would throw below).
             for (const slotId of [...openEditors.keys()]) {
-                let isOpen = false;
+                if (confirmedEditors.has(slotId)) continue;
+                const t0 = openedAt.get(slotId) ?? now;
+                if (now - t0 > PENDING_TIMEOUT_MS) {
+                    openEditors.delete(slotId);
+                    openedAt.delete(slotId);
+                    changed = true;
+                }
+            }
+
+            // Pass 2: query the native side for the remaining slots. On the
+            // first throw, treat it as a global "message thread is stalled"
+            // signal and bail — without this break, a stalled thread would
+            // burn ~1 s per slot (the IsPluginEditorOpen timeout) and stall
+            // the Electron main process.
+            for (const slotId of [...openEditors.keys()]) {
+                let isOpen: boolean;
                 try {
                     isOpen = !!audio.isPluginEditorOpen(slotId);
-                } catch { continue; }
+                } catch { break; }
                 if (isOpen) {
                     confirmedEditors.add(slotId);
                     continue;
@@ -169,15 +188,9 @@ export function initAudioBridge(): void {
                     confirmedEditors.delete(slotId);
                     openedAt.delete(slotId);
                     changed = true;
-                    continue;
                 }
-                // Pending — give createEditor a generous window.
-                const t0 = openedAt.get(slotId) ?? now;
-                if (now - t0 > PENDING_TIMEOUT_MS) {
-                    openEditors.delete(slotId);
-                    openedAt.delete(slotId);
-                    changed = true;
-                }
+                // Else: still pending and within the timeout — leave it
+                // for a later tick (Pass 1 will eventually time it out).
             }
             if (changed) rearmSentinelForMostRecentEditor();
         }, 3000);
@@ -714,6 +727,18 @@ export function initAudioBridge(): void {
 }
 
 export function shutdownAudio(): void {
+    // The addon explicitly supports init→shutdown→init. Reset all per-slot
+    // tracking and clear the on-disk sentinel here — without this, an open
+    // editor at shutdown time would leave its sentinel armed and the next
+    // init would falsely promote that plugin to the crash blocklist.
+    vstSlotPaths.clear();
+    openEditors.clear();
+    confirmedEditors.clear();
+    openedAt.clear();
+    for (const t of noQueryFallbackTimers.values()) clearTimeout(t);
+    noQueryFallbackTimers.clear();
+    disarmSentinel();
+
     if (audio) {
         try {
             audio.shutdown();

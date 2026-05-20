@@ -1439,18 +1439,31 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
 
     int slotId = info[0].As<Napi::Number>().Int32Value();
 
-    // If already open, bring to front
-    auto it = editorWindows.find(slotId);
-    if (it != editorWindows.end() && it->second)
+    // Marshal the "is the editor already open?" probe + stale-entry cleanup
+    // onto the message thread — editorWindows is owned there (mutated by
+    // closeButtonPressed and the createEditor callAsync below), so reading
+    // it from the Node thread would race. shared_ptr result handle keeps
+    // the destination alive if dispatchOnMessageThread times out and the
+    // caller's stack unwinds.
+    auto alreadyOpen = std::make_shared<bool>(false);
+    dispatchOnMessageThread([slotId, alreadyOpen]()
     {
-        if (it->second->isVisible())
+        auto it = editorWindows.find(slotId);
+        if (it != editorWindows.end() && it->second)
         {
-            it->second->toFront(true);
-            return Napi::Boolean::New(env, true);
+            if (it->second->isVisible())
+            {
+                it->second->toFront(true);
+                *alreadyOpen = true;
+            }
+            else
+            {
+                // Window was hidden/closed — remove stale entry.
+                editorWindows.erase(it);
+            }
         }
-        // Window was hidden/closed, remove stale entry
-        editorWindows.erase(it);
-    }
+    });
+    if (*alreadyOpen) return Napi::Boolean::New(env, true);
 
     auto slot = engine->getSignalChain().getSlot(slotId);
     if (!slot || !slot->processor || !slot->processor->hasEditor())
@@ -1487,24 +1500,29 @@ static Napi::Value ClosePluginEditor(const Napi::CallbackInfo& info)
     if (info.Length() < 1) return Napi::Boolean::New(env, false);
 
     int slotId = info[0].As<Napi::Number>().Int32Value();
-    auto it = editorWindows.find(slotId);
-    if (it != editorWindows.end())
+    // Marshal the lookup + erase onto the message thread for the same
+    // reason OpenPluginEditor does. The erase happens synchronously inside
+    // this single callback rather than as a second callAsync hop.
+    auto wasOpen = std::make_shared<bool>(false);
+    dispatchOnMessageThread([slotId, wasOpen]()
     {
-        juce::MessageManager::callAsync([slotId]()
+        auto it = editorWindows.find(slotId);
+        if (it != editorWindows.end())
         {
-            editorWindows.erase(slotId);
-        });
-        return Napi::Boolean::New(env, true);
-    }
-    return Napi::Boolean::New(env, false);
+            *wasOpen = true;
+            editorWindows.erase(it);
+        }
+    });
+    return Napi::Boolean::New(env, *wasOpen);
 }
 
 // Truthful answer to "is this slot's editor window currently on screen?".
-// Used by the renderer's VST crash guard to disarm the editor sentinel when
-// the window vanished without going through audio:closePluginEditor — the
-// user closed it via the OS title-bar X (PluginEditorWindow::closeButtonPressed
-// erases the entry directly), or createEditor returned null inside the async
-// open callback so no PluginEditorWindow was ever created.
+// Used by the main process's VST crash guard (src/main/vst-crash-guard.ts via
+// src/main/audio-bridge.ts) to disarm the editor sentinel when the window
+// vanished without going through audio:closePluginEditor — the user closed
+// it via the OS title-bar X (PluginEditorWindow::closeButtonPressed erases
+// the entry directly), or createEditor returned null inside the async open
+// callback so no PluginEditorWindow was ever created.
 //
 // editorWindows is owned by JUCE's message thread (mutations happen there
 // via callAsync), so the read is marshalled onto it rather than racing the
