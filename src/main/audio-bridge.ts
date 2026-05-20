@@ -18,35 +18,27 @@ let audio: AudioModule | null = null;
 // across moves so a reorder needs no upkeep.
 const vstSlotPaths = new Map<number, string>();
 
-// The slotId whose editor the crash sentinel is currently armed for, if any.
-// Tracked so a periodic watcher can disarm when the editor closes without
-// going through audio:closePluginEditor (e.g. the user clicks the OS title-bar
-// X, or createEditor returned null inside the async open callback so no
-// window was ever shown).
-let armedEditorSlotId: number | null = null;
+// Plugin editors currently believed to be open: slotId → pluginPath. Map
+// insertion order is preserved, so the most-recently-(re)inserted entry is
+// "most recently opened" — that's the editor whose path the crash sentinel
+// is armed for. Multi-editor case: opening B after A puts B on top; if B
+// closes, the sentinel re-arms for A; if A then closes too, sentinel is
+// disarmed. Native windows that vanish outside IPC (OS title-bar X, async
+// createEditor that returned null) are caught by the periodic watcher.
+const openEditors = new Map<number, string>();
 
-// Restore the previous editor arm if a fresh open attempt failed. Called from
-// the audio:openPluginEditor handler's failure paths so a still-open editor
-// on another slot keeps its sentinel rather than being wiped out by an
-// unrelated failing open.
-function restorePreviousEditorArm(prev: number | null): void {
-    // No overwrite happened (the failing open had no pluginPath, so nothing
-    // was armed for this call) — the previous arm is still intact.
-    if (armedEditorSlotId === prev) return;
-
-    // An overwrite did happen. Try to re-arm the previous slot's editor.
-    if (prev !== null) {
-        const prevPath = vstSlotPaths.get(prev);
-        if (prevPath) {
-            armEditorSentinel(prevPath);
-            armedEditorSlotId = prev;
-            return;
-        }
+// Refresh the on-disk sentinel from the current openEditors state. Arms for
+// the most-recent entry, or disarms when no editor is open.
+function rearmSentinelForMostRecentEditor(): void {
+    if (openEditors.size === 0) {
+        disarmSentinel();
+        return;
     }
-    // No previous arm, or we no longer know the previous slot's path — fall
-    // back to a clean disarm rather than leaving a stale sentinel.
-    disarmSentinel();
-    armedEditorSlotId = null;
+    // Map iteration is in insertion order; the last value yielded is the
+    // most-recent (re-)insertion.
+    let mostRecentPath: string | null = null;
+    for (const path of openEditors.values()) mostRecentPath = path;
+    if (mostRecentPath) armEditorSentinel(mostRecentPath);
 }
 
 function loadNativeAddon(): AudioModule | null {
@@ -115,23 +107,26 @@ export function initAudioBridge(): void {
             console.warn(`[audio] VST crash guard init failed: ${e.message}`);
         }
 
-        // Periodic editor-state watcher: if the crash sentinel is armed for
-        // an editor whose window has gone away without going through
-        // audio:closePluginEditor — the OS title-bar X
+        // Periodic editor-state watcher: drop any entry in openEditors whose
+        // window has vanished outside IPC — the OS title-bar X
         // (PluginEditorWindow::closeButtonPressed) and async editor-creation
-        // failure (createEditor returned null inside the open lambda) are
-        // both routes that vanish a window outside IPC — disarm the sentinel
-        // so a later unrelated crash isn't falsely attributed to this plugin.
-        // Unref'd so it never holds the process open on its own.
+        // failure (createEditor returned null inside the open lambda) both
+        // close a window without going through audio:closePluginEditor.
+        // Re-arms the sentinel for whatever's still open, or disarms if
+        // nothing is. Unref'd so it never holds the process open on its own.
         const editorWatcher = setInterval(() => {
-            if (armedEditorSlotId === null) return;
+            if (openEditors.size === 0) return;
             if (typeof audio?.isPluginEditorOpen !== 'function') return;
-            try {
-                if (!audio.isPluginEditorOpen(armedEditorSlotId)) {
-                    disarmSentinel();
-                    armedEditorSlotId = null;
-                }
-            } catch { /* best-effort */ }
+            let changed = false;
+            for (const slotId of [...openEditors.keys()]) {
+                try {
+                    if (!audio.isPluginEditorOpen(slotId)) {
+                        openEditors.delete(slotId);
+                        changed = true;
+                    }
+                } catch { /* best-effort */ }
+            }
+            if (changed) rearmSentinelForMostRecentEditor();
         }, 3000);
         editorWatcher.unref();
     }
@@ -447,13 +442,9 @@ export function initAudioBridge(): void {
     ipcMain.handle('audio:removeProcessor', (_event, slotId: number) => {
         audio?.removeProcessor(slotId);
         vstSlotPaths.delete(slotId);
-        // If the removed slot was the one whose editor armed the sentinel,
-        // its window is gone — disarm. Different slot: leave the sentinel
-        // alone (it belongs to another still-open editor).
-        if (armedEditorSlotId === slotId) {
-            disarmSentinel();
-            armedEditorSlotId = null;
-        }
+        // The slot is gone — any editor it had is destroyed. Drop it from
+        // the open-editors map and rearm for whatever's still open.
+        if (openEditors.delete(slotId)) rearmSentinelForMostRecentEditor();
     });
 
     ipcMain.handle('audio:moveProcessor', (_event, from: number, to: number) => {
@@ -467,10 +458,10 @@ export function initAudioBridge(): void {
     ipcMain.handle('audio:clearChain', () => {
         audio?.clearChain();
         vstSlotPaths.clear();
-        // Every editor window is destroyed by clearChain — no plugin's
-        // identity needs preserving, so disarm any sentinel.
-        disarmSentinel();
-        armedEditorSlotId = null;
+        // Every editor window is destroyed — drop all open-editor entries
+        // and disarm the sentinel.
+        openEditors.clear();
+        rearmSentinelForMostRecentEditor();
     });
 
     ipcMain.handle('audio:getChainState', () => {
@@ -494,42 +485,33 @@ export function initAudioBridge(): void {
             const slot = (audio?.getChainState() ?? []).find((s: any) => s?.id === slotId);
             if (slot && typeof slot.path === 'string') pluginPath = slot.path;
         }
-        // Snapshot the currently-armed slot so a failed open can restore it
-        // — not wipe protection for an already-open editor on another slot.
-        const prevArmedSlotId = armedEditorSlotId;
-        if (pluginPath) {
-            armEditorSentinel(pluginPath);
-            armedEditorSlotId = slotId;
-        }
         let opened = false;
         try {
             opened = audio?.openPluginEditor(slotId) ?? false;
         } catch (e) {
-            // A thrown call is a clean failure, not a hard crash. Restore
-            // the previous arm rather than disarming outright.
-            restorePreviousEditorArm(prevArmedSlotId);
+            // A thrown call is a clean failure, not a hard crash — and we
+            // haven't touched openEditors yet, so any other open editors
+            // keep their sentinel intact. Just propagate.
             throw e;
         }
-        // A synchronous false means no editor window was created (the plugin
-        // has none, or the open failed cleanly) — nothing can fault, so
-        // restore the previous arm. On a true return the sentinel stays
-        // armed for the editor's lifetime so a late crash gets attributed;
-        // the periodic editor-state watcher below disarms it if the editor
-        // goes away without an audio:closePluginEditor call.
-        if (!opened) restorePreviousEditorArm(prevArmedSlotId);
+        // Only record on success. On a synchronous false (no editor / clean
+        // failure) the openEditors map is unchanged, so a still-open editor
+        // on another slot keeps its arm. On true: re-insert moves this slot
+        // to the most-recent position; the sentinel re-arms for it.
+        if (opened && pluginPath) {
+            openEditors.delete(slotId);
+            openEditors.set(slotId, pluginPath);
+            rearmSentinelForMostRecentEditor();
+        }
         return opened;
     });
 
     ipcMain.handle('audio:closePluginEditor', (_event, slotId: number) => {
         const result = audio?.closePluginEditor(slotId) ?? false;
-        // The editor window is gone. Only disarm if this slot was the one
-        // currently armed — closing a different slot's editor must not wipe
-        // an unrelated still-open editor's sentinel (same plugin in two
-        // slots is the motivating case).
-        if (armedEditorSlotId === slotId) {
-            disarmSentinel();
-            armedEditorSlotId = null;
-        }
+        // The editor window is gone. Drop this slot from the open-editors
+        // map and rearm for whatever's still open — closing one editor must
+        // not wipe a still-open editor on a different slot.
+        if (openEditors.delete(slotId)) rearmSentinelForMostRecentEditor();
         return result;
     });
 
