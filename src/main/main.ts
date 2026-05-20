@@ -278,13 +278,58 @@ function createWindow(port: number): void {
         console.warn(`[main] Blocked subframe navigation to non-renderer origin: ${navUrl}`);
     });
 
-    // Open external links in system browser. Same scheme gate as
-    // will-navigate above — a `target=_blank` or `window.open` from the
-    // renderer page can supply any string, so don't pass it to
-    // shell.openExternal blindly.
-    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    // window.open() routing:
+    //
+    // - Same renderer-origin URLs → allow as an Electron BrowserWindow
+    //   that mirrors the main window's webPreferences (same preload,
+    //   same isolation, same webSecurity: false). Plugin pop-outs like
+    //   splitscreen rely on this so the popup shares the renderer's
+    //   BroadcastChannel scope and preload-exposed IPC. Without it,
+    //   `action: 'deny'` returns null to window.open() (which the
+    //   plugin reads as "popup blocked") AND the URL leaks to the
+    //   system browser via openWebUrlExternally, where BroadcastChannel
+    //   can't reach across Chromium instances.
+    //
+    // - Off-origin URLs → route to the system browser. Same scheme
+    //   gate as will-navigate above (openWebUrlExternally restricts to
+    //   http/https) since a target=_blank or stray window.open from a
+    //   plugin can supply any string.
+    const popupOverrideOptions: Electron.BrowserWindowConstructorOptions = {
+        backgroundColor: '#0f172a',
+        webPreferences: {
+            preload: path.join(__dirname, 'preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: false,
+            webSecurity: false,
+        },
+    };
+    const rendererWindowOpenHandler = ({ url }: { url: string }) => {
+        if (isRendererOrigin(url)) {
+            return { action: 'allow' as const, overrideBrowserWindowOptions: popupOverrideOptions };
+        }
         openWebUrlExternally(url);
-        return { action: 'deny' };
+        return { action: 'deny' as const };
+    };
+    mainWindow.webContents.setWindowOpenHandler(rendererWindowOpenHandler);
+
+    // Apply the same off-origin navigation guards + window-open policy
+    // to any popup the renderer opens. Otherwise a popup could be told
+    // to navigate off-origin (or spawn another window.open), and the
+    // preload-IPC surface installed via popupOverrideOptions would
+    // follow along to the new page.
+    mainWindow.webContents.on('did-create-window', (popupWin) => {
+        const wc = popupWin.webContents;
+        wc.on('will-navigate', blockOffOriginTopLevel('popup in-window navigation'));
+        wc.on('will-redirect', blockOffOriginTopLevel('popup cross-origin redirect'));
+        wc.on('will-frame-navigate', (details) => {
+            if (details.isMainFrame) return;
+            const navUrl = details.url;
+            if (isRendererOrigin(navUrl)) return;
+            details.preventDefault();
+            console.warn(`[main] Blocked popup subframe navigation to non-renderer origin: ${navUrl}`);
+        });
+        wc.setWindowOpenHandler(rendererWindowOpenHandler);
     });
 
     mainWindow.on('closed', () => {
