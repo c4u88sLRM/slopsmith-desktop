@@ -6,7 +6,7 @@ import { ipcMain } from 'electron';
 import * as path from 'path';
 import { app } from 'electron';
 import { isDebugEnabled, getDebugLogPath } from './debug-log';
-import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel } from './vst-crash-guard';
+import { initVstCrashGuard, armSentinel, disarmSentinel, disarmSentinelForPath, armEditorSentinel } from './vst-crash-guard';
 
 type AudioModule = Record<string, (...args: any[]) => any>;
 
@@ -394,8 +394,16 @@ export function initAudioBridge(): void {
     });
 
     ipcMain.handle('audio:removeProcessor', (_event, slotId: number) => {
+        // Look up the slot's plugin path BEFORE removing it; the addon
+        // destroys the slot so getChainState afterwards can't resolve it.
+        // If the removed slot's editor was the one armed in the crash
+        // sentinel, disarm — its window is gone, it can't fault anymore.
+        const pluginPath = vstSlotPaths.get(slotId)
+            ?? (audio?.getChainState() ?? []).find((s: any) => s?.id === slotId)?.path;
         audio?.removeProcessor(slotId);
         vstSlotPaths.delete(slotId);
+        if (typeof pluginPath === 'string' && pluginPath)
+            disarmSentinelForPath(pluginPath);
     });
 
     ipcMain.handle('audio:moveProcessor', (_event, from: number, to: number) => {
@@ -409,6 +417,9 @@ export function initAudioBridge(): void {
     ipcMain.handle('audio:clearChain', () => {
         audio?.clearChain();
         vstSlotPaths.clear();
+        // Every editor window is destroyed by clearChain — no plugin's
+        // identity needs preserving, so disarm any sentinel.
+        disarmSentinel();
     });
 
     ipcMain.handle('audio:getChainState', () => {
@@ -418,13 +429,15 @@ export function initAudioBridge(): void {
     // ── Plugin Editor ──────────────────────────────────────────────────────
 
     ipcMain.handle('audio:openPluginEditor', (_event, slotId: number) => {
-        // Editor creation is the common in-process fault point (an editor
-        // that must run on the OS main thread). Arm the sentinel with the
-        // slot's plugin path before opening; armEditorSentinel self-clears
-        // after a grace window since editor creation is asynchronous and has
-        // no synchronous success signal. The path comes from the loadVST map
-        // first; getChainState is only a fallback for slots created another
-        // way (e.g. preset restore).
+        // Editor creation AND any later editor message dispatch is a fault
+        // point (plugins whose editor needs the OS main thread, e.g.
+        // AmpliTube, can crash long after open returns — observed at
+        // ~95 s mid-interaction). Arm the sentinel with the slot's plugin
+        // path and keep it armed for the editor's lifetime; the sentinel is
+        // cleared by closePluginEditor / removeProcessor (same slot) or by
+        // clearChain / will-quit. The path comes from the loadVST map first;
+        // getChainState is only a fallback for slots created another way
+        // (e.g. preset restore).
         let pluginPath = vstSlotPaths.get(slotId);
         if (!pluginPath) {
             const slot = (audio?.getChainState() ?? []).find((s: any) => s?.id === slotId);
@@ -437,20 +450,26 @@ export function initAudioBridge(): void {
         } catch (e) {
             // A thrown call is a clean failure, not a hard crash — disarm so
             // the plugin isn't falsely blocklisted on next startup.
-            disarmSentinel();
+            if (pluginPath) disarmSentinelForPath(pluginPath);
             throw e;
         }
         // A synchronous false means no editor window was created (the plugin
-        // has none, or the open failed cleanly) — nothing can fault, so clear
-        // the sentinel now instead of waiting out the grace window. On a
-        // true return the sentinel stays armed: the editor is created
-        // asynchronously and could still fault within the grace window.
-        if (!opened) disarmSentinel();
+        // has none, or the open failed cleanly) — nothing can fault, so
+        // clear the sentinel now. On a true return the sentinel stays armed
+        // for the editor's lifetime so a late crash gets attributed.
+        if (!opened && pluginPath) disarmSentinelForPath(pluginPath);
         return opened;
     });
 
     ipcMain.handle('audio:closePluginEditor', (_event, slotId: number) => {
-        return audio?.closePluginEditor(slotId) ?? false;
+        const pluginPath = vstSlotPaths.get(slotId)
+            ?? (audio?.getChainState() ?? []).find((s: any) => s?.id === slotId)?.path;
+        const result = audio?.closePluginEditor(slotId) ?? false;
+        // The editor window is gone — there's nothing left to fault, so
+        // disarm any sentinel armed for this slot's plugin.
+        if (typeof pluginPath === 'string' && pluginPath)
+            disarmSentinelForPath(pluginPath);
+        return result;
     });
 
     // ── Parameters ─────────────────────────────────────────────────────────
