@@ -6,7 +6,7 @@ import { ipcMain } from 'electron';
 import * as path from 'path';
 import { app } from 'electron';
 import { isDebugEnabled, getDebugLogPath } from './debug-log';
-import { initVstCrashGuard, armSentinel, disarmSentinel, disarmSentinelForPath, armEditorSentinel } from './vst-crash-guard';
+import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel } from './vst-crash-guard';
 
 type AudioModule = Record<string, (...args: any[]) => any>;
 
@@ -421,17 +421,15 @@ export function initAudioBridge(): void {
     });
 
     ipcMain.handle('audio:removeProcessor', (_event, slotId: number) => {
-        // Look up the slot's plugin path BEFORE removing it; the addon
-        // destroys the slot so getChainState afterwards can't resolve it.
-        // If the removed slot's editor was the one armed in the crash
-        // sentinel, disarm — its window is gone, it can't fault anymore.
-        const pluginPath = vstSlotPaths.get(slotId)
-            ?? (audio?.getChainState() ?? []).find((s: any) => s?.id === slotId)?.path;
         audio?.removeProcessor(slotId);
         vstSlotPaths.delete(slotId);
-        if (typeof pluginPath === 'string' && pluginPath)
-            disarmSentinelForPath(pluginPath);
-        if (armedEditorSlotId === slotId) armedEditorSlotId = null;
+        // If the removed slot was the one whose editor armed the sentinel,
+        // its window is gone — disarm. Different slot: leave the sentinel
+        // alone (it belongs to another still-open editor).
+        if (armedEditorSlotId === slotId) {
+            disarmSentinel();
+            armedEditorSlotId = null;
+        }
     });
 
     ipcMain.handle('audio:moveProcessor', (_event, from: number, to: number) => {
@@ -481,9 +479,13 @@ export function initAudioBridge(): void {
             opened = audio?.openPluginEditor(slotId) ?? false;
         } catch (e) {
             // A thrown call is a clean failure, not a hard crash — disarm so
-            // the plugin isn't falsely blocklisted on next startup.
-            if (pluginPath) disarmSentinelForPath(pluginPath);
-            armedEditorSlotId = null;
+            // the plugin isn't falsely blocklisted on next startup. Only
+            // disarm when *we* just armed for this slot, so a concurrent
+            // editor-open on a different slot keeps its sentinel.
+            if (armedEditorSlotId === slotId) {
+                disarmSentinel();
+                armedEditorSlotId = null;
+            }
             throw e;
         }
         // A synchronous false means no editor window was created (the plugin
@@ -492,22 +494,23 @@ export function initAudioBridge(): void {
         // for the editor's lifetime so a late crash gets attributed; the
         // periodic editor-state watcher below disarms it if the editor goes
         // away without an audio:closePluginEditor call.
-        if (!opened && pluginPath) {
-            disarmSentinelForPath(pluginPath);
+        if (!opened && armedEditorSlotId === slotId) {
+            disarmSentinel();
             armedEditorSlotId = null;
         }
         return opened;
     });
 
     ipcMain.handle('audio:closePluginEditor', (_event, slotId: number) => {
-        const pluginPath = vstSlotPaths.get(slotId)
-            ?? (audio?.getChainState() ?? []).find((s: any) => s?.id === slotId)?.path;
         const result = audio?.closePluginEditor(slotId) ?? false;
-        // The editor window is gone — there's nothing left to fault, so
-        // disarm any sentinel armed for this slot's plugin.
-        if (typeof pluginPath === 'string' && pluginPath)
-            disarmSentinelForPath(pluginPath);
-        if (armedEditorSlotId === slotId) armedEditorSlotId = null;
+        // The editor window is gone. Only disarm if this slot was the one
+        // currently armed — closing a different slot's editor must not wipe
+        // an unrelated still-open editor's sentinel (same plugin in two
+        // slots is the motivating case).
+        if (armedEditorSlotId === slotId) {
+            disarmSentinel();
+            armedEditorSlotId = null;
+        }
         return result;
     });
 

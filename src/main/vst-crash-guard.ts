@@ -21,11 +21,6 @@ let sentinelPath = '';
 let blocklistPath = '';
 const blocklist = new Set<string>();
 
-// Path currently armed in the sentinel, if any. Tracked so disarmSentinelForPath
-// can leave another plugin's still-open-editor sentinel alone when an
-// unrelated slot is closed/removed.
-let armedPath: string | null = null;
-
 // Normalise a plugin path for use as a blocklist / armed-path key. Windows
 // paths are case-insensitive, so fold case there to match the addon's
 // case-insensitive lookup. POSIX paths are case-sensitive — lowercasing them
@@ -79,7 +74,6 @@ function persist(): void {
 }
 
 function clearSentinel(): void {
-    armedPath = null;
     try {
         if (sentinelPath) fs.rmSync(sentinelPath, { force: true });
     } catch { /* best-effort */ }
@@ -93,24 +87,17 @@ export function armSentinel(pluginPath: string, op: 'load' | 'editor'): void {
     try {
         fs.writeFileSync(sentinelPath,
             JSON.stringify({ plugin: pluginPath, op, at: Date.now() }));
-        armedPath = norm(pluginPath);
     } catch {
         /* best-effort — a missed sentinel just means no auto-blocklist */
     }
 }
 
-// Clear the sentinel unconditionally. Used at clean shutdown and after a
-// chain-wide clear when no plugin's identity needs preserving.
+// Clear the sentinel unconditionally. The decision of *when* to disarm an
+// editor sentinel is the caller's — slot identity (not plugin path) is the
+// right key, since the same plugin can sit in multiple chain slots, and
+// closing one slot must not clear another slot's still-open-editor sentinel.
 export function disarmSentinel(): void {
     clearSentinel();
-}
-
-// Clear the sentinel only when it was armed for the given plugin path. Used
-// by editor-close and processor-removal handlers so a different plugin's
-// still-open-editor sentinel doesn't get wiped by an unrelated slot's close.
-export function disarmSentinelForPath(pluginPath: string): void {
-    if (!pluginPath || armedPath === null) return;
-    if (armedPath === norm(pluginPath)) clearSentinel();
 }
 
 // Arm the sentinel for an editor that's about to open. Unlike a synchronous
