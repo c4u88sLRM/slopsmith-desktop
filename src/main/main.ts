@@ -142,6 +142,22 @@ function createSplashWindow(): void {
     });
 }
 
+// Shared by the main BrowserWindow and any same-origin popup spawned via
+// window.open (see setWindowOpenHandler / popupOverrideOptions below).
+// Single source of truth so a future security-sensitive change (preload
+// path, sandbox, webSecurity, isolation) can't update one path and leave
+// the other diverged.
+//   - sandbox: false is required for the preload to use require('electron').
+//   - webSecurity: false lets the renderer load mixed-origin assets from
+//     the localhost Python server.
+const rendererWebPreferences: Electron.WebPreferences = {
+    preload: path.join(__dirname, 'preload.js'),
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: false,
+    webSecurity: false,
+};
+
 function createWindow(port: number): void {
     mainWindow = new BrowserWindow({
         width: 1400,
@@ -150,13 +166,7 @@ function createWindow(port: number): void {
         minHeight: 600,
         title: 'Slopsmith',
         backgroundColor: '#0f172a', // slate-900 to match Slopsmith UI
-        webPreferences: {
-            preload: path.join(__dirname, 'preload.js'),
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: false, // required for preload to use require('electron')
-            webSecurity: false, // allow loading from localhost
-        },
+        webPreferences: rendererWebPreferences,
     });
 
     // Forward renderer console to main process stdout
@@ -296,13 +306,7 @@ function createWindow(port: number): void {
     //   plugin can supply any string.
     const popupOverrideOptions: Electron.BrowserWindowConstructorOptions = {
         backgroundColor: '#0f172a',
-        webPreferences: {
-            preload: path.join(__dirname, 'preload.js'),
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: false,
-            webSecurity: false,
-        },
+        webPreferences: rendererWebPreferences,
     };
     const rendererWindowOpenHandler = ({ url }: { url: string }) => {
         if (isRendererOrigin(url)) {
@@ -318,8 +322,14 @@ function createWindow(port: number): void {
     // to navigate off-origin (or spawn another window.open), and the
     // preload-IPC surface installed via popupOverrideOptions would
     // follow along to the new page.
-    mainWindow.webContents.on('did-create-window', (popupWin) => {
-        const wc = popupWin.webContents;
+    //
+    // Wired recursively: the last line re-registers `did-create-window`
+    // on each popup's own webContents so nested popups (popup A →
+    // popup B) inherit the same guards. Without that, only popups
+    // spawned directly from the main window would be protected, and
+    // any popup that spawned another would leave its child guard-less
+    // while still carrying the preload-IPC surface.
+    function wirePopupGuards(wc: Electron.WebContents): void {
         wc.on('will-navigate', blockOffOriginTopLevel('popup in-window navigation'));
         wc.on('will-redirect', blockOffOriginTopLevel('popup cross-origin redirect'));
         wc.on('will-frame-navigate', (details) => {
@@ -330,6 +340,10 @@ function createWindow(port: number): void {
             console.warn(`[main] Blocked popup subframe navigation to non-renderer origin: ${navUrl}`);
         });
         wc.setWindowOpenHandler(rendererWindowOpenHandler);
+        wc.on('did-create-window', (nestedWin) => wirePopupGuards(nestedWin.webContents));
+    }
+    mainWindow.webContents.on('did-create-window', (popupWin) => {
+        wirePopupGuards(popupWin.webContents);
     });
 
     mainWindow.on('closed', () => {
