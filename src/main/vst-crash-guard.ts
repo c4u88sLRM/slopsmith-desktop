@@ -41,6 +41,12 @@ const norm = (p: string): string => {
 // sentinel (= the app crashed mid-op last run) into the persistent blocklist,
 // then returns the full blocklist for handing to the addon.
 export function initVstCrashGuard(): string[] {
+    // Reset on every init — the module is loaded once but the addon
+    // supports init→shutdown→init cycles, and a previous will-quit handler
+    // would otherwise leave shuttingDown latched true and permanently
+    // disable sentinel arming.
+    shuttingDown = false;
+
     const dir = app.getPath('userData');
     sentinelPath = path.join(dir, 'vst-load-sentinel.json');
     blocklistPath = path.join(dir, 'vst-crash-blocklist.json');

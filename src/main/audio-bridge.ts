@@ -163,6 +163,7 @@ export function initAudioBridge(): void {
                 if (now - t0 > PENDING_TIMEOUT_MS) {
                     openEditors.delete(slotId);
                     openedAt.delete(slotId);
+                    clearNoQueryFallbackTimer(slotId);
                     changed = true;
                 }
             }
@@ -187,6 +188,7 @@ export function initAudioBridge(): void {
                     openEditors.delete(slotId);
                     confirmedEditors.delete(slotId);
                     openedAt.delete(slotId);
+                    clearNoQueryFallbackTimer(slotId);
                     changed = true;
                 }
                 // Else: still pending and within the timeout — leave it
