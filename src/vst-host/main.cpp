@@ -1268,6 +1268,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         auto* mm = juce::MessageManager::getInstance();
         constexpr juce::uint32 kLoadHeartbeatMs = 5000;
         juce::uint32 lastHeartbeat = juce::Time::getMillisecondCounter();
+        bool heartbeatAlive = true;
         while (!loadDone.load(std::memory_order_acquire))
         {
             mm->runDispatchLoopUntil(20);
@@ -1286,10 +1287,22 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
                 return 5; // unreachable; documents the exit path
             }
             const juce::uint32 now = juce::Time::getMillisecondCounter();
-            if (now - lastHeartbeat >= kLoadHeartbeatMs)
+            if (heartbeatAlive && now - lastHeartbeat >= kLoadHeartbeatMs)
             {
                 lastHeartbeat = now;
-                st.control.sendEvent(event::kLoading, {});
+                // sendEvent is a synchronous, timeout-bounded pipe write. In
+                // the normal case the host is draining the control pipe and it
+                // returns at once; if the host has stopped reading it can
+                // stall up to the channel write timeout. Stop heart-beating
+                // after the first failed send so a stalled pipe can't block
+                // this message pump on every iteration — a host that has
+                // stopped reading is tearing us down anyway, and the WM_QUIT
+                // check above will terminate us shortly.
+                if (!st.control.sendEvent(event::kLoading, {}))
+                {
+                    hostLogf("loading heartbeat send failed — stopping heartbeat");
+                    heartbeatAlive = false;
+                }
             }
         }
     }
