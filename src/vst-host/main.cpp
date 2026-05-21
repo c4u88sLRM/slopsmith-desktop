@@ -1259,16 +1259,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
             loadDone.store(true, std::memory_order_release);
         });
 
+    // Emit a `loading` heartbeat every ~5s while the async load runs so the
+    // host's ready-handshake watchdog doesn't fast-fail a legitimately slow
+    // first-run plugin (license validation, cold Qt/QML spin-up).
+    //
+    // The heartbeat runs on a dedicated thread, NOT the message thread:
+    // ControlChannel::sendEvent is a synchronous, timeout-bounded pipe write,
+    // and doing it on the message thread would stall the very load pump this
+    // change exists to keep free. sendEvent is mutex-guarded so off-thread use
+    // is safe; a failed send is simply skipped and retried at the next
+    // interval — a transient pipe stall must not permanently stop progress
+    // reports, or the host's per-heartbeat deadline could fast-fail a plugin
+    // that is still loading. A genuinely stuck load is bounded instead by the
+    // host-side absolute cap (kReadyAbsoluteTimeoutMs).
+    std::thread heartbeatThread([&st, &loadDone]
+    {
+        constexpr int kHeartbeatSlices = 50;   // 50 * 100ms ≈ 5s between beats
+        while (!loadDone.load(std::memory_order_acquire))
+        {
+            for (int i = 0; i < kHeartbeatSlices
+                            && !loadDone.load(std::memory_order_acquire); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (loadDone.load(std::memory_order_acquire))
+                break;
+            st.control.sendEvent(event::kLoading, {});
+        }
+    });
+
     // Pump this thread's message loop until the async load resolves — the
-    // callback above fires here, from inside runDispatchLoopUntil. Emit a
-    // `loading` heartbeat every kLoadHeartbeatMs so the host's ready-handshake
-    // watchdog doesn't fast-fail a legitimately slow first-run plugin
-    // (license validation, cold Qt/QML spin-up).
+    // callback above fires here, from inside runDispatchLoopUntil.
     {
         auto* mm = juce::MessageManager::getInstance();
-        constexpr juce::uint32 kLoadHeartbeatMs = 5000;
-        juce::uint32 lastHeartbeat = juce::Time::getMillisecondCounter();
-        bool heartbeatAlive = true;
         while (!loadDone.load(std::memory_order_acquire))
         {
             mm->runDispatchLoopUntil(20);
@@ -1278,34 +1299,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
             // a quit message is posted — so the load can neither complete nor
             // be cleanly unwound (~HostState would race the in-flight load).
             // This is a disposable sandbox child the host has explicitly told
-            // to quit; terminate hard rather than busy-spin. The host
-            // force-kills us anyway — we just do it ourselves, immediately.
+            // to quit; terminate hard rather than busy-spin. TerminateProcess
+            // ends every thread (heartbeatThread included), so there is no
+            // join to do — the host force-kills us anyway; we just do it
+            // ourselves, immediately.
             if (mm->hasStopMessageBeenSent())
             {
                 hostLogf("stop requested during plugin load — terminating");
                 TerminateProcess(GetCurrentProcess(), 5);
                 return 5; // unreachable; documents the exit path
             }
-            const juce::uint32 now = juce::Time::getMillisecondCounter();
-            if (heartbeatAlive && now - lastHeartbeat >= kLoadHeartbeatMs)
-            {
-                lastHeartbeat = now;
-                // sendEvent is a synchronous, timeout-bounded pipe write. In
-                // the normal case the host is draining the control pipe and it
-                // returns at once; if the host has stopped reading it can
-                // stall up to the channel write timeout. Stop heart-beating
-                // after the first failed send so a stalled pipe can't block
-                // this message pump on every iteration — a host that has
-                // stopped reading is tearing us down anyway, and the WM_QUIT
-                // check above will terminate us shortly.
-                if (!st.control.sendEvent(event::kLoading, {}))
-                {
-                    hostLogf("loading heartbeat send failed — stopping heartbeat");
-                    heartbeatAlive = false;
-                }
-            }
         }
     }
+    heartbeatThread.join();
     st.plugin = std::move(loadedPlugin);
 
     if (!st.plugin)
