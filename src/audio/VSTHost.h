@@ -56,6 +56,14 @@ public:
     static juce::StringArray getDefaultScanDirectories();
 
 private:
+    // Parse an XML document produced by scanPluginFileToXml and merge each
+    // contained PluginDescription into `target`. Returns false if the XML is
+    // not a valid <PLUGINS> document. Does not take listLock — the caller is
+    // responsible for synchronising access to `target` (or staging results in
+    // a thread-local list before swapping into knownPlugins).
+    bool mergePluginsFromXmlInto(const juce::String& xml,
+                                 juce::KnownPluginList& target) const;
+
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
     juce::CriticalSection listLock;

@@ -49,8 +49,8 @@ include("${CMAKE_SOURCE_DIR}/cmake/onnxruntime.cmake")
 
 add_subdirectory(src/audio)
 
-# Sandbox subprocess (Windows only for now).
-if(WIN32)
+# VST scan / sandbox subprocess helpers (Windows host, macOS scan helper).
+if(WIN32 OR APPLE)
     add_subdirectory(src/vst-host)
 endif()
 
