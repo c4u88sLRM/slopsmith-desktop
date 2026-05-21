@@ -104,7 +104,13 @@
       "notarize": true,
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Slopsmith needs microphone access for guitar input and note detection."
-      }
+      },
+      "files": [
+        "build/Release/slopsmith-vst-scan"
+      ],
+      "asarUnpack": [
+        "build/Release/slopsmith-vst-scan"
+      ]
     },
     "win": {
       "target": [

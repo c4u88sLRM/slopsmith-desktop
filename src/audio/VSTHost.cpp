@@ -9,10 +9,68 @@
  #include "Sandbox/SandboxedProcessor.h"
 #endif
 
-#if JUCE_WINDOWS && defined(SLOPSMITH_AUDIO_ADDON)
+#if defined(SLOPSMITH_AUDIO_ADDON) && (JUCE_WINDOWS || JUCE_MAC)
 namespace {
 
-// Probe one plugin file in a child slopsmith-vst-host.exe so a plugin that
+#if JUCE_MAC
+#include <dlfcn.h>
+
+// Anchor in this TU so dladdr resolves slopsmith_audio.node, not Electron.
+static int macAudioAddonDlAddrAnchor() { return 0; }
+
+// Directory containing slopsmith_audio.node (not Electron's executable).
+static juce::File resolveMacAddonDirectory()
+{
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&macAudioAddonDlAddrAnchor),
+               &info) != 0
+        && info.dli_fname != nullptr
+        && info.dli_fname[0] != '\0')
+    {
+        const juce::File addonFile(info.dli_fname);
+        if (addonFile.existsAsFile())
+            return addonFile.getParentDirectory();
+    }
+    return {};
+}
+
+// macOS: slopsmith-vst-scan (built by src/vst-host/CMakeLists.txt).
+static juce::File resolveMacScanHostExecutable()
+{
+    if (const char* env = std::getenv("SLOPSMITH_VST_SCAN_HOST"))
+    {
+        const juce::File fromEnv(env);
+        if (fromEnv.existsAsFile())
+            return fromEnv;
+    }
+
+    juce::Array<juce::File> candidates;
+
+    // Packaged + dev: helper sits next to slopsmith_audio.node in
+    // build/Release/ or app.asar.unpacked/build/Release/.
+    const auto addonDir = resolveMacAddonDirectory();
+    if (addonDir.isDirectory())
+        candidates.add(addonDir.getChildFile("slopsmith-vst-scan"));
+
+    // npm run dev when cwd is slopsmith-desktop/
+    candidates.add(juce::File::getCurrentWorkingDirectory()
+                         .getChildFile("build/Release/slopsmith-vst-scan"));
+    // Source-tree anchor when cwd differs
+    candidates.add(juce::File(__FILE__).getParentDirectory()
+                         .getParentDirectory()
+                         .getParentDirectory()
+                         .getChildFile("build/Release/slopsmith-vst-scan"));
+
+    for (const auto& c : candidates)
+        if (c.existsAsFile())
+            return c;
+
+    return {};
+}
+#endif
+
+// Probe one plugin file in a child scan host (slopsmith-vst-host.exe /
+// slopsmith-vst-scan) so a plugin that
 // crashes / aborts / hangs during init can't take down the host process.
 // Returns the descriptor XML on success; sets `reason` and returns empty on
 // failure (spawn failure, timeout, non-zero exit, or no output).
@@ -59,6 +117,17 @@ juce::String scanPluginOutOfProcess(const juce::File& hostExe,
         return {};
     }
     return xml;
+}
+
+static juce::File resolveOutOfProcessScanHost()
+{
+#if JUCE_WINDOWS
+    return slopsmith::sandbox::resolveSandboxExe();
+#elif JUCE_MAC
+    return resolveMacScanHostExecutable();
+#else
+    return {};
+#endif
 }
 
 } // anonymous
@@ -112,9 +181,11 @@ juce::StringArray VSTHost::getDefaultScanDirectories()
     dirs.add(juce::File::getSpecialLocation(juce::File::userHomeDirectory)
              .getChildFile("Library/Audio/Plug-Ins/VST3").getFullPathName());
     dirs.add("/Library/Audio/Plug-Ins/VST3");
+#if JUCE_PLUGINHOST_AU
     dirs.add(juce::File::getSpecialLocation(juce::File::userHomeDirectory)
              .getChildFile("Library/Audio/Plug-Ins/Components").getFullPathName());
     dirs.add("/Library/Audio/Plug-Ins/Components");
+#endif
 #elif JUCE_WINDOWS
     dirs.add("C:\\Program Files\\Common Files\\VST3");
     dirs.add("C:\\Program Files (x86)\\Common Files\\VST3");
@@ -129,6 +200,19 @@ void VSTHost::scanDefaultDirectories(ScanProgressCallback callback)
 {
     scanDirectories(getDefaultScanDirectories(), std::move(callback));
 }
+
+namespace {
+
+bool isFormatSupported(const juce::AudioPluginFormatManager& fm,
+                       const juce::PluginDescription& desc)
+{
+    for (auto* format : fm.getFormats())
+        if (format->getName() == desc.pluginFormatName)
+            return true;
+    return false;
+}
+
+} // namespace
 
 void VSTHost::scanDirectories(const juce::StringArray& directories, ScanProgressCallback callback)
 {
@@ -148,8 +232,11 @@ void VSTHost::scanDirectories(const juce::StringArray& directories, ScanProgress
         for (auto& f : d.findChildFiles(juce::File::findFilesAndDirectories, true, "*.vst3"))
             filesToScan.addIfNotAlreadyThere(f.getFullPathName());
 
-        // AU (macOS bundles)
-#if JUCE_MAC
+        // AU (.component) — only when this binary can actually load AudioUnits.
+        // The Electron addon deliberately omits JUCE_PLUGINHOST_AU (see
+        // src/audio/CMakeLists.txt); scanning Components would list duplicates
+        // that fail at load with "No compatible plug-in format exists".
+#if JUCE_MAC && JUCE_PLUGINHOST_AU
         for (auto& f : d.findChildFiles(juce::File::findFilesAndDirectories, true, "*.component"))
             filesToScan.addIfNotAlreadyThere(f.getFullPathName());
 #endif
@@ -164,69 +251,111 @@ void VSTHost::scanDirectories(const juce::StringArray& directories, ScanProgress
     const int totalFiles = filesToScan.size();
     int scannedCount = 0;
 
-#if JUCE_WINDOWS && defined(SLOPSMITH_AUDIO_ADDON)
-    // Out-of-process scan: probe each plugin in a child slopsmith-vst-host.exe.
-    // The addon is loaded into the Electron main process via N-API, so a
-    // plugin that crashes / aborts during in-process scanAndAddFile would take
-    // the whole app down (see issue: iZotope/Melodyne abort() during scan).
-    // A child process boundary is the only thing that contains an abort() on
-    // an arbitrary plugin-spawned thread.
+#if defined(SLOPSMITH_AUDIO_ADDON) && (JUCE_WINDOWS || JUCE_MAC)
+    // Out-of-process scan: one child per plugin file. In-process scanAndAddFile
+    // inside Electron can SIGTRAP/abort on certain plugins.
     {
-        const juce::File hostExe = slopsmith::sandbox::resolveSandboxExe();
-        if (hostExe.existsAsFile())
+        // Skip helper resolution entirely when there's nothing to probe — a
+        // missing helper shouldn't block an "everything was uninstalled"
+        // rescan from clearing the catalog.
+        juce::File hostExe;
+        if (! filesToScan.isEmpty())
         {
-            constexpr int kScanTimeoutMs = 20000;
-            for (auto& file : filesToScan)
+            hostExe = resolveOutOfProcessScanHost();
+            if (! hostExe.existsAsFile())
             {
-                if (scanCancelled.load()) break;
-
-                juce::String reason;
-                const juce::String xml = scanPluginOutOfProcess(
-                    hostExe, file, kScanTimeoutMs, reason);
-                if (xml.isNotEmpty() && addPluginsFromXml(xml))
-                {
-                    // probe succeeded — descriptors merged
-                }
-                else
-                {
-                    if (reason.isEmpty())
-                        reason = "scan host produced unparseable output";
-                    juce::Logger::writeToLog("VST scan: skipped " + file
-                                             + " — " + reason);
-                }
-
-                ++scannedCount;
-                const float progress = totalFiles > 0
-                    ? (float) scannedCount / (float) totalFiles : 1.0f;
-                if (callback)
-                    callback(progress,
-                             juce::File(file).getFileNameWithoutExtension());
+                juce::Logger::writeToLog("VST scan: out-of-process scan host not found —"
+                                         " aborting rescan (plugin list unchanged)");
+                scanning.store(false);
+                return;
             }
-            scanning.store(false);
-            return;
         }
-        juce::Logger::writeToLog("VST scan: slopsmith-vst-host.exe not found —"
-                                 " falling back to in-process scan");
+
+        // Stage in a temp list and swap into knownPlugins only after a clean
+        // pass. Cancel-mid-scan or every-probe-fails (broken helper env, etc.)
+        // leaves the live catalog untouched instead of wiping it to empty.
+        juce::KnownPluginList staged;
+        bool completed = true;
+        constexpr int kScanTimeoutMs = 20000;
+
+        for (auto& file : filesToScan)
+        {
+            if (scanCancelled.load()) { completed = false; break; }
+
+            juce::String reason;
+            const juce::String xml = scanPluginOutOfProcess(
+                hostExe, file, kScanTimeoutMs, reason);
+            if (xml.isEmpty() || ! mergePluginsFromXmlInto(xml, staged))
+            {
+                if (reason.isEmpty())
+                    reason = "scan host produced unparseable output";
+                juce::Logger::writeToLog("VST scan: skipped " + file
+                                         + " — " + reason);
+            }
+
+            ++scannedCount;
+            const float progress = totalFiles > 0
+                ? (float) scannedCount / (float) totalFiles : 1.0f;
+            if (callback)
+                callback(progress,
+                         juce::File(file).getFileNameWithoutExtension());
+        }
+
+        // Swap only if the pass completed AND it actually produced results
+        // (or there were no plugins to scan — then an empty catalog is correct).
+        if (completed && (totalFiles == 0 || staged.getNumTypes() > 0))
+        {
+            const juce::ScopedLock sl(listLock);
+            knownPlugins.clear();
+            for (auto& desc : staged.getTypes())
+                knownPlugins.addType(desc);
+        }
+
+        scanning.store(false);
+        return;
     }
 #endif
 
-    // In-process scan — used on macOS/Linux, and as a fallback on Windows when
-    // the out-of-process host binary can't be located.
+#if defined(SLOPSMITH_AUDIO_ADDON) && ! (JUCE_WINDOWS || JUCE_MAC)
+    // Linux: no out-of-process scan host. Stage into a temp list and swap on
+    // success so a cancelled scan doesn't wipe stale-but-still-loadable rows.
+    juce::KnownPluginList linuxStaged;
+    bool linuxRescanCompleted = true;
+#endif
+
+    // In-process scan (Linux addon, or non-addon builds).
     for (auto& file : filesToScan)
     {
-        if (scanCancelled.load()) break;
+        if (scanCancelled.load())
+        {
+#if defined(SLOPSMITH_AUDIO_ADDON) && ! (JUCE_WINDOWS || JUCE_MAC)
+            linuxRescanCompleted = false;
+#endif
+            break;
+        }
 
         juce::String pluginName = juce::File(file).getFileNameWithoutExtension();
 
         for (auto* format : formatManager.getFormats())
         {
-            if (scanCancelled.load()) break;
+            if (scanCancelled.load())
+            {
+#if defined(SLOPSMITH_AUDIO_ADDON) && ! (JUCE_WINDOWS || JUCE_MAC)
+                linuxRescanCompleted = false;
+#endif
+                break;
+            }
 
             juce::OwnedArray<juce::PluginDescription> found;
+#if defined(SLOPSMITH_AUDIO_ADDON) && ! (JUCE_WINDOWS || JUCE_MAC)
+            // Local list — no lock needed; swapped into knownPlugins below.
+            linuxStaged.scanAndAddFile(file, true, found, *format);
+#else
             {
                 const juce::ScopedLock sl(listLock);
                 knownPlugins.scanAndAddFile(file, true, found, *format);
             }
+#endif
 
             for (auto* desc : found)
                 pluginName = desc->name;
@@ -236,6 +365,17 @@ void VSTHost::scanDirectories(const juce::StringArray& directories, ScanProgress
         float progress = totalFiles > 0 ? (float)scannedCount / (float)totalFiles : 1.0f;
         if (callback) callback(progress, pluginName);
     }
+
+#if defined(SLOPSMITH_AUDIO_ADDON) && ! (JUCE_WINDOWS || JUCE_MAC)
+    if (linuxRescanCompleted
+        && (totalFiles == 0 || linuxStaged.getNumTypes() > 0))
+    {
+        const juce::ScopedLock sl(listLock);
+        knownPlugins.clear();
+        for (auto& desc : linuxStaged.getTypes())
+            knownPlugins.addType(desc);
+    }
+#endif
 
     scanning.store(false);
 }
@@ -258,20 +398,35 @@ juce::String VSTHost::scanPluginFileToXml(const juce::String& path)
     return root.toString();
 }
 
-bool VSTHost::addPluginsFromXml(const juce::String& xml)
+bool VSTHost::mergePluginsFromXmlInto(const juce::String& xml,
+                                      juce::KnownPluginList& target) const
 {
     const auto parsed = juce::parseXML(xml);
     if (parsed == nullptr || ! parsed->hasTagName("PLUGINS"))
         return false;
 
-    const juce::ScopedLock sl(listLock);
     for (auto* child : parsed->getChildIterator())
     {
         juce::PluginDescription desc;
-        if (desc.loadFromXml(*child))
-            knownPlugins.addType(desc);
+        if (! desc.loadFromXml(*child))
+            continue;
+
+#if defined(SLOPSMITH_AUDIO_ADDON)
+        // Scan helper may probe formats the addon cannot host (e.g. AU in
+        // slopsmith-vst-scan). Skip them so the UI does not list unloadable dupes.
+        if (! isFormatSupported(formatManager, desc))
+            continue;
+#endif
+
+        target.addType(desc);
     }
     return true;
+}
+
+bool VSTHost::addPluginsFromXml(const juce::String& xml)
+{
+    const juce::ScopedLock sl(listLock);
+    return mergePluginsFromXmlInto(xml, knownPlugins);
 }
 
 // ── Plugin Access ─────────────────────────────────────────────────────────────
