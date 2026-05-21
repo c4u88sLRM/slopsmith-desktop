@@ -17,7 +17,24 @@ if (process.platform !== 'linux') {
     try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const { VelopackApp } = require('velopack') as typeof import('velopack');
-        VelopackApp.build().run();
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { maybeUninstallLegacyNsis } = require('./nsis-migration') as typeof import('./nsis-migration');
+        VelopackApp.build()
+            // Fires during MSI install (the InstallHookDeferred custom
+            // action in vpk's WiX template, post-InstallFiles). Detects a
+            // legacy NSIS install at HKLM\...\Uninstall\Slopsmith, runs
+            // its QuietUninstallString, and restores the Velopack stub
+            // that NSIS deletes as part of its cleanup. No-op on machines
+            // without the legacy install. 30-second hard budget — runs
+            // synchronously with a sync registry-poll, well within it.
+            .onAfterInstallFastCallback(() => {
+                try {
+                    maybeUninstallLegacyNsis();
+                } catch (err) {
+                    console.error('[main] NSIS cleanup hook failed:', err);
+                }
+            })
+            .run();
     } catch (err) {
         // Never crash over this — a launchable app beats a dead one. But in a
         // packaged build a hook failure means install/update lifecycle flags
