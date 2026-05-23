@@ -489,6 +489,7 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
 {
     const juce::ScopedLock sl(backingLock);
     stopBackingNoLock();
+    backingResampler.reset();
     backingTransport.reset();
     backingSource.reset();
 
@@ -518,8 +519,9 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
     backingSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
     backingTransport = std::make_unique<juce::AudioTransportSource>();
     backingTransport->setSource(backingSource.get(), 0, nullptr, readerSampleRate);
-    backingTransport->prepareToPlay(currentBlockSize.load(std::memory_order_relaxed),
-                                    currentSampleRate.load(std::memory_order_relaxed));
+    backingResampler = std::make_unique<juce::ResamplingAudioSource>(backingTransport.get(), false, 2);
+    backingResampler->setResamplingRatio(backingSpeed.load(std::memory_order_relaxed));
+    backingResampler->prepareToPlay(currentBlockSize.load(std::memory_order_relaxed), currentSampleRate.load(std::memory_order_relaxed));
     cachedBackingDuration.store(backingTransport->getLengthInSeconds());
     cachedBackingPosition.store(0.0);
     std::cerr << "[AudioEngine] loadBackingTrack OK sr=" << readerSampleRate
@@ -534,6 +536,10 @@ void AudioEngine::setBackingPosition(double seconds)
     if (backingTransport)
     {
         backingTransport->setPosition(seconds);
+        if (backingResampler)
+        {
+            backingResampler->flushBuffers();
+        }
         // Read back the actual position; the transport may clamp (e.g. negative or past EOF).
         cachedBackingPosition.store(backingTransport->getCurrentPosition());
     }
@@ -562,6 +568,21 @@ void AudioEngine::stopBacking()
 {
     const juce::ScopedLock sl(backingLock);
     stopBackingNoLock();
+}
+
+void AudioEngine::setBackingSpeed(double speed)
+{
+    if (!std::isfinite(speed) || speed <= 0.0)
+    {
+        return;
+    }
+
+    const juce::ScopedLock sl(backingLock);
+    backingSpeed.store(speed);
+    if (backingResampler)
+    {
+        backingResampler->setResamplingRatio(speed);
+    }
 }
 
 void AudioEngine::resetPeaks()
@@ -612,8 +633,10 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     tonePolish.prepare(sr);
 
     const juce::ScopedLock sl(backingLock);
-    if (backingTransport)
-        backingTransport->prepareToPlay(bs, sr);
+    if (backingResampler)
+    {
+        backingResampler->prepareToPlay(bs, sr);
+    }
 }
 
 void AudioEngine::audioDeviceStopped()
@@ -813,12 +836,16 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // Mix backing track
     {
         const juce::ScopedTryLock sl(backingLock);
-        if (sl.isLocked() && backingTransport && backingPlaying.load())
+        if (sl.isLocked() && backingResampler && backingTransport && backingPlaying.load())
         {
-            backingBuffer.setSize(numOutputChannels, numSamples, false, false, true);
+            // The resampler was constructed with numChannels=2 (stereo backing
+            // tracks), so always use a 2-channel scratch buffer.  This avoids
+            // passing a narrower buffer into the resampler on mono output
+            // while keeping a well-defined channel count at all times.
+            backingBuffer.setSize(2, numSamples, false, false, true);
             backingBuffer.clear();
             juce::AudioSourceChannelInfo info(&backingBuffer, 0, numSamples);
-            backingTransport->getNextAudioBlock(info);
+            backingResampler->getNextAudioBlock(info);
 
             // Keep cached position and playing state up to date for lock-free polling.
             // backingTransport is non-null (checked above) and backingLock is held for
@@ -829,11 +856,13 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             if (!backingTransport->isPlaying())
                 backingPlaying.store(false);
 
+            // Mix stereo backing into the first two output channels only;
+            // channels beyond index 1 are left silent so a multi-channel
+            // device does not receive unexpected content on surround outputs.
             float bVol = backingVolume.load();
-            for (int ch = 0; ch < numOutputChannels; ++ch)
-                buffer.addFrom(ch, 0, backingBuffer,
-                               juce::jmin(ch, backingBuffer.getNumChannels() - 1),
-                               0, numSamples, bVol);
+            const int mixChannels = juce::jmin(numOutputChannels, 2);
+            for (int ch = 0; ch < mixChannels; ++ch)
+                buffer.addFrom(ch, 0, backingBuffer, ch, 0, numSamples, bVol);
         }
     }
 

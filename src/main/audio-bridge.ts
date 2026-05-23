@@ -615,6 +615,26 @@ export function initAudioBridge(): void {
     ipcMain.handle('audio:getBackingPosition', () => audio?.getBackingPosition() ?? 0);
     ipcMain.handle('audio:getBackingDuration', () => audio?.getBackingDuration() ?? 0);
     ipcMain.handle('audio:isBackingPlaying', () => audio?.isBackingPlaying() ?? false);
+    ipcMain.handle('audio:setBackingSpeed', (_event, speed: number) => {
+        // Feature-detect the method the same way getSampleRate / scoreChord do —
+        // a downlevel native addon that predates setBackingSpeed would throw rather
+        // than silently no-op, so we guard the method's existence explicitly and
+        // return false (the standard "not available" sentinel used across this
+        // bridge) so the renderer can handle version-skew without an IPC crash.
+        if (!audio || typeof audio.setBackingSpeed !== 'function') return false;
+        // Validate before calling into the native layer: AudioEngine::setBackingSpeed
+        // silently ignores non-finite / <= 0 values, so an invalid call would return
+        // true here but have no effect — return false so the renderer can distinguish
+        // a rejected call from a successful one.
+        if (!Number.isFinite(speed) || speed <= 0) return false;
+        try {
+            audio.setBackingSpeed(speed);
+            return true;
+        } catch (e: unknown) {
+            console.warn(`[audio] setBackingSpeed failed: ${e instanceof Error ? e.message : String(e)}`);
+            return false;
+        }
+    });
 
     // ── Presets ────────────────────────────────────────────────────────────
 
