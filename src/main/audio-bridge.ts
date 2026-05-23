@@ -14,7 +14,9 @@ type AudioModule = Record<string, (...args: any[]) => any>;
 let audio: AudioModule | null = null;
 
 type AudioDeviceSettings = {
-    type: string;
+    type: string;          // legacy alias = inputType when only type was stored
+    inputType?: string;
+    outputType?: string;
     input: string;
     output: string;
     sampleRate: string;
@@ -52,8 +54,12 @@ function normalizeDeviceSettings(settings: unknown): AudioDeviceSettings | null 
     const record = asRecord(settings);
     if (!record) return null;
 
+    // Accept legacy ('type' only) or new ('inputType'+'outputType'). Legacy
+    // values are mirrored into both slots so the engine stays in duplex.
+    const hasLegacyType = typeof record.type === 'string';
+    const hasDualType = typeof record.inputType === 'string' && typeof record.outputType === 'string';
     const hasExpectedShape =
-        typeof record.type === 'string'
+        (hasLegacyType || hasDualType)
         && typeof record.input === 'string'
         && typeof record.output === 'string'
         && isSelectValue(record.sampleRate)
@@ -61,8 +67,14 @@ function normalizeDeviceSettings(settings: unknown): AudioDeviceSettings | null 
         && isSelectValue(record.inputChannel);
     if (!hasExpectedShape) return null;
 
+    const legacyType = typeof record.type === 'string' ? record.type : '';
+    const inputType = typeof record.inputType === 'string' ? record.inputType : legacyType;
+    const outputType = typeof record.outputType === 'string' ? record.outputType : legacyType || inputType;
+
     const normalized: AudioDeviceSettings = {
-        type: typeof record.type === 'string' ? record.type : '',
+        type: legacyType || inputType,
+        inputType,
+        outputType,
         input: typeof record.input === 'string' ? record.input : '',
         output: typeof record.output === 'string' ? record.output : '',
         sampleRate: normalizeSelectValue(record.sampleRate),
@@ -79,16 +91,25 @@ function normalizeDeviceSettings(settings: unknown): AudioDeviceSettings | null 
     return normalized;
 }
 
-function normalizeDeviceOptions(options: unknown, fallback: { type: string; input: string; output: string; error?: string }) {
+function normalizeDeviceOptions(
+    options: unknown,
+    fallback: { type: string; inputType?: string; outputType?: string; input: string; output: string; error?: string },
+) {
     const record = asRecord(options);
+    const inputType = String(record?.inputType ?? record?.type ?? fallback.inputType ?? fallback.type ?? '');
+    const outputType = String(record?.outputType ?? record?.type ?? fallback.outputType ?? fallback.type ?? inputType);
+    const compatible = typeof record?.compatible === 'boolean' ? record.compatible : true;
     return {
-        type: String(record?.type ?? fallback.type ?? ''),
+        type: String(record?.type ?? fallback.type ?? inputType),
+        inputType,
+        outputType,
         input: String(record?.input ?? fallback.input ?? ''),
         output: String(record?.output ?? fallback.output ?? ''),
         inputChannels: normalizeStringArray(record?.inputChannels),
         outputChannels: normalizeStringArray(record?.outputChannels),
         sampleRates: normalizeNumberArray(record?.sampleRates),
         bufferSizes: normalizeNumberArray(record?.bufferSizes),
+        compatible,
         error: String(record?.error ?? fallback.error ?? ''),
     };
 }
@@ -239,14 +260,25 @@ export function initAudioBridge(): void {
         return audio?.getBufferSizes() ?? [];
     });
 
-    ipcMain.handle('audio:probeDeviceOptions', (_event, typeName: string, input: string, output: string) => {
+    ipcMain.handle('audio:probeDeviceOptions', (_event, ...args: any[]) => {
+        // (inputType, inputName, outputType, outputName) | legacy (type, input, output)
+        const isDual = args.length >= 4;
+        const inputType: string  = args[0] ?? '';
+        const inputName: string  = args[1] ?? '';
+        const outputType: string = isDual ? (args[2] ?? '') : inputType;
+        const outputName: string = isDual ? (args[3] ?? '') : (args[2] ?? '');
+
         const options = audio && typeof audio.probeDeviceOptions === 'function'
-            ? audio.probeDeviceOptions(typeName, input, output)
+            ? (isDual
+                ? audio.probeDeviceOptions(inputType, inputName, outputType, outputName)
+                : audio.probeDeviceOptions(inputType, inputName, outputName))
             : null;
         return normalizeDeviceOptions(options, {
-            type: String(typeName || ''),
-            input: String(input || ''),
-            output: String(output || ''),
+            type: String(inputType || ''),
+            inputType: String(inputType || ''),
+            outputType: String(outputType || ''),
+            input: String(inputName || ''),
+            output: String(outputName || ''),
             error: 'Native audio addon not available',
         });
     });
@@ -259,8 +291,33 @@ export function initAudioBridge(): void {
         return audio?.setDeviceType(typeName) ?? false;
     });
 
-    ipcMain.handle('audio:setDevice', (_event, input: string, output: string, sampleRate: number, bufferSize: number) => {
-        return audio?.setDevice(input, output, sampleRate, bufferSize) ?? false;
+    ipcMain.handle('audio:setOutputDeviceType', (_event, typeName: string) => {
+        if (!audio || typeof audio.setOutputDeviceType !== 'function') return false;
+        try { return audio.setOutputDeviceType(typeName); }
+        catch (e: any) {
+            console.warn(`[audio] setOutputDeviceType failed: ${e?.message ?? e}`);
+            return false;
+        }
+    });
+
+    ipcMain.handle('audio:setDevice', (_event, ...args: any[]) => {
+        if (!audio) return { ok: false, error: 'Native audio addon not available', duplex: true };
+        // Object payload: setDevice({inputType, inputDevice, outputType, outputDevice, sampleRate, bufferSize})
+        // Legacy positional: setDevice(input, output, sampleRate, bufferSize)
+        if (args.length === 1 && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+            return audio.setDevice(args[0]);
+        }
+        const [input, output, sampleRate, bufferSize] = args;
+        return audio.setDevice(input, output, sampleRate, bufferSize);
+    });
+
+    ipcMain.handle('audio:getDeviceMetrics', () => {
+        if (!audio || typeof audio.getDeviceMetrics !== 'function') return null;
+        try { return audio.getDeviceMetrics(); }
+        catch (e: any) {
+            console.warn(`[audio] getDeviceMetrics failed: ${e?.message ?? e}`);
+            return null;
+        }
     });
 
     ipcMain.handle('audio:loadDeviceSettings', () => readAudioSettings());

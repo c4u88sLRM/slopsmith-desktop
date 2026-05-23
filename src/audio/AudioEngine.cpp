@@ -11,15 +11,19 @@ AudioEngine::AudioEngine()
 {
     formatManager.registerBasicFormats();
 
-    // Initialize device manager so device types are available for enumeration.
-    // This registers ALSA, JACK, CoreAudio, ASIO etc. depending on platform.
-    // We don't start audio yet — just make devices queryable.
-    auto result = deviceManager.initialiseWithDefaultDevices(2, 2);
+    auto result = inputDeviceManager.initialiseWithDefaultDevices(2, 2);
     if (result.isNotEmpty())
-        std::cerr << "[AudioEngine] init note: " << result.toStdString() << std::endl;
+        std::cerr << "[AudioEngine] input init note: " << result.toStdString() << std::endl;
 
-    // Log available device types
-    auto& availableTypes = deviceManager.getAvailableDeviceTypes();
+    auto outResult = outputDeviceManager.initialiseWithDefaultDevices(0, 2);
+    if (outResult.isNotEmpty())
+        std::cerr << "[AudioEngine] output init note: " << outResult.toStdString() << std::endl;
+
+    // Some backends (WASAPI) bind to a default device on init and would
+    // hold it exclusive against the duplex codepath. Idle until split mode.
+    outputDeviceManager.closeAudioDevice();
+
+    auto& availableTypes = inputDeviceManager.getAvailableDeviceTypes();
     std::cerr << "[AudioEngine] Available device types: " << availableTypes.size() << std::endl;
     for (auto* type : availableTypes)
     {
@@ -28,6 +32,8 @@ AudioEngine::AudioEngine()
                   << " - inputs: " << type->getDeviceNames(true).size()
                   << ", outputs: " << type->getDeviceNames(false).size() << std::endl;
     }
+    for (auto* type : outputDeviceManager.getAvailableDeviceTypes())
+        type->scanForDevices();
 }
 
 AudioEngine::~AudioEngine()
@@ -42,7 +48,7 @@ juce::Array<AudioEngine::DeviceTypeInfo> AudioEngine::getDeviceTypes()
 {
     juce::Array<DeviceTypeInfo> types;
 
-    for (auto* type : deviceManager.getAvailableDeviceTypes())
+    for (auto* type : inputDeviceManager.getAvailableDeviceTypes())
     {
         DeviceTypeInfo info;
         info.name = type->getTypeName();
@@ -60,7 +66,7 @@ juce::Array<AudioEngine::DeviceTypeInfo> AudioEngine::getDeviceTypes()
 juce::Array<double> AudioEngine::getSampleRates()
 {
     juce::Array<double> rates;
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    if (auto* device = inputDeviceManager.getCurrentAudioDevice())
     {
         for (auto rate : device->getAvailableSampleRates())
             rates.add(rate);
@@ -71,7 +77,7 @@ juce::Array<double> AudioEngine::getSampleRates()
 juce::Array<int> AudioEngine::getBufferSizes()
 {
     juce::Array<int> sizes;
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    if (auto* device = inputDeviceManager.getCurrentAudioDevice())
     {
         for (auto size : device->getAvailableBufferSizes())
             sizes.add(size);
@@ -83,75 +89,137 @@ AudioEngine::DeviceOptions AudioEngine::probeDeviceOptions(const juce::String& t
                                                            const juce::String& inputName,
                                                            const juce::String& outputName)
 {
+    return probeDeviceOptionsDual(typeName, inputName, typeName, outputName);
+}
+
+AudioEngine::DeviceOptions AudioEngine::probeDeviceOptionsDual(const juce::String& inputTypeName,
+                                                               const juce::String& inputName,
+                                                               const juce::String& outputTypeName,
+                                                               const juce::String& outputName)
+{
     DeviceOptions options;
+    options.inputType = inputTypeName;
+    options.outputType = outputTypeName.isEmpty() ? inputTypeName : outputTypeName;
+    options.type = options.inputType;   // legacy alias
 
-    juce::AudioIODeviceType* selectedType = nullptr;
-    for (auto* type : deviceManager.getAvailableDeviceTypes())
-    {
-        if ((typeName.isNotEmpty() && type->getTypeName() == typeName)
-            || (typeName.isEmpty() && selectedType == nullptr))
+    auto findType = [&](const juce::String& wanted) -> juce::AudioIODeviceType* {
+        juce::AudioIODeviceType* match = nullptr;
+        for (auto* type : inputDeviceManager.getAvailableDeviceTypes())
         {
-            selectedType = type;
-            if (typeName.isNotEmpty())
-                break;
+            if ((wanted.isNotEmpty() && type->getTypeName() == wanted)
+                || (wanted.isEmpty() && match == nullptr))
+            {
+                match = type;
+                if (wanted.isNotEmpty()) break;
+            }
         }
-    }
+        return match;
+    };
 
-    if (selectedType == nullptr)
+    auto* inputType  = findType(options.inputType);
+    auto* outputType = findType(options.outputType);
+
+    if (inputType == nullptr)
     {
-        options.error = "Device type not found";
+        options.error = "Input device type not found";
+        options.compatible = false;
+        return options;
+    }
+    if (outputType == nullptr)
+    {
+        options.error = "Output device type not found";
+        options.compatible = false;
         return options;
     }
 
     try
     {
-        options.type = selectedType->getTypeName();
+        options.inputType = inputType->getTypeName();
+        options.outputType = outputType->getTypeName();
+        options.type = options.inputType;
 
-        auto inputs = selectedType->getDeviceNames(true);
-        auto outputs = selectedType->getDeviceNames(false);
+        auto inputs = inputType->getDeviceNames(true);
+        auto outputs = outputType->getDeviceNames(false);
         options.input = inputName;
         options.output = outputName;
+        if (options.input.isEmpty() && inputs.size() > 0) options.input = inputs[0];
+        if (options.output.isEmpty() && outputs.size() > 0) options.output = outputs[0];
 
-        if (options.input.isEmpty() && inputs.size() > 0)
-            options.input = inputs[0];
-        if (options.output.isEmpty() && outputs.size() > 0)
-            options.output = outputs[0];
+        const bool isDuplex = (options.inputType == options.outputType
+                               && options.input == options.output
+                               && options.input.isNotEmpty());
 
-        std::unique_ptr<juce::AudioIODevice> device(
-            selectedType->createDevice(options.output, options.input));
-
-        if (!device)
+        if (isDuplex)
         {
-            options.error = "Could not create probe device";
-            return options;
+            std::unique_ptr<juce::AudioIODevice> dev(
+                inputType->createDevice(options.output, options.input));
+            if (!dev) { options.error = "Could not create probe device"; options.compatible = false; return options; }
+
+            options.inputChannels = dev->getInputChannelNames();
+            options.outputChannels = dev->getOutputChannelNames();
+            for (auto rate : dev->getAvailableSampleRates())
+                options.sampleRates.addIfNotAlreadyThere(rate);
+            for (auto size : dev->getAvailableBufferSizes())
+                options.bufferSizes.addIfNotAlreadyThere(size);
+        }
+        else
+        {
+            std::unique_ptr<juce::AudioIODevice> inDev(
+                inputType->createDevice({}, options.input));
+            std::unique_ptr<juce::AudioIODevice> outDev(
+                outputType->createDevice(options.output, {}));
+            if (!inDev || !outDev)
+            {
+                options.error = "Could not create dual probe devices";
+                options.compatible = false;
+                return options;
+            }
+
+            options.inputChannels = inDev->getInputChannelNames();
+            options.outputChannels = outDev->getOutputChannelNames();
+
+            // Tolerance covers backends that report fractional drift around the nominal rate.
+            const auto inRates = inDev->getAvailableSampleRates();
+            const auto outRates = outDev->getAvailableSampleRates();
+            for (auto r : inRates)
+            {
+                for (auto r2 : outRates)
+                {
+                    if (std::abs(r - r2) < 0.5)
+                    {
+                        options.sampleRates.addIfNotAlreadyThere(r);
+                        break;
+                    }
+                }
+            }
+            if (options.sampleRates.isEmpty())
+            {
+                options.error = "Input and output devices share no common sample rate";
+                options.compatible = false;
+            }
+
+            const auto inBufs = inDev->getAvailableBufferSizes();
+            const auto outBufs = outDev->getAvailableBufferSizes();
+            for (auto b : outBufs) options.bufferSizes.addIfNotAlreadyThere(b);
+            for (auto b : inBufs) options.bufferSizes.addIfNotAlreadyThere(b);
         }
 
-        options.inputChannels = device->getInputChannelNames();
-        options.outputChannels = device->getOutputChannelNames();
-
-        for (auto rate : device->getAvailableSampleRates())
-            options.sampleRates.addIfNotAlreadyThere(rate);
-
-        // Buffer sizes are advertised before opening the device, so they are
-        // intentionally rate-agnostic. Opening a probe device while audio is
-        // running can disrupt some drivers; the real device setup reports the
-        // actual accepted block size after Apply.
-        const auto advertisedBuffers = device->getAvailableBufferSizes();
-        for (auto size : advertisedBuffers)
-            options.bufferSizes.addIfNotAlreadyThere(size);
-
-        fprintf(stderr, "[AudioEngine] Probed device options: type='%s' in='%s' out='%s' inputs=%d outputs=%d rates=%d buffers=%d\n",
-                options.type.toRawUTF8(), options.input.toRawUTF8(), options.output.toRawUTF8(),
-                options.inputChannels.size(), options.outputChannels.size(),
-                options.sampleRates.size(), options.bufferSizes.size());
+        fprintf(stderr, "[AudioEngine] Probed device options: inType='%s' outType='%s' in='%s' out='%s' "
+                "duplex=%d inputs=%d outputs=%d rates=%d buffers=%d compatible=%d\n",
+                options.inputType.toRawUTF8(), options.outputType.toRawUTF8(),
+                options.input.toRawUTF8(), options.output.toRawUTF8(),
+                (int) isDuplex, options.inputChannels.size(), options.outputChannels.size(),
+                options.sampleRates.size(), options.bufferSizes.size(), (int) options.compatible);
     }
     catch (const std::exception& e)
     {
         options.error = e.what();
+        options.compatible = false;
     }
     catch (...)
     {
         options.error = "Probe failed";
+        options.compatible = false;
     }
 
     return options;
@@ -159,16 +227,30 @@ AudioEngine::DeviceOptions AudioEngine::probeDeviceOptions(const juce::String& t
 
 juce::String AudioEngine::getCurrentDeviceType()
 {
-    if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+    return getCurrentInputDeviceType();
+}
+
+juce::String AudioEngine::getCurrentInputDeviceType()
+{
+    if (auto* type = inputDeviceManager.getCurrentDeviceTypeObject())
+        return type->getTypeName();
+    return {};
+}
+
+juce::String AudioEngine::getCurrentOutputDeviceType()
+{
+    if (duplexMode.load(std::memory_order_relaxed))
+        return getCurrentInputDeviceType();
+    if (auto* type = outputDeviceManager.getCurrentDeviceTypeObject())
         return type->getTypeName();
     return {};
 }
 
 juce::String AudioEngine::getCurrentInputDevice()
 {
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    if (auto* device = inputDeviceManager.getCurrentAudioDevice())
     {
-        auto setup = deviceManager.getAudioDeviceSetup();
+        auto setup = inputDeviceManager.getAudioDeviceSetup();
         return setup.inputDeviceName;
     }
     return {};
@@ -176,46 +258,77 @@ juce::String AudioEngine::getCurrentInputDevice()
 
 juce::String AudioEngine::getCurrentOutputDevice()
 {
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    auto& mgr = duplexMode.load(std::memory_order_relaxed)
+        ? inputDeviceManager : outputDeviceManager;
+    if (mgr.getCurrentAudioDevice() == nullptr) return {};
+    return mgr.getAudioDeviceSetup().outputDeviceName;
+}
+
+AudioEngine::DeviceMetrics AudioEngine::getDeviceMetrics() const
+{
+    DeviceMetrics m;
+    m.duplex = duplexMode.load(std::memory_order_relaxed);
+    m.inputOverflowCount = inputOverflowCount.load(std::memory_order_relaxed);
+    m.outputUnderflowCount = outputUnderflowCount.load(std::memory_order_relaxed);
+    m.outputRingCapacitySamples = kOutputRingFrames;
+    if (! m.duplex)
     {
-        auto setup = deviceManager.getAudioDeviceSetup();
-        return setup.outputDeviceName;
+        const auto w = outputRingWriteIndex.load(std::memory_order_acquire);
+        const auto r = outputRingReadIndex.load(std::memory_order_acquire);
+        m.outputRingFillSamples = (int) (w - r);
     }
-    return {};
+    return m;
 }
 
 double AudioEngine::getLatencyMs() const
 {
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    const double sr = currentSampleRate.load(std::memory_order_relaxed);
+    if (sr <= 0.0) return 0.0;
+
+    if (duplexMode.load(std::memory_order_relaxed))
     {
-        int latencySamples = device->getCurrentBufferSizeSamples()
-                           + device->getInputLatencyInSamples()
-                           + device->getOutputLatencyInSamples();
-        return (latencySamples / currentSampleRate.load(std::memory_order_relaxed)) * 1000.0;
+        if (auto* device = inputDeviceManager.getCurrentAudioDevice())
+        {
+            int latencySamples = device->getCurrentBufferSizeSamples()
+                               + device->getInputLatencyInSamples()
+                               + device->getOutputLatencyInSamples();
+            return (latencySamples / sr) * 1000.0;
+        }
+        return 0.0;
     }
-    return 0.0;
+
+    int totalSamples = 0;
+    if (auto* in = inputDeviceManager.getCurrentAudioDevice())
+        totalSamples += in->getCurrentBufferSizeSamples() + in->getInputLatencyInSamples();
+    if (auto* out = outputDeviceManager.getCurrentAudioDevice())
+        totalSamples += out->getCurrentBufferSizeSamples() + out->getOutputLatencyInSamples();
+
+    // Steady-state ring residency ≈ half capacity once both clocks stabilize.
+    totalSamples += kOutputRingFrames / 2;
+
+    return (totalSamples / sr) * 1000.0;
 }
 
 // ── Device Selection ──────────────────────────────────────────────────────────
 
 bool AudioEngine::setDeviceType(const juce::String& typeName)
 {
-    if (auto* currentType = deviceManager.getCurrentDeviceTypeObject())
+    if (auto* currentType = inputDeviceManager.getCurrentDeviceTypeObject())
     {
         if (currentType->getTypeName() == typeName)
         {
-            fprintf(stderr, "[AudioEngine] Device type already selected: %s\n", typeName.toRawUTF8());
+            fprintf(stderr, "[AudioEngine] Input device type already selected: %s\n", typeName.toRawUTF8());
             return true;
         }
     }
 
-    for (auto* type : deviceManager.getAvailableDeviceTypes())
+    for (auto* type : inputDeviceManager.getAvailableDeviceTypes())
     {
         if (type->getTypeName() == typeName)
         {
             try {
-                fprintf(stderr, "[AudioEngine] Setting device type: %s\n", typeName.toRawUTF8());
-                deviceManager.setCurrentAudioDeviceType(typeName, true);
+                fprintf(stderr, "[AudioEngine] Setting input device type: %s\n", typeName.toRawUTF8());
+                inputDeviceManager.setCurrentAudioDeviceType(typeName, true);
                 return true;
             } catch (const std::exception& e) {
                 fprintf(stderr, "[AudioEngine] setDeviceType crashed: %s\n", e.what());
@@ -229,28 +342,64 @@ bool AudioEngine::setDeviceType(const juce::String& typeName)
     return false;
 }
 
+bool AudioEngine::setOutputDeviceType(const juce::String& typeName)
+{
+    if (duplexMode.load(std::memory_order_relaxed))
+        return setDeviceType(typeName);
+
+    if (auto* currentType = outputDeviceManager.getCurrentDeviceTypeObject())
+    {
+        if (currentType->getTypeName() == typeName)
+            return true;
+    }
+    for (auto* type : outputDeviceManager.getAvailableDeviceTypes())
+    {
+        if (type->getTypeName() == typeName)
+        {
+            try {
+                fprintf(stderr, "[AudioEngine] Setting output device type: %s\n", typeName.toRawUTF8());
+                outputDeviceManager.setCurrentAudioDeviceType(typeName, true);
+                return true;
+            } catch (...) {
+                fprintf(stderr, "[AudioEngine] setOutputDeviceType crashed\n");
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::String& outputName,
                                   double sampleRate, int bufferSize)
 {
-    fprintf(stderr, "[AudioEngine] setAudioDevice: in='%s' out='%s' sr=%.0f bs=%d\n",
-            inputName.toRawUTF8(), outputName.toRawUTF8(), sampleRate, bufferSize);
+    DeviceConfig c;
+    c.inputType  = getCurrentInputDeviceType();
+    c.outputType = c.inputType;
+    c.inputDevice = inputName;
+    c.outputDevice = outputName;
+    c.sampleRate = sampleRate > 0 ? sampleRate : 48000.0;
+    c.bufferSize = bufferSize > 0 ? bufferSize : 256;
+    return setAudioDevices(c).ok;
+}
 
-    bool wasRunning = audioRunning.load(std::memory_order_relaxed);
+AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig& config)
+{
+    DeviceConfigResult res;
 
-    // Save current device type name before closing
-    juce::String currentTypeName;
-    if (auto* currentType = deviceManager.getCurrentDeviceTypeObject())
-        currentTypeName = currentType->getTypeName();
+    fprintf(stderr, "[AudioEngine] setAudioDevices: inType='%s' inDev='%s' outType='%s' outDev='%s' sr=%.0f bs=%d\n",
+            config.inputType.toRawUTF8(), config.inputDevice.toRawUTF8(),
+            config.outputType.toRawUTF8(), config.outputDevice.toRawUTF8(),
+            config.sampleRate, config.bufferSize);
 
-    // Initialize if no device type set yet.
-    //
-    // Linux ordering matters: JUCE typically lists JACK first whenever
-    // libjack is installed, even if jackd isn't actually running. Picking
-    // JACK in that case makes setCurrentAudioDeviceType block trying to
-    // reach a server that doesn't exist. Most home users run PulseAudio /
-    // PipeWire over ALSA, so prefer ALSA by default and let pro users
-    // who actually run JACK switch in the audio settings UI.
-    if (deviceManager.getCurrentDeviceTypeObject() == nullptr)
+    // Platform-preferred backend when unspecified. Linux prefers ALSA over
+    // JACK (jackd may be installed but not running).
+    juce::String resolvedInputType = config.inputType;
+    if (resolvedInputType.isEmpty())
+    {
+        if (auto* t = inputDeviceManager.getCurrentDeviceTypeObject())
+            resolvedInputType = t->getTypeName();
+    }
+    if (resolvedInputType.isEmpty())
     {
 #if JUCE_LINUX
         const juce::StringArray preferredOrder { "ALSA", "JACK" };
@@ -261,70 +410,131 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
 #else
         const juce::StringArray preferredOrder;
 #endif
-
-        const auto& available = deviceManager.getAvailableDeviceTypes();
-        bool selected = false;
-
-        if (!preferredOrder.isEmpty())
+        const auto& available = inputDeviceManager.getAvailableDeviceTypes();
+        for (const auto& want : preferredOrder)
         {
-            for (const auto& want : preferredOrder)
+            for (auto* type : available)
             {
-                for (auto* type : available)
+                if (type->getTypeName() == want)
                 {
-                    if (type->getTypeName() == want)
-                    {
-                        deviceManager.setCurrentAudioDeviceType(want, true);
-                        selected = true;
-                        break;
-                    }
+                    resolvedInputType = want;
+                    break;
                 }
-                if (selected) break;
             }
+            if (resolvedInputType.isNotEmpty()) break;
         }
-
-        if (!selected && !available.isEmpty())
-        {
-            // Fallback: take whatever JUCE listed first.
-            deviceManager.setCurrentAudioDeviceType(available.getFirst()->getTypeName(), true);
-        }
+        if (resolvedInputType.isEmpty() && !available.isEmpty())
+            resolvedInputType = available.getFirst()->getTypeName();
     }
 
-    // If device names are empty, use defaults for the current device type
-    juce::String resolvedInput = inputName;
-    juce::String resolvedOutput = outputName;
-    if (resolvedInput.isEmpty() || resolvedOutput.isEmpty())
+    juce::String resolvedOutputType = config.outputType.isEmpty()
+        ? resolvedInputType : config.outputType;
+
+    if (auto* current = inputDeviceManager.getCurrentDeviceTypeObject())
     {
-        if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+        if (current->getTypeName() != resolvedInputType)
+            inputDeviceManager.setCurrentAudioDeviceType(resolvedInputType, true);
+    }
+    else
+    {
+        inputDeviceManager.setCurrentAudioDeviceType(resolvedInputType, true);
+    }
+
+    juce::String resolvedInput = config.inputDevice;
+    juce::String resolvedOutput = config.outputDevice;
+    if (auto* inType = inputDeviceManager.getCurrentDeviceTypeObject())
+    {
+        if (resolvedInput.isEmpty())
         {
-            auto inputs = type->getDeviceNames(true);
-            auto outputs = type->getDeviceNames(false);
-            if (resolvedInput.isEmpty() && inputs.size() > 0)
-                resolvedInput = inputs[0];
-            if (resolvedOutput.isEmpty() && outputs.size() > 0)
-                resolvedOutput = outputs[0];
-            fprintf(stderr, "[AudioEngine] Resolved empty names: in='%s' out='%s'\n",
-                    resolvedInput.toRawUTF8(), resolvedOutput.toRawUTF8());
+            auto inputs = inType->getDeviceNames(true);
+            if (inputs.size() > 0) resolvedInput = inputs[0];
+        }
+    }
+    {
+        juce::AudioIODeviceType* outType = nullptr;
+        auto* registry = (resolvedInputType == resolvedOutputType)
+            ? &inputDeviceManager : &outputDeviceManager;
+        for (auto* t : registry->getAvailableDeviceTypes())
+        {
+            if (t->getTypeName() == resolvedOutputType) { outType = t; break; }
+        }
+        if (outType && resolvedOutput.isEmpty())
+        {
+            auto outputs = outType->getDeviceNames(false);
+            if (outputs.size() > 0) resolvedOutput = outputs[0];
         }
     }
 
-    // Configure specific devices
+    const bool isDuplex = (resolvedInputType == resolvedOutputType
+                           && resolvedInput == resolvedOutput
+                           && resolvedInput.isNotEmpty());
+
+    const bool wasRunning = audioRunning.load(std::memory_order_relaxed);
+    if (wasRunning) stopAudio();
+
+    if (isDuplex)
+    {
+        teardownSplitMode();
+
+        const juce::String err = applyDuplexSetup(resolvedInput, resolvedOutput,
+                                                  config.sampleRate, config.bufferSize);
+        if (err.isNotEmpty())
+        {
+            res.error = err;
+            res.duplex = true;
+            return res;
+        }
+        duplexMode.store(true, std::memory_order_relaxed);
+
+        if (auto* dev = inputDeviceManager.getCurrentAudioDevice())
+        {
+            res.sampleRate = dev->getCurrentSampleRate();
+            res.inputBlockSize = dev->getCurrentBufferSizeSamples();
+            res.outputBlockSize = res.inputBlockSize;
+        }
+        res.ok = true;
+        res.duplex = true;
+    }
+    else
+    {
+        DeviceConfig resolved = config;
+        resolved.inputType = resolvedInputType;
+        resolved.outputType = resolvedOutputType;
+        resolved.inputDevice = resolvedInput;
+        resolved.outputDevice = resolvedOutput;
+        if (resolved.sampleRate <= 0) resolved.sampleRate = 48000.0;
+        if (resolved.bufferSize <= 0) resolved.bufferSize = 256;
+
+        res = applySplitSetup(resolved);
+        if (!res.ok)
+            return res;
+        duplexMode.store(false, std::memory_order_relaxed);
+    }
+
+    if (wasRunning) startAudio();
+    return res;
+}
+
+juce::String AudioEngine::applyDuplexSetup(const juce::String& inputName,
+                                           const juce::String& outputName,
+                                           double sampleRate, int bufferSize)
+{
     juce::AudioDeviceManager::AudioDeviceSetup setup;
-    setup.inputDeviceName = resolvedInput;
-    setup.outputDeviceName = resolvedOutput;
+    setup.inputDeviceName = inputName;
+    setup.outputDeviceName = outputName;
     setup.sampleRate = sampleRate > 0 ? sampleRate : 48000.0;
     setup.bufferSize = bufferSize > 0 ? bufferSize : 256;
-    setup.useDefaultInputChannels = resolvedInput.isEmpty();
-    setup.useDefaultOutputChannels = resolvedOutput.isEmpty();
+    setup.useDefaultInputChannels = inputName.isEmpty();
+    setup.useDefaultOutputChannels = outputName.isEmpty();
 
-    // Skip only when the full requested setup already matches. The channel
-    // masks matter: older sessions may have opened just two inputs, and a
-    // high-numbered selectedInputChannel requires the expanded input mask.
-    if (auto* currentDevice = deviceManager.getCurrentAudioDevice())
+    // Channel masks must match too — high-numbered selectedInputChannel needs
+    // the expanded mask that an older session may not have opened.
+    if (auto* currentDevice = inputDeviceManager.getCurrentAudioDevice())
     {
         try
         {
             juce::AudioDeviceManager::AudioDeviceSetup current;
-            deviceManager.getAudioDeviceSetup(current);
+            inputDeviceManager.getAudioDeviceSetup(current);
 
             const int advertisedInputs = currentDevice->getInputChannelNames().size();
             juce::BigInteger expectedInputs;
@@ -341,10 +551,11 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
                 && current.useDefaultInputChannels == setup.useDefaultInputChannels
                 && current.useDefaultOutputChannels == setup.useDefaultOutputChannels
                 && current.inputChannels == expectedInputs
-                && current.outputChannels == expectedOutputs)
+                && current.outputChannels == expectedOutputs
+                && duplexMode.load(std::memory_order_relaxed))
             {
-                fprintf(stderr, "[AudioEngine] Device already configured with same settings, skipping\n");
-                return true;
+                fprintf(stderr, "[AudioEngine] Duplex device already configured with same settings, skipping\n");
+                return {};
             }
         }
         catch (const std::exception& e)
@@ -357,21 +568,19 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
         }
     }
 
-    if (wasRunning) stopAudio();
-
-    // Close the device completely on Linux to avoid ALSA deadlocks on
-    // reconfigure. On Windows, setAudioDeviceSetup can reconfigure in place
-    // and closing first makes WASAPI driver changes much slower.
+    // ALSA deadlocks on reconfigure unless we fully close first. WASAPI
+    // reconfigures in place and is much slower if closed.
 #if JUCE_LINUX
-    if (deviceManager.getCurrentAudioDevice() != nullptr)
+    juce::String currentTypeName;
+    if (auto* currentType = inputDeviceManager.getCurrentDeviceTypeObject())
+        currentTypeName = currentType->getTypeName();
+    if (inputDeviceManager.getCurrentAudioDevice() != nullptr)
     {
         try {
-            deviceManager.closeAudioDevice();
+            inputDeviceManager.closeAudioDevice();
             fprintf(stderr, "[AudioEngine] Closed device for reconfiguration\n");
-
-            // Re-set the device type so the device list is repopulated
             if (currentTypeName.isNotEmpty())
-                deviceManager.setCurrentAudioDeviceType(currentTypeName, true);
+                inputDeviceManager.setCurrentAudioDeviceType(currentTypeName, true);
         } catch (...) {
             fprintf(stderr, "[AudioEngine] closeAudioDevice crashed, continuing\n");
         }
@@ -380,11 +589,11 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
 
     int inputChannelCount = 0;
     int outputChannelCount = 0;
-    if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+    if (auto* type = inputDeviceManager.getCurrentDeviceTypeObject())
     {
         try
         {
-            if (auto probe = std::unique_ptr<juce::AudioIODevice>(type->createDevice(resolvedOutput, resolvedInput)))
+            if (auto probe = std::unique_ptr<juce::AudioIODevice>(type->createDevice(outputName, inputName)))
             {
                 inputChannelCount = probe->getInputChannelNames().size();
                 outputChannelCount = probe->getOutputChannelNames().size();
@@ -402,44 +611,36 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
     if (inputChannelCount <= 0) inputChannelCount = 2;
     if (outputChannelCount <= 0) outputChannelCount = 2;
 
-    // Keep every advertised input open so selectedInputChannel can choose
-    // high-numbered dry DI inputs used by mixers and modelers. Output routing
-    // remains stereo for now; exposing arbitrary output pairs is a separate UI
-    // concern tracked upstream.
     setup.inputChannels.setRange(0, inputChannelCount, true);
     setup.outputChannels.setRange(0, juce::jmin(outputChannelCount, 2), true);
 
     juce::String result;
     try {
-        result = deviceManager.setAudioDeviceSetup(setup, true);
+        result = inputDeviceManager.setAudioDeviceSetup(setup, true);
     } catch (...) {
-        fprintf(stderr, "[AudioEngine] setAudioDeviceSetup crashed\n");
-        return false;
+        return "setAudioDeviceSetup threw";
     }
     if (result.isNotEmpty())
     {
         fprintf(stderr, "[AudioEngine] Device setup error: %s\n", result.toRawUTF8());
         try {
-            result = deviceManager.initialiseWithDefaultDevices(2, 2);
+            result = inputDeviceManager.initialiseWithDefaultDevices(2, 2);
         } catch (...) {
-            fprintf(stderr, "[AudioEngine] Fallback init crashed\n");
-            return false;
+            return "fallback initialiseWithDefaultDevices threw";
         }
         if (result.isNotEmpty())
-        {
-            fprintf(stderr, "[AudioEngine] Fallback init also failed: %s\n", result.toRawUTF8());
-            return false;
-        }
+            return "device setup failed: " + result;
     }
 
-    if (auto* configuredDevice = deviceManager.getCurrentAudioDevice())
+    if (auto* configuredDevice = inputDeviceManager.getCurrentAudioDevice())
     {
         const double sr = configuredDevice->getCurrentSampleRate();
         const int bs = configuredDevice->getCurrentBufferSizeSamples();
         currentSampleRate.store(sr, std::memory_order_relaxed);
-        currentBlockSize.store(bs, std::memory_order_relaxed);
+        inputBlockSize.store(bs, std::memory_order_relaxed);
+        outputBlockSize.store(bs, std::memory_order_relaxed);
 
-        fprintf(stderr, "[AudioEngine] Device configured OK. Current device: %s\n",
+        fprintf(stderr, "[AudioEngine] Duplex device configured OK. Current device: %s\n",
                 configuredDevice->getName().toRawUTF8());
         fprintf(stderr, "[AudioEngine] Actual device setup: sr=%.0f bs=%d (requested bs=%d)\n",
                 sr, bs, bufferSize);
@@ -447,18 +648,162 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
         signalChain.prepare(sr, bs);
         noiseGate.prepare(sr, bs);
         tonePolish.prepare(sr);
+        return {};
+    }
+    currentSampleRate.store(0.0, std::memory_order_relaxed);
+    inputBlockSize.store(0, std::memory_order_relaxed);
+    outputBlockSize.store(0, std::memory_order_relaxed);
+    signalChain.releaseResources();
+    return "no current device after setup";
+}
+
+AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig& config)
+{
+    DeviceConfigResult res;
+    res.duplex = false;
+
+    if (auto* current = outputDeviceManager.getCurrentDeviceTypeObject())
+    {
+        if (current->getTypeName() != config.outputType)
+            outputDeviceManager.setCurrentAudioDeviceType(config.outputType, true);
     }
     else
     {
-        fprintf(stderr, "[AudioEngine] Device setup completed but no current device is active\n");
-        currentSampleRate.store(0.0, std::memory_order_relaxed);
-        currentBlockSize.store(0, std::memory_order_relaxed);
-        signalChain.releaseResources();
-        return false;
+        outputDeviceManager.setCurrentAudioDeviceType(config.outputType, true);
     }
 
-    if (wasRunning) startAudio();
-    return true;
+    // v1 forces matching nominal SR — no adaptive resampler yet.
+    auto rateSupportedBy = [&](juce::AudioIODeviceType* t,
+                               const juce::String& dev, bool isInput, double sr) {
+        if (!t) return false;
+        std::unique_ptr<juce::AudioIODevice> probe(
+            isInput ? t->createDevice({}, dev) : t->createDevice(dev, {}));
+        if (!probe) return false;
+        for (auto r : probe->getAvailableSampleRates())
+            if (std::abs(r - sr) < 0.5) return true;
+        return false;
+    };
+    juce::AudioIODeviceType* inputType = nullptr;
+    juce::AudioIODeviceType* outputType = nullptr;
+    for (auto* t : inputDeviceManager.getAvailableDeviceTypes())
+        if (t->getTypeName() == config.inputType) { inputType = t; break; }
+    for (auto* t : outputDeviceManager.getAvailableDeviceTypes())
+        if (t->getTypeName() == config.outputType) { outputType = t; break; }
+    if (!inputType || !outputType)
+    {
+        res.error = "Device type not found";
+        return res;
+    }
+    if (!rateSupportedBy(inputType, config.inputDevice, true, config.sampleRate)
+     || !rateSupportedBy(outputType, config.outputDevice, false, config.sampleRate))
+    {
+        res.error = "Sample rate not supported by both input and output devices";
+        return res;
+    }
+
+    juce::AudioDeviceManager::AudioDeviceSetup inSetup;
+    inSetup.inputDeviceName  = config.inputDevice;
+    inSetup.outputDeviceName = "";
+    inSetup.sampleRate = config.sampleRate;
+    inSetup.bufferSize = config.bufferSize;
+    inSetup.useDefaultInputChannels = false;
+    inSetup.useDefaultOutputChannels = false;
+
+    int inputChannelCount = 0;
+    {
+        try {
+            std::unique_ptr<juce::AudioIODevice> probe(inputType->createDevice({}, config.inputDevice));
+            if (probe) inputChannelCount = probe->getInputChannelNames().size();
+        } catch (...) {}
+    }
+    if (inputChannelCount <= 0) inputChannelCount = 2;
+    inSetup.inputChannels.setRange(0, inputChannelCount, true);
+    inSetup.outputChannels.clear();
+
+    juce::String inErr;
+    try { inErr = inputDeviceManager.setAudioDeviceSetup(inSetup, true); }
+    catch (...) { res.error = "input setAudioDeviceSetup threw"; return res; }
+    if (inErr.isNotEmpty()) { res.error = "input setup: " + inErr; return res; }
+
+    auto* inDev = inputDeviceManager.getCurrentAudioDevice();
+    if (!inDev) { res.error = "no input device after setup"; return res; }
+    const double inSr = inDev->getCurrentSampleRate();
+    const int    inBs = inDev->getCurrentBufferSizeSamples();
+
+    juce::AudioDeviceManager::AudioDeviceSetup outSetup;
+    outSetup.inputDeviceName  = "";
+    outSetup.outputDeviceName = config.outputDevice;
+    outSetup.sampleRate = config.sampleRate;
+    outSetup.bufferSize = config.bufferSize;
+    outSetup.useDefaultInputChannels = false;
+    outSetup.useDefaultOutputChannels = false;
+
+    int outputChannelCount = 0;
+    {
+        try {
+            std::unique_ptr<juce::AudioIODevice> probe(outputType->createDevice(config.outputDevice, {}));
+            if (probe) outputChannelCount = probe->getOutputChannelNames().size();
+        } catch (...) {}
+    }
+    if (outputChannelCount <= 0) outputChannelCount = 2;
+    outSetup.inputChannels.clear();
+    outSetup.outputChannels.setRange(0, juce::jmin(outputChannelCount, 2), true);
+
+    juce::String outErr;
+    try { outErr = outputDeviceManager.setAudioDeviceSetup(outSetup, true); }
+    catch (...) { res.error = "output setAudioDeviceSetup threw"; return res; }
+    if (outErr.isNotEmpty()) { res.error = "output setup: " + outErr; return res; }
+
+    auto* outDev = outputDeviceManager.getCurrentAudioDevice();
+    if (!outDev) { res.error = "no output device after setup"; return res; }
+    const double outSr = outDev->getCurrentSampleRate();
+    const int    outBs = outDev->getCurrentBufferSizeSamples();
+
+    if (std::abs(inSr - outSr) > 0.5)
+    {
+        res.error = "Input and output devices opened at different sample rates";
+        return res;
+    }
+
+    currentSampleRate.store(inSr, std::memory_order_relaxed);
+    inputBlockSize.store(inBs, std::memory_order_relaxed);
+    outputBlockSize.store(outBs, std::memory_order_relaxed);
+
+    fprintf(stderr, "[AudioEngine] Split mode configured: inSr=%.0f inBs=%d outSr=%.0f outBs=%d\n",
+            inSr, inBs, outSr, outBs);
+
+    outputRingWriteIndex.store(0, std::memory_order_relaxed);
+    outputRingReadIndex.store(0, std::memory_order_relaxed);
+    outputUnderflowCount.store(0, std::memory_order_relaxed);
+    inputOverflowCount.store(0, std::memory_order_relaxed);
+    for (auto& slot : outputPendingRing)
+        slot.store(0.0f, std::memory_order_relaxed);
+
+    signalChain.prepare(inSr, inBs);
+    noiseGate.prepare(inSr, inBs);
+    tonePolish.prepare(inSr);
+
+    res.ok = true;
+    res.sampleRate = inSr;
+    res.inputBlockSize = inBs;
+    res.outputBlockSize = outBs;
+    return res;
+}
+
+void AudioEngine::teardownSplitMode()
+{
+    if (outputCallbackRegistered)
+    {
+        outputDeviceManager.removeAudioCallback(&outputCallback);
+        outputCallbackRegistered = false;
+    }
+    try { outputDeviceManager.closeAudioDevice(); }
+    catch (...) { fprintf(stderr, "[AudioEngine] teardownSplitMode: output close threw\n"); }
+
+    outputRingWriteIndex.store(0, std::memory_order_relaxed);
+    outputRingReadIndex.store(0, std::memory_order_relaxed);
+    for (auto& slot : outputPendingRing)
+        slot.store(0.0f, std::memory_order_relaxed);
 }
 
 // ── Audio Control ─────────────────────────────────────────────────────────────
@@ -470,16 +815,36 @@ void AudioEngine::startAudio()
         fprintf(stderr, "[AudioEngine] startAudio: already running\n");
         return;
     }
-    deviceManager.addAudioCallback(this);
+
+    // Input first so it has time to prefill the ring before the output
+    // callback pulls — otherwise split mode underflows once at start.
+    inputDeviceManager.addAudioCallback(this);
+
+    if (!duplexMode.load(std::memory_order_relaxed))
+    {
+        outputDeviceManager.addAudioCallback(&outputCallback);
+        outputCallbackRegistered = true;
+    }
+
     audioRunning.store(true, std::memory_order_relaxed);
-    fprintf(stderr, "[AudioEngine] startAudio: callback added, running=1, device=%s\n",
-            deviceManager.getCurrentAudioDevice() ? deviceManager.getCurrentAudioDevice()->getName().toRawUTF8() : "none");
+    fprintf(stderr, "[AudioEngine] startAudio: duplex=%d input='%s' output='%s'\n",
+            (int) duplexMode.load(std::memory_order_relaxed),
+            inputDeviceManager.getCurrentAudioDevice()
+                ? inputDeviceManager.getCurrentAudioDevice()->getName().toRawUTF8() : "none",
+            outputDeviceManager.getCurrentAudioDevice()
+                ? outputDeviceManager.getCurrentAudioDevice()->getName().toRawUTF8() : "(duplex)");
 }
 
 void AudioEngine::stopAudio()
 {
     if (!audioRunning.load(std::memory_order_relaxed)) return;
-    deviceManager.removeAudioCallback(this);
+    // Output first so it doesn't pull from a stalling ring during detach.
+    if (outputCallbackRegistered)
+    {
+        outputDeviceManager.removeAudioCallback(&outputCallback);
+        outputCallbackRegistered = false;
+    }
+    inputDeviceManager.removeAudioCallback(this);
     audioRunning.store(false, std::memory_order_relaxed);
 }
 
@@ -521,7 +886,10 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
     backingTransport->setSource(backingSource.get(), 0, nullptr, readerSampleRate);
     backingResampler = std::make_unique<juce::ResamplingAudioSource>(backingTransport.get(), false, 2);
     backingResampler->setResamplingRatio(backingSpeed.load(std::memory_order_relaxed));
-    backingResampler->prepareToPlay(currentBlockSize.load(std::memory_order_relaxed), currentSampleRate.load(std::memory_order_relaxed));
+    // Output block size matches input block size in duplex, so this works
+    // for both paths. Split prepares against the output device specifically.
+    backingResampler->prepareToPlay(outputBlockSize.load(std::memory_order_relaxed),
+                                    currentSampleRate.load(std::memory_order_relaxed));
     cachedBackingDuration.store(backingTransport->getLengthInSeconds());
     cachedBackingPosition.store(0.0);
     std::cerr << "[AudioEngine] loadBackingTrack OK sr=" << readerSampleRate
@@ -605,10 +973,14 @@ void AudioEngine::setTonePolishEnabled(bool enabled)
 
 void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
 {
+    // Fires on the input manager — duplex serves output here too; split has
+    // audioOutputAboutToStart on the second manager.
     const double sr = device->getCurrentSampleRate();
     const int bs = device->getCurrentBufferSizeSamples();
     currentSampleRate.store(sr, std::memory_order_relaxed);
-    currentBlockSize.store(bs, std::memory_order_relaxed);
+    inputBlockSize.store(bs, std::memory_order_relaxed);
+    if (duplexMode.load(std::memory_order_relaxed))
+        outputBlockSize.store(bs, std::memory_order_relaxed);
 
     // Reset the input ring buffer so a stop→start cycle delivers a
     // clean zero-padded cold-start frame instead of mixing in stale
@@ -632,37 +1004,47 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     noiseGate.prepare(sr, bs);
     tonePolish.prepare(sr);
 
-    const juce::ScopedLock sl(backingLock);
-    if (backingResampler)
+    // Split mode preps the backing resampler in audioOutputAboutToStart instead.
+    if (duplexMode.load(std::memory_order_relaxed))
     {
-        backingResampler->prepareToPlay(bs, sr);
+        const juce::ScopedLock sl(backingLock);
+        if (backingResampler)
+            backingResampler->prepareToPlay(bs, sr);
     }
 }
 
 void AudioEngine::audioDeviceStopped()
 {
     signalChain.releaseResources();
-    // Stop the ML inference thread and clear its snapshot — audioDeviceAboutToStart()
-    // prepares it again on the next start. Without this the worker thread stays
-    // alive after a stop/device-removal and getPitchDetection()/detectNotes()
-    // could keep serving the last session's stale notes.
     mlNoteDetector.stop();
-    // Stop the chart-verification thread too — audioDeviceAboutToStart()
-    // restarts it on the next start. Without this the worker stays alive
-    // after a device stop and would keep scoring stale input-ring samples.
     noteVerifier.stop();
-    // Flatten the input ring index on stop so a getInputFrame() call
-    // made between stopAudio() and the next startAudio() returns the
-    // cold-start zero-padded frame rather than stale samples from the
-    // just-finished session.
     inputFrameRingWriteIndex.store(0, std::memory_order_relaxed);
-    // Track the actual device lifecycle, not just our intent. JUCE
-    // can stop the device externally (hot-unplug, format change, OS
-    // sleep), which fires this callback without going through our
-    // stopAudio() path — leaving audioRunning stuck at true would
-    // keep the audio-bridge's idle gate burning IPC on a dead engine
-    // until the user actually clicked Stop.
+    outputRingWriteIndex.store(0, std::memory_order_relaxed);
+    outputRingReadIndex.store(0, std::memory_order_relaxed);
     audioRunning.store(false, std::memory_order_relaxed);
+}
+
+void AudioEngine::audioOutputAboutToStart(juce::AudioIODevice* device)
+{
+    const int bs = device->getCurrentBufferSizeSamples();
+    outputBlockSize.store(bs, std::memory_order_relaxed);
+
+    if ((int) outputPullScratchL.size() < bs) outputPullScratchL.assign((size_t) bs, 0.0f);
+    if ((int) outputPullScratchR.size() < bs) outputPullScratchR.assign((size_t) bs, 0.0f);
+    outputBackingBuffer.setSize(2, bs, false, false, true);
+    outputBackingBuffer.clear();
+
+    const double sr = currentSampleRate.load(std::memory_order_relaxed);
+    {
+        const juce::ScopedLock sl(backingLock);
+        if (backingResampler)
+            backingResampler->prepareToPlay(bs, sr > 0 ? sr : device->getCurrentSampleRate());
+    }
+}
+
+void AudioEngine::audioOutputStopped()
+{
+    outputRingReadIndex.store(0, std::memory_order_relaxed);
 }
 
 void AudioEngine::audioDeviceIOCallbackWithContext(
@@ -670,8 +1052,29 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     float* const* outputData, int numOutputChannels,
     int numSamples, const juce::AudioIODeviceCallbackContext&)
 {
-    // Work directly in output buffer
-    juce::AudioBuffer<float> buffer(outputData, numOutputChannels, numSamples);
+    const bool duplex = duplexMode.load(std::memory_order_relaxed);
+
+    // Duplex writes outputData directly. Split runs DSP into a private 2-channel
+    // scratch and pushes the result to outputPendingRing for OutputCallback.
+    juce::AudioBuffer<float> buffer;
+    if (duplex)
+    {
+        buffer.setDataToReferTo(outputData, numOutputChannels, numSamples);
+    }
+    else
+    {
+        if (outputBackingBuffer.getNumChannels() < 2
+            || outputBackingBuffer.getNumSamples() < numSamples)
+        {
+            outputBackingBuffer.setSize(2, juce::jmax(numSamples, outputBackingBuffer.getNumSamples()),
+                                         false, false, true);
+        }
+        outputBackingBuffer.clear(0, 0, numSamples);
+        outputBackingBuffer.clear(1, 0, numSamples);
+        buffer.setDataToReferTo(outputBackingBuffer.getArrayOfWritePointers(), 2, numSamples);
+    }
+
+    const int effectiveOutputChannels = duplex ? numOutputChannels : 2;
 
     float inGain = inputGain.load();
     int selectedCh = selectedInputChannel.load();
@@ -686,10 +1089,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     {
         // Single-channel mode (e.g. dry from Valeton GP-5 left channel).
         // Broadcast the selected input across all output channels.
-        for (int outCh = 0; outCh < numOutputChannels; ++outCh)
+        for (int outCh = 0; outCh < effectiveOutputChannels; ++outCh)
             for (int i = 0; i < numSamples; ++i)
                 buffer.setSample(outCh, i, inputData[selectedCh][i] * inGain);
-        filledOutputChannels = numOutputChannels;
+        filledOutputChannels = effectiveOutputChannels;
     }
     else if (selectedCh < 0 && numInputChannels > 1)
     {
@@ -708,16 +1111,16 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             for (int ch = 0; ch < mixChannels; ++ch)
                 mix += inputData[ch][i];
             const float gained = mix * invCh * inGain;
-            for (int outCh = 0; outCh < numOutputChannels; ++outCh)
+            for (int outCh = 0; outCh < effectiveOutputChannels; ++outCh)
                 buffer.setSample(outCh, i, gained);
         }
-        filledOutputChannels = numOutputChannels;
+        filledOutputChannels = effectiveOutputChannels;
     }
     else
     {
         // Pass-through: single-input device, or stereo in/out with no
         // explicit channel selection and no need to mix.
-        const int passThroughChannels = juce::jmin(numInputChannels, numOutputChannels);
+        const int passThroughChannels = juce::jmin(numInputChannels, effectiveOutputChannels);
         for (int ch = 0; ch < passThroughChannels; ++ch)
             for (int i = 0; i < numSamples; ++i)
                 buffer.setSample(ch, i, inputData[ch][i] * inGain);
@@ -727,31 +1130,24 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // Zero anything we didn't fill. Previously this was hard-coded to
     // start at numInputChannels, which on a 2-in/4-out broadcast
     // config would have wiped the upper two channels we just wrote.
-    for (int ch = filledOutputChannels; ch < numOutputChannels; ++ch)
+    for (int ch = filledOutputChannels; ch < effectiveOutputChannels; ++ch)
         buffer.clear(ch, 0, numSamples);
 
     // Metering: input level (pre-processing)
     {
         float peak = 0.0f;
-        for (int ch = 0; ch < numOutputChannels; ++ch)
+        for (int ch = 0; ch < effectiveOutputChannels; ++ch)
             peak = juce::jmax(peak, buffer.getMagnitude(ch, 0, numSamples));
         currentInputLevel.store(peak);
         float prevPeak = inputPeak.load();
         if (peak > prevPeak) inputPeak.store(peak);
     }
 
-    // Feed pitch detector and the input-frame ring (before signal-
-    // chain processing, so we detect the dry guitar). In the common
-    // case (numOutputChannels > 0) the channel-copy block above
-    // guarantees buffer channel 0 holds the right post-gain mono
-    // signal for every selection mode, and we read it directly. For
-    // input-only configurations (numOutputChannels == 0, rare but
-    // legal on some ASIO/JACK setups) the output buffer is empty, so
-    // we materialize the same post-gain mono signal from `inputData`
-    // into a pre-sized scratch vector and feed both consumers from
-    // there.
+    // Feed pitch detector + ring with the pre-FX dry guitar. Buffer ch 0 holds
+    // the post-gain mono signal in both duplex and split paths. Zero-output
+    // duplex setups (input-only ASIO/JACK) need the scratch fallback.
     const float* monoSource = nullptr;
-    if (numOutputChannels > 0)
+    if (effectiveOutputChannels > 0)
     {
         monoSource = buffer.getReadPointer(0);
     }
@@ -833,45 +1229,33 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // single atomic load when disabled.
     tonePolish.processBlock(buffer);
 
-    // Mix backing track
+    // Duplex mixes backing + applies output gain + meters here.
+    // Split defers all three to OutputCallback (output device's clock).
+    if (duplex)
     {
         const juce::ScopedTryLock sl(backingLock);
         if (sl.isLocked() && backingResampler && backingTransport && backingPlaying.load())
         {
-            // The resampler was constructed with numChannels=2 (stereo backing
-            // tracks), so always use a 2-channel scratch buffer.  This avoids
-            // passing a narrower buffer into the resampler on mono output
-            // while keeping a well-defined channel count at all times.
+            // Resampler is fixed to numChannels=2, so the scratch must be too.
             backingBuffer.setSize(2, numSamples, false, false, true);
             backingBuffer.clear();
             juce::AudioSourceChannelInfo info(&backingBuffer, 0, numSamples);
             backingResampler->getNextAudioBlock(info);
 
-            // Keep cached position and playing state up to date for lock-free polling.
-            // backingTransport is non-null (checked above) and backingLock is held for
-            // this entire block via ScopedTryLock, so these reads are safe.
             cachedBackingPosition.store(backingTransport->getCurrentPosition());
-
-            // Sync the flag if transport stopped at EOF
             if (!backingTransport->isPlaying())
                 backingPlaying.store(false);
 
-            // Mix stereo backing into the first two output channels only;
-            // channels beyond index 1 are left silent so a multi-channel
-            // device does not receive unexpected content on surround outputs.
             float bVol = backingVolume.load();
             const int mixChannels = juce::jmin(numOutputChannels, 2);
             for (int ch = 0; ch < mixChannels; ++ch)
                 buffer.addFrom(ch, 0, backingBuffer, ch, 0, numSamples, bVol);
         }
-    }
 
-    // Apply output gain
-    float outGain = outputGain.load();
-    buffer.applyGain(outGain);
+        // Apply output gain
+        buffer.applyGain(outputGain.load());
 
-    // Metering: output level (post-processing)
-    {
+        // Output metering
         float peak = 0.0f;
         for (int ch = 0; ch < numOutputChannels; ++ch)
             peak = juce::jmax(peak, buffer.getMagnitude(ch, 0, numSamples));
@@ -879,6 +1263,110 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         float prevPeak = outputPeak.load();
         if (peak > prevPeak) outputPeak.store(peak);
     }
+    else
+    {
+        // Split: push processed stereo (pre-backing, pre-output-gain) into the
+        // ring. OutputCallback adds backing + output gain on its own clock.
+        constexpr uint64_t kMask = (uint64_t) kOutputRingFrames - 1;
+        const uint64_t w = outputRingWriteIndex.load(std::memory_order_relaxed);
+        const uint64_t r = outputRingReadIndex.load(std::memory_order_acquire);
+        const uint64_t fill = w - r;
+        const uint64_t cap  = (uint64_t) kOutputRingFrames;
+
+        // Drop-oldest on overflow. Steady-state drift is tens of ppm so this
+        // mainly fires at startup before the output callback catches up.
+        uint64_t writeIndex = w;
+        if (fill + (uint64_t) numSamples > cap)
+        {
+            const uint64_t newRead = (w + (uint64_t) numSamples) - cap;
+            outputRingReadIndex.store(newRead, std::memory_order_release);
+            inputOverflowCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        const float* L = buffer.getReadPointer(0);
+        const float* R = buffer.getReadPointer(1);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const uint64_t slot = (writeIndex + (uint64_t) i) & kMask;
+            outputPendingRing[slot * 2 + 0].store(L[i], std::memory_order_relaxed);
+            outputPendingRing[slot * 2 + 1].store(R[i], std::memory_order_relaxed);
+        }
+        outputRingWriteIndex.store(writeIndex + (uint64_t) numSamples, std::memory_order_release);
+    }
+}
+
+void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
+                                      int /*numInputChannels*/,
+                                      float* const* outputData,
+                                      int numOutputChannels,
+                                      int numSamples)
+{
+    juce::AudioBuffer<float> buffer(outputData, numOutputChannels, numSamples);
+    if (numOutputChannels <= 0)
+        return;
+
+    constexpr uint64_t kMask = (uint64_t) kOutputRingFrames - 1;
+    const uint64_t r = outputRingReadIndex.load(std::memory_order_relaxed);
+    const uint64_t w = outputRingWriteIndex.load(std::memory_order_acquire);
+    const uint64_t available = w - r;
+    const int      pullCount = juce::jmin(numSamples, (int) available);
+
+    if ((int) outputPullScratchL.size() < numSamples) outputPullScratchL.assign((size_t) numSamples, 0.0f);
+    if ((int) outputPullScratchR.size() < numSamples) outputPullScratchR.assign((size_t) numSamples, 0.0f);
+
+    for (int i = 0; i < pullCount; ++i)
+    {
+        const uint64_t slot = (r + (uint64_t) i) & kMask;
+        outputPullScratchL[(size_t) i] = outputPendingRing[slot * 2 + 0].load(std::memory_order_relaxed);
+        outputPullScratchR[(size_t) i] = outputPendingRing[slot * 2 + 1].load(std::memory_order_relaxed);
+    }
+    if (pullCount < numSamples)
+    {
+        for (int i = pullCount; i < numSamples; ++i)
+        {
+            outputPullScratchL[(size_t) i] = 0.0f;
+            outputPullScratchR[(size_t) i] = 0.0f;
+        }
+        outputUnderflowCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    outputRingReadIndex.store(r + (uint64_t) pullCount, std::memory_order_release);
+
+    buffer.clear();
+    const int copyChannels = juce::jmin(numOutputChannels, 2);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        buffer.setSample(0, i, outputPullScratchL[(size_t) i]);
+        if (copyChannels > 1)
+            buffer.setSample(1, i, outputPullScratchR[(size_t) i]);
+    }
+
+    {
+        const juce::ScopedTryLock sl(backingLock);
+        if (sl.isLocked() && backingResampler && backingTransport && backingPlaying.load())
+        {
+            outputBackingBuffer.setSize(2, numSamples, false, false, true);
+            outputBackingBuffer.clear();
+            juce::AudioSourceChannelInfo info(&outputBackingBuffer, 0, numSamples);
+            backingResampler->getNextAudioBlock(info);
+
+            cachedBackingPosition.store(backingTransport->getCurrentPosition());
+            if (!backingTransport->isPlaying())
+                backingPlaying.store(false);
+
+            float bVol = backingVolume.load();
+            for (int ch = 0; ch < copyChannels; ++ch)
+                buffer.addFrom(ch, 0, outputBackingBuffer, ch, 0, numSamples, bVol);
+        }
+    }
+
+    buffer.applyGain(outputGain.load());
+
+    float peak = 0.0f;
+    for (int ch = 0; ch < numOutputChannels; ++ch)
+        peak = juce::jmax(peak, buffer.getMagnitude(ch, 0, numSamples));
+    currentOutputLevel.store(peak);
+    float prevPeak = outputPeak.load();
+    if (peak > prevPeak) outputPeak.store(peak);
 }
 
 ChordScorer::Result AudioEngine::scoreChord(const ChordScorer::Request& req)

@@ -134,12 +134,26 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
         getDeviceTypes: () => ipcRenderer.invoke('audio:getDeviceTypes'),
         getSampleRates: () => ipcRenderer.invoke('audio:getSampleRates'),
         getBufferSizes: () => ipcRenderer.invoke('audio:getBufferSizes'),
-        probeDeviceOptions: (typeName: string, input: string, output: string) =>
-            ipcRenderer.invoke('audio:probeDeviceOptions', typeName, input, output),
+        probeDeviceOptions: (
+            inputTypeOrType: string,
+            inputName: string,
+            outputTypeOrOutputName: string,
+            outputName?: string,
+        ) => outputName === undefined
+            ? ipcRenderer.invoke('audio:probeDeviceOptions', inputTypeOrType, inputName, outputTypeOrOutputName)
+            : ipcRenderer.invoke('audio:probeDeviceOptions', inputTypeOrType, inputName, outputTypeOrOutputName, outputName),
         getCurrentDevice: () => ipcRenderer.invoke('audio:getCurrentDevice'),
         setDeviceType: (typeName: string) => ipcRenderer.invoke('audio:setDeviceType', typeName),
-        setDevice: (input: string, output: string, sampleRate: number, bufferSize: number) =>
-            ipcRenderer.invoke('audio:setDevice', input, output, sampleRate, bufferSize),
+        setOutputDeviceType: (typeName: string) => ipcRenderer.invoke('audio:setOutputDeviceType', typeName),
+        setDevice: (
+            arg0: any,
+            arg1?: any,
+            arg2?: any,
+            arg3?: any,
+        ) => arg1 === undefined
+            ? ipcRenderer.invoke('audio:setDevice', arg0)
+            : ipcRenderer.invoke('audio:setDevice', arg0, arg1, arg2, arg3),
+        getDeviceMetrics: () => ipcRenderer.invoke('audio:getDeviceMetrics'),
         loadDeviceSettings: () => ipcRenderer.invoke('audio:loadDeviceSettings'),
         saveDeviceSettings: (settings: unknown) => ipcRenderer.invoke('audio:saveDeviceSettings', settings),
 
