@@ -317,6 +317,7 @@ export function initAudioBridge(): void {
     ipcMain.handle('audio:getBackingPosition', () => audio?.getBackingPosition() ?? 0);
     ipcMain.handle('audio:getBackingDuration', () => audio?.getBackingDuration() ?? 0);
     ipcMain.handle('audio:isBackingPlaying', () => audio?.isBackingPlaying() ?? false);
+    ipcMain.handle('audio:setBackingSpeed', (_event, speed: number) => audio?.setBackingSpeed(speed));
 
     // ── Presets ────────────────────────────────────────────────────────────
 

@@ -89,6 +89,7 @@ public:
     void setBackingPosition(double seconds);
     void startBacking();
     void stopBacking();
+    void setBackingSpeed(double speed);
     // Non-blocking reads — do not acquire backingLock and never block the audio callback
     bool isBackingPlaying() const { return backingPlaying.load(); }
     double getBackingPosition() const { return cachedBackingPosition.load(); }
@@ -161,10 +162,12 @@ private:
     // Backing track
     std::unique_ptr<juce::AudioFormatReaderSource> backingSource;
     std::unique_ptr<juce::AudioTransportSource> backingTransport;
+    std::unique_ptr<juce::ResamplingAudioSource> backingResampler;
     juce::AudioBuffer<float> backingBuffer;
     std::atomic<bool> backingPlaying{false};
     std::atomic<double> cachedBackingPosition{0.0};
     std::atomic<double> cachedBackingDuration{0.0};
+    std::atomic<double> backingSpeed{1.0};
     juce::CriticalSection backingLock;
 
     // Toggled from startAudio()/stopAudio() (main / device-management

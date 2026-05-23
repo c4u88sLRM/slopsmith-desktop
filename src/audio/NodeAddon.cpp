@@ -1293,6 +1293,15 @@ static Napi::Value IsBackingPlaying(const Napi::CallbackInfo& info)
     return Napi::Boolean::New(info.Env(), playing);
 }
 
+static Napi::Value SetBackingSpeed(const Napi::CallbackInfo& info)
+{
+    if (engine && info.Length() > 0)
+    {
+        engine->setBackingSpeed(info[0].As<Napi::Number>().DoubleValue());
+    }
+    return info.Env().Undefined();
+}
+
 // ── Presets ───────────────────────────────────────────────────────────────────
 
 static Napi::Value SavePreset(const Napi::CallbackInfo& info)
@@ -1614,6 +1623,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     exports.Set("getBackingPosition", Napi::Function::New(env, GetBackingPosition));
     exports.Set("getBackingDuration", Napi::Function::New(env, GetBackingDuration));
     exports.Set("isBackingPlaying", Napi::Function::New(env, IsBackingPlaying));
+    exports.Set("setBackingSpeed", Napi::Function::New(env, SetBackingSpeed));
 
     // Presets
     exports.Set("savePreset", Napi::Function::New(env, SavePreset));
