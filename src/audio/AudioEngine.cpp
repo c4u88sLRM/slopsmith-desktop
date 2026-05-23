@@ -997,6 +997,16 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     if ((int) inputCaptureScratch.size() < bs)
         inputCaptureScratch.assign((size_t) bs, 0.0f);
 
+    // Input callback uses outputBackingBuffer as DSP scratch in split mode.
+    // Pre-size against input block size so the hot path can't allocate when
+    // inputBlockSize > outputBlockSize (audioOutputAboutToStart only sizes
+    // against output).
+    if (!duplexMode.load(std::memory_order_relaxed)
+        && outputBackingBuffer.getNumSamples() < bs)
+    {
+        outputBackingBuffer.setSize(2, bs, false, false, true);
+    }
+
     signalChain.prepare(sr, bs);
     pitchDetector.prepare(sr, bs);
     mlNoteDetector.prepare(sr, bs);
