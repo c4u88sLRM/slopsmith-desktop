@@ -537,37 +537,15 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
     const bool userIntendsDuplex = (resolvedInputType == resolvedOutputType
                                     && config.inputDevice == config.outputDevice);
 
-    juce::String resolvedInput = config.inputDevice;
-    juce::String resolvedOutput = config.outputDevice;
-    if (!userIntendsDuplex)
-    {
-        // Only resolve empty names when we may need them for split-mode
-        // classification / setup. Duplex with both empty stays "system
-        // default" and applyDuplexSetup() passes the empty names through
-        // to JUCE's initialiseWithDefaultDevices fallback.
-        if (auto* inType = inputDeviceManager.getCurrentDeviceTypeObject())
-        {
-            if (resolvedInput.isEmpty())
-            {
-                auto inputs = inType->getDeviceNames(true);
-                if (inputs.size() > 0) resolvedInput = inputs[0];
-            }
-        }
-        {
-            juce::AudioIODeviceType* outType = nullptr;
-            auto* registry = (resolvedInputType == resolvedOutputType)
-                ? &inputDeviceManager : &outputDeviceManager;
-            for (auto* t : registry->getAvailableDeviceTypes())
-            {
-                if (t->getTypeName() == resolvedOutputType) { outType = t; break; }
-            }
-            if (outType && resolvedOutput.isEmpty())
-            {
-                auto outputs = outType->getDeviceNames(false);
-                if (outputs.size() > 0) resolvedOutput = outputs[0];
-            }
-        }
-    }
+    // Don't resolve empty names to first-device-of-each-type. Pre-PR
+    // behavior — and Copilot's fail-closed concern — treat empty names
+    // as "OS default" per side. Filling them with inputs[0] / outputs[0]
+    // is JUCE-enumeration-order dependent and can pick the wrong device
+    // (e.g. an audio interface that isn't the system default). Both
+    // applyDuplexSetup and applySplitSetup handle empty names by setting
+    // useDefault*Channels=true, letting JUCE select the OS default.
+    const juce::String& resolvedInput  = config.inputDevice;
+    const juce::String& resolvedOutput = config.outputDevice;
 
     const bool isDuplex = userIntendsDuplex
                           || (resolvedInputType == resolvedOutputType
@@ -835,7 +813,11 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
     inSetup.outputDeviceName = "";
     inSetup.sampleRate = config.sampleRate;
     inSetup.bufferSize = config.bufferSize;
-    inSetup.useDefaultInputChannels = false;
+    // Empty inputDeviceName == "use OS default input" — mirror what
+    // applyDuplexSetup does. Setting useDefaultInputChannels=true asks
+    // JUCE to pick the platform default's channel mask, which is the
+    // right thing when we haven't been given a specific device name.
+    inSetup.useDefaultInputChannels = config.inputDevice.isEmpty();
     inSetup.useDefaultOutputChannels = false;
 
     int inputChannelCount = 0;
@@ -875,7 +857,9 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
     outSetup.sampleRate = config.sampleRate;
     outSetup.bufferSize = config.bufferSize;
     outSetup.useDefaultInputChannels = false;
-    outSetup.useDefaultOutputChannels = false;
+    // Same default-channel semantics for empty outputDeviceName as the
+    // input side above.
+    outSetup.useDefaultOutputChannels = config.outputDevice.isEmpty();
 
     int outputChannelCount = 0;
     {
