@@ -203,13 +203,22 @@ AudioEngine::DeviceOptions AudioEngine::probeDeviceOptionsDual(const juce::Strin
                     // apply-side check accepts it.
                     if (std::abs(r - r2) <= 0.5)
                     {
-                        // Round to nominal: backends sometimes report
-                        // fractional near-48000 rates and surfacing the
-                        // raw value into the UI would round-trip back to
-                        // setAudioDeviceSetup, which expects an exact
-                        // supported rate. Round to the nearest integer
-                        // so the UI option matches what JUCE will accept.
-                        options.sampleRates.addIfNotAlreadyThere(std::round(r));
+                        // Round the midpoint to a clean nominal rate
+                        // (backends sometimes report fractional near-48000
+                        // rates; surfacing the raw value would fail the
+                        // apply-side setAudioDeviceSetup, which expects an
+                        // exact supported nominal). Re-check the rounded
+                        // candidate is within tolerance of BOTH sides — a
+                        // matched pair like 48000.4/48000.6 passes the |r-r2|
+                        // check but std::round(48000.4)=48000 would fall
+                        // outside tolerance of 48000.6 (diff 0.6). Skip
+                        // those so the probe stays fail-closed.
+                        const double candidate = std::round((r + r2) * 0.5);
+                        if (std::abs(r  - candidate) <= 0.5
+                         && std::abs(r2 - candidate) <= 0.5)
+                        {
+                            options.sampleRates.addIfNotAlreadyThere(candidate);
+                        }
                         break;
                     }
                 }
