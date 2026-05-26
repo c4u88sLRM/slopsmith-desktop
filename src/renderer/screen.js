@@ -1018,6 +1018,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             if (audioRunning) {
                 await api.stopAudio();
                 audioRunning = false;
+                // Reflect the stopped state in the UI immediately so a
+                // subsequent setDevice failure doesn't leave the label
+                // saying "Stop" while audioRunning is already false —
+                // the next click would otherwise *start* audio despite
+                // the label.
+                toggleBtn.textContent = 'Start';
             }
             const inputType = deviceTypeSelect.value;
             const outputType = outputDeviceTypeSelect?.value || inputType;
