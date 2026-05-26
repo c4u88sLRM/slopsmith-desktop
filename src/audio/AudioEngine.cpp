@@ -105,9 +105,15 @@ AudioEngine::DeviceOptions AudioEngine::probeDeviceOptionsDual(const juce::Strin
     options.outputType = outputTypeName.isEmpty() ? inputTypeName : outputTypeName;
     options.type = options.inputType;   // legacy alias
 
-    auto findType = [&](const juce::String& wanted) -> juce::AudioIODeviceType* {
+    // Resolve each side from its own manager so probe stays consistent with
+    // applySplitSetup()/setOutputDeviceType(), which mutate the manager that
+    // owns the side they're configuring. Using inputDeviceManager for the
+    // output lookup would silently fall back to whatever input has scanned,
+    // which can miss output-only backends.
+    auto findType = [](juce::AudioDeviceManager& manager,
+                       const juce::String& wanted) -> juce::AudioIODeviceType* {
         juce::AudioIODeviceType* match = nullptr;
-        for (auto* type : inputDeviceManager.getAvailableDeviceTypes())
+        for (auto* type : manager.getAvailableDeviceTypes())
         {
             if ((wanted.isNotEmpty() && type->getTypeName() == wanted)
                 || (wanted.isEmpty() && match == nullptr))
@@ -119,8 +125,8 @@ AudioEngine::DeviceOptions AudioEngine::probeDeviceOptionsDual(const juce::Strin
         return match;
     };
 
-    auto* inputType  = findType(options.inputType);
-    auto* outputType = findType(options.outputType);
+    auto* inputType  = findType(inputDeviceManager, options.inputType);
+    auto* outputType = findType(outputDeviceManager, options.outputType);
 
     if (inputType == nullptr)
     {
@@ -276,9 +282,14 @@ AudioEngine::DeviceMetrics AudioEngine::getDeviceMetrics() const
     m.outputRingCapacityFrames = kOutputRingFrames;
     if (! m.duplex)
     {
-        const auto w = outputRingWriteIndex.load(std::memory_order_acquire);
-        const auto r = outputRingReadIndex.load(std::memory_order_acquire);
-        m.outputRingFillFrames = (int) (w - r);
+        // Output device can stop while the input keeps writing, leaving
+        // (w - r) larger than capacity. Clamp uint64 → int via the
+        // capacity ceiling so the consumer-facing field never overflows
+        // or goes negative.
+        const uint64_t w = outputRingWriteIndex.load(std::memory_order_acquire);
+        const uint64_t r = outputRingReadIndex.load(std::memory_order_acquire);
+        const uint64_t fill = (w >= r) ? (w - r) : 0;
+        m.outputRingFillFrames = (int) std::min(fill, (uint64_t) kOutputRingFrames);
     }
     return m;
 }
@@ -433,14 +444,25 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
     juce::String resolvedOutputType = config.outputType.isEmpty()
         ? resolvedInputType : config.outputType;
 
-    if (auto* current = inputDeviceManager.getCurrentDeviceTypeObject())
+    // setCurrentAudioDeviceType can throw from inside JUCE backends (ASIO
+    // is the usual culprit). Catch and propagate as a structured error so
+    // the N-API caller doesn't see the exception cross the boundary.
+    try
     {
-        if (current->getTypeName() != resolvedInputType)
+        if (auto* current = inputDeviceManager.getCurrentDeviceTypeObject())
+        {
+            if (current->getTypeName() != resolvedInputType)
+                inputDeviceManager.setCurrentAudioDeviceType(resolvedInputType, true);
+        }
+        else
+        {
             inputDeviceManager.setCurrentAudioDeviceType(resolvedInputType, true);
+        }
     }
-    else
+    catch (...)
     {
-        inputDeviceManager.setCurrentAudioDeviceType(resolvedInputType, true);
+        res.error = "setCurrentAudioDeviceType threw for input type '" + resolvedInputType + "'";
+        return res;
     }
 
     juce::String resolvedInput = config.inputDevice;
@@ -505,7 +527,11 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
         resolved.outputType = resolvedOutputType;
         resolved.inputDevice = resolvedInput;
         resolved.outputDevice = resolvedOutput;
-        if (resolved.sampleRate <= 0) resolved.sampleRate = 48000.0;
+        // Validate finite-and-positive, not just `<= 0` — a NaN slipping in
+        // from a non-numeric JS value would satisfy neither comparison and
+        // poison rateSupportedBy() downstream.
+        if (!std::isfinite(resolved.sampleRate) || resolved.sampleRate <= 0.0)
+            resolved.sampleRate = 48000.0;
         if (resolved.bufferSize <= 0) resolved.bufferSize = 256;
 
         res = applySplitSetup(resolved);
@@ -665,14 +691,25 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
     DeviceConfigResult res;
     res.duplex = false;
 
-    if (auto* current = outputDeviceManager.getCurrentDeviceTypeObject())
+    // setCurrentAudioDeviceType can throw from JUCE backends (ASIO).
+    // Catch so the failure surfaces as a structured error rather than an
+    // exception crossing the N-API boundary.
+    try
     {
-        if (current->getTypeName() != config.outputType)
+        if (auto* current = outputDeviceManager.getCurrentDeviceTypeObject())
+        {
+            if (current->getTypeName() != config.outputType)
+                outputDeviceManager.setCurrentAudioDeviceType(config.outputType, true);
+        }
+        else
+        {
             outputDeviceManager.setCurrentAudioDeviceType(config.outputType, true);
+        }
     }
-    else
+    catch (...)
     {
-        outputDeviceManager.setCurrentAudioDeviceType(config.outputType, true);
+        res.error = "setCurrentAudioDeviceType threw for output type '" + config.outputType + "'";
+        return res;
     }
 
     // v1 forces matching nominal SR — no adaptive resampler yet.
@@ -1136,12 +1173,14 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     }
     else
     {
-        if (outputBackingBuffer.getNumChannels() < 2
-            || outputBackingBuffer.getNumSamples() < numSamples)
-        {
-            outputBackingBuffer.setSize(2, juce::jmax(numSamples, outputBackingBuffer.getNumSamples()),
-                                         false, false, true);
-        }
+        // outputBackingBuffer is pre-sized to inputBlockSize in
+        // audioDeviceAboutToStart(); never realloc on the RT thread. A
+        // reconfig race could transiently deliver a larger numSamples —
+        // clamp it (drop the tail) so the rest of the callback operates
+        // strictly within the allocated scratch.
+        const int scratchCap = outputBackingBuffer.getNumSamples();
+        if (numSamples > scratchCap)
+            numSamples = scratchCap;
         outputBackingBuffer.clear(0, 0, numSamples);
         outputBackingBuffer.clear(1, 0, numSamples);
         buffer.setDataToReferTo(outputBackingBuffer.getArrayOfWritePointers(), 2, numSamples);

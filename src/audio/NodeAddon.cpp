@@ -471,8 +471,16 @@ static Napi::Value SetDevice(const Napi::CallbackInfo& info)
             if (obj.Has(key) && obj.Get(key).IsString()) return obj.Get(key).As<Napi::String>().Utf8Value();
             return {};
         };
+        // Reject NaN/Infinity at the JS→C boundary so they can't poison
+        // downstream comparisons (NaN <= 0 is false, so the validation
+        // fallback in setAudioDevices() wouldn't catch them). Casting a
+        // non-finite double to int is also UB in C++.
         auto readNum = [&](const char* key, double def) -> double {
-            if (obj.Has(key) && obj.Get(key).IsNumber()) return obj.Get(key).As<Napi::Number>().DoubleValue();
+            if (obj.Has(key) && obj.Get(key).IsNumber())
+            {
+                const double v = obj.Get(key).As<Napi::Number>().DoubleValue();
+                if (std::isfinite(v)) return v;
+            }
             return def;
         };
         cfg.inputType    = juce::String(readStr("inputType"));

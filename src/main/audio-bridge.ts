@@ -93,12 +93,25 @@ function normalizeDeviceSettings(settings: unknown): AudioDeviceSettings | null 
 
 function normalizeDeviceOptions(
     options: unknown,
-    fallback: { type: string; inputType?: string; outputType?: string; input: string; output: string; error?: string },
+    fallback: {
+        type: string;
+        inputType?: string;
+        outputType?: string;
+        input: string;
+        output: string;
+        error?: string;
+        compatible?: boolean;
+    },
 ) {
     const record = asRecord(options);
     const inputType = String(record?.inputType ?? record?.type ?? fallback.inputType ?? fallback.type ?? '');
     const outputType = String(record?.outputType ?? record?.type ?? fallback.outputType ?? fallback.type ?? inputType);
-    const compatible = typeof record?.compatible === 'boolean' ? record.compatible : true;
+    // Default to NOT compatible when the probe didn't say so — defaulting to
+    // true here would leave Apply enabled in the addon-unavailable fallback
+    // even though the same path also reports an error.
+    const compatible = typeof record?.compatible === 'boolean'
+        ? record.compatible
+        : (fallback.compatible ?? false);
     return {
         type: String(record?.type ?? fallback.type ?? inputType),
         inputType,
@@ -310,7 +323,19 @@ export function initAudioBridge(): void {
         // main-process exception.
         try {
             if (args.length === 1 && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
-                return audio.setDevice(args[0]);
+                // NodeAddon's object-payload path expects numeric
+                // sampleRate/bufferSize (it falls back to 48000/256 when
+                // the key isn't a Number). Saved settings round-trip
+                // through JSON / DOM strings, so coerce here so a
+                // string-shaped "48000" doesn't silently reopen at the
+                // fallback rate. Non-finite values fall through to the
+                // native fallback (handled there too as defense-in-depth).
+                const payload = { ...args[0] };
+                const sr = Number(payload.sampleRate);
+                const bs = Number(payload.bufferSize);
+                if (Number.isFinite(sr) && sr > 0) payload.sampleRate = sr;
+                if (Number.isFinite(bs) && bs > 0) payload.bufferSize = bs;
+                return audio.setDevice(payload);
             }
             const [input, output, sampleRate, bufferSize] = args;
             return audio.setDevice(input, output, sampleRate, bufferSize);
