@@ -1148,8 +1148,12 @@ void AudioEngine::audioOutputAboutToStart(juce::AudioIODevice* device)
 
     if ((int) outputPullScratchL.size() < bs) outputPullScratchL.assign((size_t) bs, 0.0f);
     if ((int) outputPullScratchR.size() < bs) outputPullScratchR.assign((size_t) bs, 0.0f);
-    outputBackingBuffer.setSize(2, bs, false, false, true);
-    outputBackingBuffer.clear();
+    // NOTE: outputBackingBuffer is sized by audioDeviceAboutToStart() from the
+    // INPUT device's block size — it's the split-input DSP scratch, not an
+    // output-side buffer. Don't touch it here: resizing from the output
+    // thread races with the input callback and can shrink the scratch below
+    // its expected size. The output side uses backingBuffer / backingInputBuffer,
+    // sized below.
 
     const double srStored = currentSampleRate.load(std::memory_order_relaxed);
     const double sr = srStored > 0.0 ? srStored : device->getCurrentSampleRate();
