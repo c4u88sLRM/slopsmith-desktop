@@ -788,13 +788,23 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
     inSetup.inputChannels.setRange(0, inputChannelCount, true);
     inSetup.outputChannels.clear();
 
+    // Rollback helper: on any failure path after a side has been opened,
+    // close both managers' devices so we don't leave the OS audio resource
+    // held (sometimes exclusively, e.g. ASIO) while setDevice reports a
+    // failure. closeAudioDevice is idempotent so unconditional calls are
+    // safe even when only the input or neither side opened.
+    auto rollbackOpenedDevices = [&]() {
+        try { inputDeviceManager.closeAudioDevice(); } catch (...) {}
+        try { outputDeviceManager.closeAudioDevice(); } catch (...) {}
+    };
+
     juce::String inErr;
     try { inErr = inputDeviceManager.setAudioDeviceSetup(inSetup, true); }
-    catch (...) { res.error = "input setAudioDeviceSetup threw"; return res; }
-    if (inErr.isNotEmpty()) { res.error = "input setup: " + inErr; return res; }
+    catch (...) { res.error = "input setAudioDeviceSetup threw"; rollbackOpenedDevices(); return res; }
+    if (inErr.isNotEmpty()) { res.error = "input setup: " + inErr; rollbackOpenedDevices(); return res; }
 
     auto* inDev = inputDeviceManager.getCurrentAudioDevice();
-    if (!inDev) { res.error = "no input device after setup"; return res; }
+    if (!inDev) { res.error = "no input device after setup"; rollbackOpenedDevices(); return res; }
     const double inSr = inDev->getCurrentSampleRate();
     const int    inBs = inDev->getCurrentBufferSizeSamples();
 
@@ -819,17 +829,18 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
 
     juce::String outErr;
     try { outErr = outputDeviceManager.setAudioDeviceSetup(outSetup, true); }
-    catch (...) { res.error = "output setAudioDeviceSetup threw"; return res; }
-    if (outErr.isNotEmpty()) { res.error = "output setup: " + outErr; return res; }
+    catch (...) { res.error = "output setAudioDeviceSetup threw"; rollbackOpenedDevices(); return res; }
+    if (outErr.isNotEmpty()) { res.error = "output setup: " + outErr; rollbackOpenedDevices(); return res; }
 
     auto* outDev = outputDeviceManager.getCurrentAudioDevice();
-    if (!outDev) { res.error = "no output device after setup"; return res; }
+    if (!outDev) { res.error = "no output device after setup"; rollbackOpenedDevices(); return res; }
     const double outSr = outDev->getCurrentSampleRate();
     const int    outBs = outDev->getCurrentBufferSizeSamples();
 
     if (std::abs(inSr - outSr) > 0.5)
     {
         res.error = "Input and output devices opened at different sample rates";
+        rollbackOpenedDevices();
         return res;
     }
 
@@ -1142,6 +1153,16 @@ void AudioEngine::audioDeviceStopped()
     outputRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingReadIndex.store(0, std::memory_order_relaxed);
     audioRunning.store(false, std::memory_order_relaxed);
+
+    // Note on split-mode lifecycle: we deliberately do NOT detach the
+    // output callback here. JUCE auto-restarts a transiently-stopped input
+    // device by re-firing audioDeviceAboutToStart() on its own; that path
+    // doesn't re-add the output callback, so detaching would break
+    // automatic recovery (output stays silent until a manual reconfigure).
+    // While input is down, the output side naturally produces silence —
+    // there's no producer feeding outputPendingRing, so the consumer's
+    // underflow branch zero-fills and the device buffer goes quiet without
+    // a teardown. Real teardown belongs to stopAudio() / teardownSplitMode().
 }
 
 void AudioEngine::audioOutputAboutToStart(juce::AudioIODevice* device)
