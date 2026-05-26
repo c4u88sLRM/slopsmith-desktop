@@ -207,10 +207,23 @@ AudioEngine::DeviceOptions AudioEngine::probeDeviceOptionsDual(const juce::Strin
                 options.compatible = false;
             }
 
+            // Split mode opens both sides with the same bufferSize, so the
+            // UI should only see sizes the intersection of both devices
+            // supports — a union would let the user pick a value that
+            // predictably fails at apply time on one side.
             const auto inBufs = inDev->getAvailableBufferSizes();
             const auto outBufs = outDev->getAvailableBufferSizes();
-            for (auto b : outBufs) options.bufferSizes.addIfNotAlreadyThere(b);
-            for (auto b : inBufs) options.bufferSizes.addIfNotAlreadyThere(b);
+            for (auto b : inBufs)
+            {
+                for (auto b2 : outBufs)
+                {
+                    if (b == b2)
+                    {
+                        options.bufferSizes.addIfNotAlreadyThere(b);
+                        break;
+                    }
+                }
+            }
         }
 
         fprintf(stderr, "[AudioEngine] Probed device options: inType='%s' outType='%s' in='%s' out='%s' "
@@ -497,12 +510,22 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
     const bool wasRunning = audioRunning.load(std::memory_order_relaxed);
     if (wasRunning) stopAudio();
 
+    // Normalize before branching — applyDuplexSetup() only checks `> 0` and
+    // would otherwise let Infinity (or NaN slipping past N-API) reach JUCE
+    // on the legacy positional setDevice() path. Finite-and-positive is the
+    // baseline both modes need.
+    const double requestedSampleRate =
+        (std::isfinite(config.sampleRate) && config.sampleRate > 0.0)
+            ? config.sampleRate
+            : 48000.0;
+    const int requestedBufferSize = config.bufferSize > 0 ? config.bufferSize : 256;
+
     if (isDuplex)
     {
         teardownSplitMode();
 
         const juce::String err = applyDuplexSetup(resolvedInput, resolvedOutput,
-                                                  config.sampleRate, config.bufferSize);
+                                                  requestedSampleRate, requestedBufferSize);
         if (err.isNotEmpty())
         {
             res.error = err;
@@ -527,12 +550,8 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
         resolved.outputType = resolvedOutputType;
         resolved.inputDevice = resolvedInput;
         resolved.outputDevice = resolvedOutput;
-        // Validate finite-and-positive, not just `<= 0` — a NaN slipping in
-        // from a non-numeric JS value would satisfy neither comparison and
-        // poison rateSupportedBy() downstream.
-        if (!std::isfinite(resolved.sampleRate) || resolved.sampleRate <= 0.0)
-            resolved.sampleRate = 48000.0;
-        if (resolved.bufferSize <= 0) resolved.bufferSize = 256;
+        resolved.sampleRate = requestedSampleRate;
+        resolved.bufferSize = requestedBufferSize;
 
         res = applySplitSetup(resolved);
         if (!res.ok)

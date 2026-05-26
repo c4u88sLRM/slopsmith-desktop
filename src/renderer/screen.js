@@ -385,7 +385,17 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
         const compatible = options?.compatible !== false;
         if (srMismatchWarning) {
+            // `compatible: false` can come from non-SR causes (addon
+            // unavailable, device type missing, probe failure). Surface
+            // options.error when present so the user sees the actual
+            // reason instead of the generic SR-mismatch copy.
             srMismatchWarning.classList.toggle('hidden', compatible);
+            const errMsg = (typeof options?.error === 'string' && options.error.length > 0)
+                ? options.error
+                : '';
+            srMismatchWarning.textContent = !compatible && errMsg
+                ? errMsg
+                : "Input and output devices don't share a compatible sample rate. Pick devices that both support the same rate (typical: 48000 Hz) or use the same device for both directions.";
         }
         if (applyDeviceBtn) {
             applyDeviceBtn.disabled = !compatible;
