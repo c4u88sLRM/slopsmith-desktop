@@ -1482,6 +1482,16 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
     uint64_t r = outputRingReadIndex.load(std::memory_order_relaxed);
     const uint64_t w = outputRingWriteIndex.load(std::memory_order_acquire);
 
+    // If audioDeviceStopped() raced between our two loads and reset both
+    // indices to 0, we can observe w < r. Treat that as an empty ring
+    // and resync — without this, the unsigned (w - r) wraps into a huge
+    // positive value and falls into the catch-up branch reading stale slots.
+    if (w < r)
+    {
+        r = w;
+        outputRingReadIndex.store(r, std::memory_order_relaxed);
+    }
+
     // Catch up if the producer has lapped (drop-oldest is achieved via this
     // single-writer consumer-side advance, not a producer-side write to r).
     if ((w - r) > kCap)
