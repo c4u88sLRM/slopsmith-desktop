@@ -1182,12 +1182,13 @@ void AudioEngine::audioOutputAboutToStart(juce::AudioIODevice* device)
 
 void AudioEngine::audioOutputStopped()
 {
-    // Reset readIndex on the consumer side (this callback is fired after the
-    // output callback has stopped, so no consumer is active). The producer
-    // (input callback) keeps advancing writeIndex if the input device is
-    // still running — the consumer's catch-up branch in audioOutputCallback
-    // handles the resulting (w - r) > cap on the next output start.
-    outputRingReadIndex.store(0, std::memory_order_relaxed);
+    // No-op by design. The consumer's catch-up branch in audioOutputCallback
+    // handles both (w - r) > cap (producer lapped during the stop) and
+    // w < r (a future reset race) on the next output start, so we don't
+    // need to reset readIndex here. Resetting r to 0 while the producer
+    // keeps advancing w is equivalent — both end up in the catch-up branch
+    // — but it leaves a transient window where r appears reset without the
+    // ring invariants being re-established, which is harder to reason about.
 }
 
 void AudioEngine::audioDeviceIOCallbackWithContext(

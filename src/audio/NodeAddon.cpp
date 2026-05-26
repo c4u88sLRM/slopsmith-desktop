@@ -492,7 +492,16 @@ static Napi::Value SetDevice(const Napi::CallbackInfo& info)
         cfg.outputDevice = juce::String(readStr("outputDevice"));
         if (cfg.outputDevice.isEmpty()) cfg.outputDevice = juce::String(readStr("output"));
         cfg.sampleRate = readNum("sampleRate", 48000.0);
-        cfg.bufferSize = (int) readNum("bufferSize", 256.0);
+        // Clamp before the double→int cast: finite-but-out-of-range values
+        // (e.g. a JS-side bug passing 1e18) are UB to convert to int. readNum
+        // already filtered non-finite; we just need a range check here.
+        {
+            const double bsd = readNum("bufferSize", 256.0);
+            if (bsd >= 1.0 && bsd <= (double) std::numeric_limits<int>::max())
+                cfg.bufferSize = (int) bsd;
+            else
+                cfg.bufferSize = 256;
+        }
     }
     else
     {
