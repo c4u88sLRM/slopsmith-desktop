@@ -525,34 +525,54 @@ AudioEngine::DeviceConfigResult AudioEngine::setAudioDevices(const DeviceConfig&
         return res;
     }
 
+    // User-intent duplex: both sides came in identical (typically both
+    // empty = "system default", or both naming the same explicit device).
+    // Capture before we resolve names, otherwise the resolve loop below
+    // fills empty-input with first-input-device and empty-output with
+    // first-output-device — those usually differ (especially on macOS
+    // where defaults are separate input/output devices), and the engine
+    // would silently route into split mode with ~85ms of ring-buffer
+    // latency for a config the user expected to be duplex. Legacy
+    // pre-PR settings commonly use empty names; preserve their behavior.
+    const bool userIntendsDuplex = (resolvedInputType == resolvedOutputType
+                                    && config.inputDevice == config.outputDevice);
+
     juce::String resolvedInput = config.inputDevice;
     juce::String resolvedOutput = config.outputDevice;
-    if (auto* inType = inputDeviceManager.getCurrentDeviceTypeObject())
+    if (!userIntendsDuplex)
     {
-        if (resolvedInput.isEmpty())
+        // Only resolve empty names when we may need them for split-mode
+        // classification / setup. Duplex with both empty stays "system
+        // default" and applyDuplexSetup() passes the empty names through
+        // to JUCE's initialiseWithDefaultDevices fallback.
+        if (auto* inType = inputDeviceManager.getCurrentDeviceTypeObject())
         {
-            auto inputs = inType->getDeviceNames(true);
-            if (inputs.size() > 0) resolvedInput = inputs[0];
+            if (resolvedInput.isEmpty())
+            {
+                auto inputs = inType->getDeviceNames(true);
+                if (inputs.size() > 0) resolvedInput = inputs[0];
+            }
         }
-    }
-    {
-        juce::AudioIODeviceType* outType = nullptr;
-        auto* registry = (resolvedInputType == resolvedOutputType)
-            ? &inputDeviceManager : &outputDeviceManager;
-        for (auto* t : registry->getAvailableDeviceTypes())
         {
-            if (t->getTypeName() == resolvedOutputType) { outType = t; break; }
-        }
-        if (outType && resolvedOutput.isEmpty())
-        {
-            auto outputs = outType->getDeviceNames(false);
-            if (outputs.size() > 0) resolvedOutput = outputs[0];
+            juce::AudioIODeviceType* outType = nullptr;
+            auto* registry = (resolvedInputType == resolvedOutputType)
+                ? &inputDeviceManager : &outputDeviceManager;
+            for (auto* t : registry->getAvailableDeviceTypes())
+            {
+                if (t->getTypeName() == resolvedOutputType) { outType = t; break; }
+            }
+            if (outType && resolvedOutput.isEmpty())
+            {
+                auto outputs = outType->getDeviceNames(false);
+                if (outputs.size() > 0) resolvedOutput = outputs[0];
+            }
         }
     }
 
-    const bool isDuplex = (resolvedInputType == resolvedOutputType
-                           && resolvedInput == resolvedOutput
-                           && resolvedInput.isNotEmpty());
+    const bool isDuplex = userIntendsDuplex
+                          || (resolvedInputType == resolvedOutputType
+                              && resolvedInput == resolvedOutput
+                              && resolvedInput.isNotEmpty());
 
     // Normalize before branching — applyDuplexSetup() only checks `> 0` and
     // would otherwise let Infinity (or NaN slipping past N-API) reach JUCE
