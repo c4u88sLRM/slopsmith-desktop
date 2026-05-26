@@ -795,11 +795,12 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
 
 void AudioEngine::teardownSplitMode()
 {
-    if (outputCallbackRegistered)
-    {
-        outputDeviceManager.removeAudioCallback(&outputCallback);
-        outputCallbackRegistered = false;
-    }
+    // Unconditional remove — JUCE's removeAudioCallback is idempotent
+    // (no-op if the callback isn't registered), so we don't need the
+    // outputCallbackRegistered guard here. This makes teardown robust
+    // against a stale flag left over from a previous failed split setup.
+    outputDeviceManager.removeAudioCallback(&outputCallback);
+    outputCallbackRegistered = false;
     try { outputDeviceManager.closeAudioDevice(); }
     catch (...) { fprintf(stderr, "[AudioEngine] teardownSplitMode: output close threw\n"); }
 
@@ -1111,6 +1112,11 @@ void AudioEngine::audioOutputAboutToStart(juce::AudioIODevice* device)
 
 void AudioEngine::audioOutputStopped()
 {
+    // Reset readIndex on the consumer side (this callback is fired after the
+    // output callback has stopped, so no consumer is active). The producer
+    // (input callback) keeps advancing writeIndex if the input device is
+    // still running — the consumer's catch-up branch in audioOutputCallback
+    // handles the resulting (w - r) > cap on the next output start.
     outputRingReadIndex.store(0, std::memory_order_relaxed);
 }
 
@@ -1364,31 +1370,26 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     {
         // Split: push processed stereo (pre-backing, pre-output-gain) into the
         // ring. OutputCallback adds backing + output gain on its own clock.
+        //
+        // Strict SPSC: producer (this callback) only ever writes
+        // outputRingWriteIndex; consumer (audioOutputCallback) is the sole
+        // writer of outputRingReadIndex. Drop-oldest is achieved by letting
+        // writeIndex lap the buffer — old slots get overwritten in place,
+        // and the consumer catches up by advancing its own readIndex when
+        // it observes (w - r) > cap. Counting the overflow at the consumer
+        // side is what surfaces it in DeviceMetrics.
         constexpr uint64_t kMask = (uint64_t) kOutputRingFrames - 1;
         const uint64_t w = outputRingWriteIndex.load(std::memory_order_relaxed);
-        const uint64_t r = outputRingReadIndex.load(std::memory_order_acquire);
-        const uint64_t fill = w - r;
-        const uint64_t cap  = (uint64_t) kOutputRingFrames;
-
-        // Drop-oldest on overflow. Steady-state drift is tens of ppm so this
-        // mainly fires at startup before the output callback catches up.
-        uint64_t writeIndex = w;
-        if (fill + (uint64_t) numSamples > cap)
-        {
-            const uint64_t newRead = (w + (uint64_t) numSamples) - cap;
-            outputRingReadIndex.store(newRead, std::memory_order_release);
-            inputOverflowCount.fetch_add(1, std::memory_order_relaxed);
-        }
 
         const float* L = buffer.getReadPointer(0);
         const float* R = buffer.getReadPointer(1);
         for (int i = 0; i < numSamples; ++i)
         {
-            const uint64_t slot = (writeIndex + (uint64_t) i) & kMask;
+            const uint64_t slot = (w + (uint64_t) i) & kMask;
             outputPendingRing[slot * 2 + 0].store(L[i], std::memory_order_relaxed);
             outputPendingRing[slot * 2 + 1].store(R[i], std::memory_order_relaxed);
         }
-        outputRingWriteIndex.store(writeIndex + (uint64_t) numSamples, std::memory_order_release);
+        outputRingWriteIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
     }
 }
 
@@ -1403,13 +1404,29 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
         return;
 
     constexpr uint64_t kMask = (uint64_t) kOutputRingFrames - 1;
-    const uint64_t r = outputRingReadIndex.load(std::memory_order_relaxed);
-    const uint64_t w = outputRingWriteIndex.load(std::memory_order_acquire);
-    const uint64_t available = w - r;
-    const int      pullCount = juce::jmin(numSamples, (int) available);
+    constexpr uint64_t kCap  = (uint64_t) kOutputRingFrames;
 
-    if ((int) outputPullScratchL.size() < numSamples) outputPullScratchL.assign((size_t) numSamples, 0.0f);
-    if ((int) outputPullScratchR.size() < numSamples) outputPullScratchR.assign((size_t) numSamples, 0.0f);
+    // Clamp the working size to the scratch capacity pre-allocated in
+    // audioOutputAboutToStart() so the .assign() calls below never realloc
+    // on the RT thread when a transient oversized block arrives (mirrors
+    // the backing path's clamp in audioDeviceIOCallbackWithContext).
+    const int scratchCap = (int) outputPullScratchL.size();
+    const int outSamples = juce::jmin(numSamples, scratchCap);
+
+    uint64_t r = outputRingReadIndex.load(std::memory_order_relaxed);
+    const uint64_t w = outputRingWriteIndex.load(std::memory_order_acquire);
+
+    // Catch up if the producer has lapped (drop-oldest is achieved via this
+    // single-writer consumer-side advance, not a producer-side write to r).
+    if ((w - r) > kCap)
+    {
+        r = w - kCap;
+        outputRingReadIndex.store(r, std::memory_order_relaxed);
+        inputOverflowCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const uint64_t available = w - r;
+    const int      pullCount = juce::jmin(outSamples, (int) available);
 
     for (int i = 0; i < pullCount; ++i)
     {
@@ -1417,9 +1434,9 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
         outputPullScratchL[(size_t) i] = outputPendingRing[slot * 2 + 0].load(std::memory_order_relaxed);
         outputPullScratchR[(size_t) i] = outputPendingRing[slot * 2 + 1].load(std::memory_order_relaxed);
     }
-    if (pullCount < numSamples)
+    if (pullCount < outSamples)
     {
-        for (int i = pullCount; i < numSamples; ++i)
+        for (int i = pullCount; i < outSamples; ++i)
         {
             outputPullScratchL[(size_t) i] = 0.0f;
             outputPullScratchR[(size_t) i] = 0.0f;
@@ -1430,7 +1447,7 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
 
     buffer.clear();
     const int copyChannels = juce::jmin(numOutputChannels, 2);
-    for (int i = 0; i < numSamples; ++i)
+    for (int i = 0; i < outSamples; ++i)
     {
         buffer.setSample(0, i, outputPullScratchL[(size_t) i]);
         if (copyChannels > 1)
@@ -1447,17 +1464,17 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
             const double rate = juce::jlimit(0.01, kMaxBackingSpeed, backingSpeed.load(std::memory_order_relaxed));
             const int outCap = backingBuffer.getNumSamples();
             const int inCap  = backingInputBuffer.getNumSamples();
-            const int outSamples = juce::jmin(numSamples, outCap);
-            const int inputFrames = juce::jmin((int) std::ceil(outSamples * rate), inCap);
+            const int backingOut = juce::jmin(numSamples, outCap);
+            const int inputFrames = juce::jmin((int) std::ceil(backingOut * rate), inCap);
 
             backingInputBuffer.clear(0, inputFrames);
             juce::AudioSourceChannelInfo info(&backingInputBuffer, 0, inputFrames);
             backingTransport->getNextAudioBlock(info);
 
-            backingBuffer.clear(0, outSamples);
+            backingBuffer.clear(0, backingOut);
             const float* const* inPtrs  = backingInputBuffer.getArrayOfReadPointers();
             float* const*       outPtrs = backingBuffer.getArrayOfWritePointers();
-            backingStretch.process(inPtrs, inputFrames, outPtrs, outSamples);
+            backingStretch.process(inPtrs, inputFrames, outPtrs, backingOut);
 
             const double srNow = currentSampleRate.load(std::memory_order_relaxed);
             const double latencyInputSec = (srNow > 0.0)
@@ -1470,7 +1487,7 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
 
             float bVol = backingVolume.load();
             for (int ch = 0; ch < copyChannels; ++ch)
-                buffer.addFrom(ch, 0, backingBuffer, ch, 0, outSamples, bVol);
+                buffer.addFrom(ch, 0, backingBuffer, ch, 0, backingOut, bVol);
         }
     }
 

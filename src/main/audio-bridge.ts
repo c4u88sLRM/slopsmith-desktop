@@ -304,11 +304,21 @@ export function initAudioBridge(): void {
         if (!audio) return { ok: false, error: 'Native audio addon not available', duplex: true };
         // Object payload: setDevice({inputType, inputDevice, outputType, outputDevice, sampleRate, bufferSize})
         // Legacy positional: setDevice(input, output, sampleRate, bufferSize)
-        if (args.length === 1 && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
-            return audio.setDevice(args[0]);
+        // setAudioDeviceSetup can throw from the JUCE backend (ASIO drivers
+        // are especially fond of this) — catch so the IPC promise resolves
+        // with a structured error instead of rejecting into an unhandled
+        // main-process exception.
+        try {
+            if (args.length === 1 && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+                return audio.setDevice(args[0]);
+            }
+            const [input, output, sampleRate, bufferSize] = args;
+            return audio.setDevice(input, output, sampleRate, bufferSize);
+        } catch (e: unknown) {
+            const error = e instanceof Error ? e.message : String(e);
+            console.warn(`[audio] setDevice threw: ${error}`);
+            return { ok: false, error, duplex: true };
         }
-        const [input, output, sampleRate, bufferSize] = args;
-        return audio.setDevice(input, output, sampleRate, bufferSize);
     });
 
     ipcMain.handle('audio:getDeviceMetrics', () => {
