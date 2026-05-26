@@ -428,7 +428,8 @@ static Napi::Value SetDeviceType(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
     auto liveEngine = snapshotEngine();
-    if (!liveEngine || info.Length() < 1) return Napi::Boolean::New(env, false);
+    if (!liveEngine || info.Length() < 1 || !info[0].IsString())
+        return Napi::Boolean::New(env, false);
 
     auto typeName = info[0].As<Napi::String>().Utf8Value();
     bool result = liveEngine->setDeviceType(juce::String(typeName));
