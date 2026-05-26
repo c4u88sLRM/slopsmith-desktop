@@ -783,6 +783,19 @@ AudioEngine::DeviceConfigResult AudioEngine::applySplitSetup(const DeviceConfig&
     DeviceConfigResult res;
     res.duplex = false;
 
+    // The split-mode output ring is fixed at kOutputRingFrames samples
+    // (~85ms @ 48kHz). A single callback at bufferSize > kOutputRingFrames
+    // would overrun the ring in one go, guaranteeing immediate
+    // overwrite/wrap and audible glitches. Reject those configurations up
+    // front — duplex still works fine since it bypasses the ring entirely.
+    if (config.bufferSize > kOutputRingFrames)
+    {
+        res.error = "Buffer size " + juce::String(config.bufferSize)
+                  + " exceeds split-mode ring capacity ("
+                  + juce::String(kOutputRingFrames) + "). Pick a smaller buffer size or use duplex.";
+        return res;
+    }
+
     // setCurrentAudioDeviceType can throw from JUCE backends (ASIO).
     // Catch so the failure surfaces as a structured error rather than an
     // exception crossing the N-API boundary.
