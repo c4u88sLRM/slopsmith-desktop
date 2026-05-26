@@ -905,13 +905,15 @@ void AudioEngine::startAudio()
 
 void AudioEngine::stopAudio()
 {
-    if (!audioRunning.load(std::memory_order_relaxed)) return;
+    // Always attempt to detach both callbacks — removeAudioCallback is
+    // idempotent. We don't gate on audioRunning here because that flag can
+    // be cleared externally by audioDeviceStopped() (input device
+    // hot-unplug); in split mode the output callback may still be registered
+    // even after the input side has reported itself stopped, and a guarded
+    // stopAudio() would no-op while leaving the output device producing.
     // Output first so it doesn't pull from a stalling ring during detach.
-    if (outputCallbackRegistered)
-    {
-        outputDeviceManager.removeAudioCallback(&outputCallback);
-        outputCallbackRegistered = false;
-    }
+    outputDeviceManager.removeAudioCallback(&outputCallback);
+    outputCallbackRegistered = false;
     inputDeviceManager.removeAudioCallback(this);
     audioRunning.store(false, std::memory_order_relaxed);
 }
