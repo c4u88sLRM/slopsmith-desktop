@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>

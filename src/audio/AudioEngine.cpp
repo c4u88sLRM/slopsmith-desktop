@@ -1,5 +1,6 @@
 #include "AudioEngine.h"
 
+#include <algorithm>
 #include <cmath>
 
 // Hard ceiling on backing playback speed. This drives input buffer sizing and runtime clamp.
