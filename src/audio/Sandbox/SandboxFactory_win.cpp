@@ -17,21 +17,17 @@ namespace slopsmith::sandbox {
 
 namespace {
 
-// Filename-only matching in v1. The manufacturer-based denylist was
-// removed: at LoadVST time we synthesise a PluginDescription whose
-// manufacturerName is empty (we haven't scanned the plugin yet), so a
-// manufacturer match was unreachable in practice. The manufacturer +
-// vst3 UID route lands with the proper plugin-scan / sandbox-list.json
-// follow-up.
+// Historical pre-seed of plugins known to fail in-process. With the
+// sandbox-by-default policy in shouldSandbox() below, every VST3 routes to
+// the sandbox regardless of this list, so it no longer determines routing
+// on its own. It survives as (a) documentation of *why* each plugin
+// originally needed the sandbox, (b) diagnostic tagging in shouldSandbox's
+// VST_TRACE output, and (c) forward-looking infrastructure for a future
+// per-plugin opt-in (these are the plugins that should never opt back into
+// in-process even if the user toggles the opt-in).
 //
-// v1 is effect-plugins only: the sandbox path doesn't yet deliver MIDI to
-// the plugin (op::kMidiEvent is no-op'd in vst-host and gets sent over the
-// control channel, which the audio-shm MIDI follow-up replaces). Forcing
-// MIDI-driven instruments through here would silently make them mute.
-//
-// Once inline MIDI lands in PR #2, add the other NI offenders back:
-//   "Massive", "Reaktor", "Kontakt", "Battery", "Komplete Kontrol",
-//   "FM8", "Absynth", "Maschine", "Monark".
+// MIDI is supported in the sandbox since the v2 audio-shm inline-MIDI
+// protocol — instruments are no longer muted by the sandbox path.
 const juce::StringArray kDefaultNeedsSandboxFilenames = {
     "Guitar Rig",
     // PolyChrome DSP Graphene — its editor faults (access violation) when
@@ -141,21 +137,37 @@ juce::File resolveSandboxExe()
     return {};
 }
 
+// Routing policy: every VST3 plugin loads via the out-of-process sandbox.
+// Non-VST3 processors (NAM, IR) stay in-process.
+//
+// Why default to sandboxed: many VSTs assume their host's message thread is
+// the OS main thread, with proper STA COM initialisation — the environment
+// native DAWs give plugins by construction. Slopsmith is Electron: V8 owns
+// the OS main thread, so JUCE's message thread is a *background* thread.
+// That mismatch is the root cause of nearly every in-process plugin failure
+// we have crash dumps for (AmpliTube's half-wired editor, TONEX's heap
+// corruption, Graphene's editor access violation, ASIO driver AVs touched
+// by AmpliTube's shared standalone init). The sandbox child's WinMain *is*
+// its message thread, with STA COM init — exactly the environment plugins
+// expect. Containment is a byproduct: a sandbox crash kills the disposable
+// child, not Slopsmith.
+//
+// The pre-seed list and runtime crash blocklist remain. They no longer gate
+// routing on their own — every VST3 takes the sandbox path regardless — but
+// the VST_TRACE output preserves *why* a given plugin matched, which is
+// useful for diagnostics and for a future per-plugin opt-in mechanism.
 bool shouldSandbox(const juce::PluginDescription& desc)
 {
-    // Filename match: useful at LoadVST time before we have the manufacturer.
-    // Anchor to prefix on a .vst3 file rather than a loose substring so a
-    // non-NI plugin whose name happens to contain "Guitar Rig" doesn't get
-    // forced into the sandbox.
     const auto path = juce::File(desc.fileOrIdentifier);
+
+    // VST3 only: non-VST3 processors (NAM models, IRs) keep loading in-process.
     if (!path.getFileName().endsWithIgnoreCase(".vst3"))
         return false;
 
-    // Runtime crash blocklist: a plugin that took the app down in-process on
-    // a previous run is routed through the sandbox even if it doesn't match
-    // the filename heuristic below. Compared in canonical full-path form so a
-    // slash-direction or relative/absolute difference between the persisted
-    // path and the one handed to LoadVST can't cause a silent miss.
+    // Runtime crash blocklist — diagnostic tagging only under the
+    // sandbox-by-default policy. Canonical full-path form so a slash-direction
+    // or relative/absolute difference between the persisted path and the one
+    // handed to LoadVST can't cause a silent miss.
     {
         const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
         const auto canonical = path.getFullPathName();
@@ -167,6 +179,10 @@ bool shouldSandbox(const juce::PluginDescription& desc)
         }
     }
 
+    // Pre-seed filename match — diagnostic tagging only under the
+    // sandbox-by-default policy. Prefix-anchored on the basename so a non-NI
+    // plugin whose name happens to contain "Guitar Rig" doesn't get a
+    // misleading trace line.
     const auto basename = path.getFileNameWithoutExtension();
     for (auto& needle : kDefaultNeedsSandboxFilenames)
     {
@@ -178,7 +194,10 @@ bool shouldSandbox(const juce::PluginDescription& desc)
             return true;
         }
     }
-    return false;
+
+    VST_TRACE("shouldSandbox: %s — default policy (every VST3 sandboxes)",
+              desc.fileOrIdentifier.toRawUTF8());
+    return true;
 }
 
 std::unique_ptr<juce::AudioProcessor> tryLoadSandboxed(
