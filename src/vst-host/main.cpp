@@ -637,11 +637,27 @@ void runAudioThread(HostState& st)
 // every other state-mutating op on st.editor / st.editorWindow.
 static void releaseEditorFlag(HostState& st)
 {
-    if (st.userCloseRequestedFromButton.exchange(false, std::memory_order_acq_rel))
+    // Drain user-close intent only while the message loop is alive and the
+    // control channel is owned by us. During shutdown (st.running=false)
+    // ~HostState will destroy editor/window anyway, and st.control is
+    // sequencing its own teardown — touching it here can either block the
+    // message thread on a pipe write to a closing peer or race
+    // control.stop()'s join. Skipping the drain on the shutdown path is
+    // observably correct: any host that opened the editor learns about
+    // the close via the sandbox process exiting (crash callback or wait
+    // status), which already flips SandboxedProcessor::editorOpen=false.
+    if (st.running.load(std::memory_order_acquire))
     {
-        if (st.editorWindow) st.editorWindow.reset();
-        if (st.editor)       st.editor.reset();
-        st.control.sendEvent(event::kEditorClosed, {});
+        if (st.userCloseRequestedFromButton.exchange(false, std::memory_order_acq_rel))
+        {
+            if (st.editorWindow) st.editorWindow.reset();
+            if (st.editor)       st.editor.reset();
+            st.control.sendEvent(event::kEditorClosed, {});
+        }
+    }
+    else
+    {
+        st.userCloseRequestedFromButton.store(false, std::memory_order_release);
     }
     st.editorRequestInFlight.store(false, std::memory_order_release);
 }
