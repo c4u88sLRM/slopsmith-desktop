@@ -860,6 +860,20 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
             {
                 st.editorWindow->setVisible(true);
                 st.editorWindow->toFront(true);
+                // If the user X'd the window while this lambda was queued
+                // (CAS-fail path in closeButtonPressed set the flag), do
+                // NOT report success — releaseEditorFlag will destroy the
+                // window + send kEditorClosed in that branch, and replying
+                // success here would race that event on the host side
+                // (event arrives first sets editorOpen=false, then the
+                // true reply restores editorOpen=true on a destroyed
+                // window — stuck-open state).
+                if (st.userCloseRequestedFromButton.load(std::memory_order_acquire))
+                {
+                    releaseEditorFlag(st);  // drains: destroys + sends event
+                    reply(false, {}, "user closed editor during open");
+                    return;
+                }
                 HWND existing = (HWND)st.editorWindow->getWindowHandle();
                 juce::DynamicObject::Ptr res(new juce::DynamicObject());
                 res->setProperty("hwnd", "0x" + juce::String::toHexString(
@@ -994,6 +1008,16 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                 st.editor.reset();
                 releaseEditorFlag(st);
                 reply(false, {}, "failed to obtain native window handle");
+                return;
+            }
+            // Same user-close-during-open guard as the repeat-open path:
+            // setVisible(true) above can yield to the message loop briefly
+            // (peer creation pumps messages on Windows), so an X click
+            // queued during creation could land before we get here.
+            if (st.userCloseRequestedFromButton.load(std::memory_order_acquire))
+            {
+                releaseEditorFlag(st);
+                reply(false, {}, "user closed editor during open");
                 return;
             }
             juce::DynamicObject::Ptr res(new juce::DynamicObject());
