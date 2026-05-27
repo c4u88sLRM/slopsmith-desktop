@@ -889,8 +889,24 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                     // user sees it vanish immediately, then send the
                     // event — even if sendEvent burns the full timeout
                     // there's no visible editor frame still waiting.
+                    //
+                    // st-lifetime safety: WinMain's main dispatch loop
+                    // (~line 1536) exits as soon as st.running goes
+                    // false, BEFORE any ~HostState destruction starts.
+                    // Once the loop exits no callAsync lambda can fire —
+                    // queued ones are destructed (capture refs released
+                    // without invocation, no UAF). The defensive running
+                    // check below is belt-and-braces: if the loop is
+                    // mid-tick when running flips, we bail rather than
+                    // touch st.control / st.editorWindow while shutdown
+                    // teardown logic is racing against us elsewhere.
                     juce::MessageManager::callAsync([&st]
                     {
+                        if (! st.running.load(std::memory_order_acquire))
+                        {
+                            st.editorRequestInFlight.store(false, std::memory_order_release);
+                            return;
+                        }
                         if (st.editorWindow) st.editorWindow.reset();
                         if (st.editor)       st.editor.reset();
                         st.control.sendEvent(event::kEditorClosed, {});

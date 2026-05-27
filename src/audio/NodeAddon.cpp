@@ -2006,8 +2006,16 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
     // closes a UAF window where the slot could be removed (or the engine
     // torn down) between this call returning and the async firing.
     // Return optimistically; matches the in-process path below.
-    if (dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
+    if (auto* sb = dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
     {
+        // Synchronous gate: if the sandbox child is already gone (crashed
+        // or shut down) there's no point scheduling the IPC. Return false
+        // so the renderer can surface "editor unavailable" rather than
+        // toggling its UI into a fake-open state that no event will ever
+        // contradict. hasEditor() above already gated on isAlive() but a
+        // crash between then and now is possible — re-check here.
+        if (!sb->isAlive())
+            return Napi::Boolean::New(env, false);
         juce::MessageManager::callAsync([slotId]()
         {
             auto liveEngine = snapshotEngine();
