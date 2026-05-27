@@ -285,6 +285,15 @@ struct HostState
     // without this guard a host retrying kOpenEditor (timeout, double-click,
     // etc.) could race two async lambdas on st.editor / st.editorWindow.
     std::atomic<bool> editorRequestInFlight{false};
+    // Set true when the user clicks the editor window's X while another
+    // op (kOpenEditor toFront / kCloseEditor / close-button-destroy) still
+    // holds editorRequestInFlight. The in-flight op's CAS-release site
+    // (always on the message thread, via releaseEditorFlag) drains this
+    // flag — destroys the editor and sends event::kEditorClosed — so the
+    // user's close intent is honoured even when their click landed during
+    // a tiny in-flight window. Without this, the close would be silently
+    // dropped and the host would think the editor is still open.
+    std::atomic<bool> userCloseRequestedFromButton{false};
     std::thread audioThread;
     std::atomic<int> sampleRate{48000};
     std::atomic<int> blockSize{256};
@@ -620,6 +629,23 @@ void runAudioThread(HostState& st)
     st.audioPausedAck.signal();
 }
 
+// Release the editor-op flag and, on the way out, drain any user-close
+// intent the X button captured while we held the flag. Called by every
+// kOpenEditor / kCloseEditor / close-button lambda exit path — anywhere
+// editorRequestInFlight transitions back to false. All call sites are on
+// the message thread, so the destroy + sendEvent here are sequenced with
+// every other state-mutating op on st.editor / st.editorWindow.
+static void releaseEditorFlag(HostState& st)
+{
+    if (st.userCloseRequestedFromButton.exchange(false, std::memory_order_acq_rel))
+    {
+        if (st.editorWindow) st.editorWindow.reset();
+        if (st.editor)       st.editor.reset();
+        st.control.sendEvent(event::kEditorClosed, {});
+    }
+    st.editorRequestInFlight.store(false, std::memory_order_release);
+}
+
 void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                      const juce::var& args)
 {
@@ -840,7 +866,7 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                                               (juce::int64)(uintptr_t)existing));
                 res->setProperty("w", st.editor ? st.editor->getWidth()  : 0);
                 res->setProperty("h", st.editor ? st.editor->getHeight() : 0);
-                st.editorRequestInFlight.store(false, std::memory_order_release);
+                releaseEditorFlag(st);
                 reply(true, juce::var(res.get()));
                 return;
             }
@@ -848,7 +874,7 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
             st.editor.reset(st.plugin->createEditorAndMakeActive());
             if (!st.editor)
             {
-                st.editorRequestInFlight.store(false, std::memory_order_release);
+                releaseEditorFlag(st);
                 reply(false, {}, "createEditorAndMakeActive null");
                 return;
             }
@@ -875,14 +901,26 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                     // otherwise hit the repeat-open fast path and return
                     // success on a window about to be destroyed. Holding
                     // the in-flight flag rejects that with "already in
-                    // flight" until the destroy completes. If the flag is
-                    // already taken (an open/close is in progress), let
-                    // that path run to completion instead — closing a
-                    // mid-flight editor is a no-op.
+                    // flight" until the destroy completes.
+                    //
+                    // If the flag is already taken (a kOpenEditor or
+                    // kCloseEditor is mid-flight), set the user-close
+                    // intent flag. releaseEditorFlag() — called by
+                    // every editorRequestInFlight clear site on the
+                    // message thread — drains it: destroys the editor
+                    // and sends event::kEditorClosed once the in-flight
+                    // op finishes. Without that, the host could receive
+                    // a successful kOpenEditor reply after the user had
+                    // already clicked X, leaving editorOpen=true on the
+                    // host side for a window the user already dismissed.
                     bool closeExpected = false;
                     if (! st.editorRequestInFlight.compare_exchange_strong(
                             closeExpected, true, std::memory_order_acq_rel))
+                    {
+                        st.userCloseRequestedFromButton.store(true,
+                                                              std::memory_order_release);
                         return;
+                    }
                     // Defer destruction + the kEditorClosed send to the
                     // next message-loop tick. Doing the send inside
                     // closeButtonPressed (this callback) would block the
@@ -922,19 +960,19 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                     {
                         if (! st.running.load(std::memory_order_acquire))
                         {
-                            st.editorRequestInFlight.store(false, std::memory_order_release);
+                            releaseEditorFlag(st);
                             return;
                         }
                         if (st.editorWindow) st.editorWindow.reset();
                         if (st.editor)       st.editor.reset();
                         st.control.sendEvent(event::kEditorClosed, {});
-                        st.editorRequestInFlight.store(false, std::memory_order_release);
+                        releaseEditorFlag(st);
                     });
                     if (! queued)
                     {
                         hostLogf("editor close-button: callAsync rejected — "
                                  "message queue likely shutting down");
-                        st.editorRequestInFlight.store(false, std::memory_order_release);
+                        releaseEditorFlag(st);
                     }
                 });
             st.editorWindow->setVisible(true);
@@ -954,7 +992,7 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                 // following up with a redundant kCloseEditor on hwnd==null.
                 st.editorWindow.reset();
                 st.editor.reset();
-                st.editorRequestInFlight.store(false, std::memory_order_release);
+                releaseEditorFlag(st);
                 reply(false, {}, "failed to obtain native window handle");
                 return;
             }
@@ -962,14 +1000,14 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
             res->setProperty("hwnd", "0x" + juce::String::toHexString((juce::int64)(uintptr_t)hwnd));
             res->setProperty("w", st.editor->getWidth());
             res->setProperty("h", st.editor->getHeight());
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(true, juce::var(res.get()));
           }
           catch (const std::exception& e)
           {
             st.editorWindow.reset();
             st.editor.reset();
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             hostLogf("kOpenEditor: editor creation threw: %s", e.what());
             reply(false, {}, juce::String("editor creation threw: ") + e.what());
           }
@@ -977,7 +1015,7 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
           {
             st.editorWindow.reset();
             st.editor.reset();
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             hostLogf("kOpenEditor: editor creation threw (unknown exception)");
             reply(false, {}, "editor creation threw (unknown exception)");
           }
@@ -987,7 +1025,7 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
             // Lambda never runs, so undo the in-flight flag here and surface
             // the failure to the host — otherwise editorRequestInFlight would
             // stay true forever and block all subsequent open/close requests.
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(false, {}, "message queue unavailable (shutdown)");
         }
     }
@@ -1004,11 +1042,11 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
         {
             st.editorWindow.reset();
             st.editor.reset();
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(true, {});
         }))
         {
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(false, {}, "message queue unavailable (shutdown)");
         }
     }
