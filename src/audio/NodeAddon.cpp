@@ -1997,8 +1997,20 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
     // etc.) because their render context lives in the child. The child's
     // kOpenEditor handler brings the existing window to front on a repeat
     // click, so re-entry is cheap and we don't track host-side state.
+    //
+    // Dispatch off the N-API call thread: requestOpenEditor() uses a
+    // blocking control->request (kDefaultReplyTimeoutMs = 10s), which on
+    // a slow or hung sandbox would otherwise stall V8's JS thread for
+    // the full timeout. Run it on the JUCE message thread (a background
+    // thread under Electron) the same way the in-process path below
+    // dispatches createEditorAndMakeActive. Return optimistically — the
+    // existing in-process path also returns true before its callAsync
+    // resolves.
     if (auto* sb = dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
-        return Napi::Boolean::New(env, sb->requestOpenEditor());
+    {
+        juce::MessageManager::callAsync([sb]() { sb->requestOpenEditor(); });
+        return Napi::Boolean::New(env, true);
+    }
 
     // In-process plugin — host-side PluginEditorWindow flow. If a window
     // already exists for this slot, bring it to front rather than creating

@@ -442,10 +442,13 @@ bool SandboxedProcessor::requestOpenEditor()
     auto result = control->request(op::kOpenEditor, {}, kDefaultReplyTimeoutMs, &err);
     if (!result.isObject())
     {
-        // The sandbox may have completed the open after we gave up (timeout
-        // or transient channel hiccup); best-effort close so a sandbox-side
-        // window isn't orphaned until the next open / kShutdown.
-        control->postNoReply(op::kCloseEditor, {});
+        // Don't auto-send op::kCloseEditor here. With the top-level-window
+        // model the child may already have a visible editor window the
+        // user can interact with (the open could have succeeded but the
+        // reply got lost on the wire); auto-closing would dismiss a valid
+        // editor against user intent. If no window is open, the next Edit
+        // click sends a fresh kOpenEditor, which the child handles either
+        // by creating one or by toFront-ing the existing one.
         return false;
     }
     // The HWND in the reply payload is left over from the previous embed

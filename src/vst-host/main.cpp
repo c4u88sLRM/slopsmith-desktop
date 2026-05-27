@@ -857,11 +857,27 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                     // here would unwind through its own stack. The host's
                     // op::kCloseEditor path lands at the same teardown
                     // code, so this is idempotent if both fire.
+                    //
+                    // Take editorRequestInFlight first: between this
+                    // callback returning and the queued destroy lambda
+                    // running, an op::kOpenEditor from the host would
+                    // otherwise hit the repeat-open fast path and return
+                    // success on a window about to be destroyed. Holding
+                    // the in-flight flag rejects that with "already in
+                    // flight" until the destroy completes. If the flag is
+                    // already taken (an open/close is in progress), let
+                    // that path run to completion instead — closing a
+                    // mid-flight editor is a no-op.
+                    bool closeExpected = false;
+                    if (! st.editorRequestInFlight.compare_exchange_strong(
+                            closeExpected, true, std::memory_order_acq_rel))
+                        return;
                     st.control.sendEvent(event::kEditorClosed, {});
                     juce::MessageManager::callAsync([&st]
                     {
                         if (st.editorWindow) st.editorWindow.reset();
                         if (st.editor)       st.editor.reset();
+                        st.editorRequestInFlight.store(false, std::memory_order_release);
                     });
                 });
             st.editorWindow->setVisible(true);
