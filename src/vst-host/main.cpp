@@ -900,7 +900,14 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                     // mid-tick when running flips, we bail rather than
                     // touch st.control / st.editorWindow while shutdown
                     // teardown logic is racing against us elsewhere.
-                    juce::MessageManager::callAsync([&st]
+                    // callAsync returns false if the message queue can't
+                    // accept the post (queue already torn down during a
+                    // racing shutdown). Clear the in-flight flag on that
+                    // path so subsequent open/close requests in the same
+                    // process lifetime aren't permanently rejected as
+                    // "already in flight". The op::kCloseEditor handler
+                    // (~line 946) does the same.
+                    const bool queued = juce::MessageManager::callAsync([&st]
                     {
                         if (! st.running.load(std::memory_order_acquire))
                         {
@@ -912,6 +919,12 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                         st.control.sendEvent(event::kEditorClosed, {});
                         st.editorRequestInFlight.store(false, std::memory_order_release);
                     });
+                    if (! queued)
+                    {
+                        hostLogf("editor close-button: callAsync rejected — "
+                                 "message queue likely shutting down");
+                        st.editorRequestInFlight.store(false, std::memory_order_release);
+                    }
                 });
             st.editorWindow->setVisible(true);
             HWND hwnd = (HWND)st.editorWindow->getWindowHandle();

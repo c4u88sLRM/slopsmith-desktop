@@ -2042,12 +2042,19 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
         editorWindows.erase(it);
     }
 
-    // Create editor on the message thread
-    auto* processor = slot->processor.get();
-    auto name = slot->name;
-
-    juce::MessageManager::callAsync([processor, name, slotId]()
+    // Create editor on the message thread. Capture slotId only — re-resolve
+    // the slot via snapshotEngine() + getSlot(slotId) inside the lambda so a
+    // SignalChain::removeProcessor() between this call returning and the
+    // async firing can't leave us calling createEditorAndMakeActive() on a
+    // dangling juce::AudioProcessor*. Mirrors the sandbox branch's pattern.
+    juce::MessageManager::callAsync([slotId]()
     {
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) return;
+        auto* slot = liveEngine->getSignalChain().getSlot(slotId);
+        if (!slot || !slot->processor) return;
+        auto* processor = slot->processor.get();
+        auto name = slot->name;
         juce::AudioProcessorEditor* editor = nullptr;
         try {
             editor = processor->createEditorAndMakeActive();
