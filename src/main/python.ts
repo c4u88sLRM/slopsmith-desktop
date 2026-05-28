@@ -136,7 +136,7 @@ function findPythonExecutable(): string {
 
 function reapOrphanedPythonBackends(pythonPath: string): void {
     if (process.platform === 'win32') return;
-    const result = spawnSync('ps', ['-ww', '-axo', 'pid=,ppid=,command='], { encoding: 'utf8' });
+    const result = spawnSync('ps', ['-ww', '-axo', 'pid=,ppid=,command='], PROBE_SPAWN);
     if (result.error || result.status !== 0 || typeof result.stdout !== 'string') return;
 
     const expectedPrefixes = new Set<string>();
@@ -203,16 +203,35 @@ async function waitForPortFree(port: number, timeoutMs: number): Promise<boolean
     }
 }
 
+// Shared spawnSync options for the startup port-reclaim probes: a short
+// timeout so a hung query (netstat / lsof / ps / powershell / taskkill) can
+// never freeze app startup, and windowsHide so none of them flash a console
+// window on Windows. On timeout, spawnSync sets `.error` (ETIMEDOUT), which
+// every caller already treats as "couldn't query".
+const PROBE_SPAWN: { encoding: BufferEncoding; timeout: number; windowsHide: boolean } = {
+    encoding: 'utf8', timeout: 5000, windowsHide: true,
+};
+
+// Our backend is always launched as
+//   python -m uvicorn server:app --host 127.0.0.1 --port <p> …
+// Match on that full signature (not just the python image) so we never kill
+// an unrelated orphaned uvicorn `server:app` that happens to hold the port.
+function isOurBackendCmd(cmd: string): boolean {
+    return cmd.includes('uvicorn')
+        && cmd.includes('server:app')
+        && cmd.includes('--host 127.0.0.1');
+}
+
 // PIDs listening on the loopback interface (127.0.0.1 / ::1) at <port> — the
 // interface our backend binds (`uvicorn --host 127.0.0.1`). Cross-platform;
-// returns [] when the query tool is unavailable or nothing is listening.
+// returns [] when the query tool is unavailable, hangs, or nothing is listening.
 function findPidsOnPort(port: number): number[] {
     const pids = new Set<number>();
     const isLoopback = (addr: string): boolean =>
         addr === '127.0.0.1' || addr === '[::1]' || addr === '::1';
     if (process.platform === 'win32') {
-        const out = spawnSync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8' });
-        if (typeof out.stdout !== 'string') return [];
+        const out = spawnSync('netstat', ['-ano', '-p', 'tcp'], PROBE_SPAWN);
+        if (out.error || typeof out.stdout !== 'string') return [];
         for (const line of out.stdout.split('\n')) {
             // Proto  Local Address        Foreign Address  State      PID
             //  TCP   127.0.0.1:18000      0.0.0.0:0        LISTENING  1234
@@ -225,8 +244,8 @@ function findPidsOnPort(port: number): number[] {
         // lsof ships with macOS and most Linux installs. Scope to loopback so
         // we never match a listener on another interface.
         for (const host of ['127.0.0.1', '[::1]']) {
-            const out = spawnSync('lsof', ['-nP', `-iTCP@${host}:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
-            if (typeof out.stdout !== 'string') continue;
+            const out = spawnSync('lsof', ['-nP', `-iTCP@${host}:${port}`, '-sTCP:LISTEN', '-t'], PROBE_SPAWN);
+            if (out.error || typeof out.stdout !== 'string') continue;
             for (const tok of out.stdout.split(/\s+/)) {
                 const pid = Number(tok);
                 if (Number.isInteger(pid) && pid > 0) pids.add(pid);
@@ -237,13 +256,13 @@ function findPidsOnPort(port: number): number[] {
 }
 
 // Is `pid` currently a live process? POSIX: signal 0 probes without killing.
-// Windows: tasklist filtered to the exact pid, parsing the CSV pid column so
-// e.g. pid 123 doesn't match a row for 5123.
+// Windows: a PowerShell CIM query that prints a deterministic ALIVE/DEAD token.
 //
-// Fails SAFE: if we cannot positively query the process table (tasklist
-// errored / non-zero / unparseable), assume the process is alive. The only
-// caller uses this to decide whether a port holder is orphaned, and a query
-// failure must never let us conclude "parent is dead" and kill a live backend.
+// Fails SAFE: if we cannot positively query the process (PowerShell errored /
+// non-zero / unparseable, or signal probe inconclusive), assume the process is
+// alive. The only caller uses this to decide whether a port holder is orphaned,
+// and a query failure must never let us conclude "parent is dead" and kill a
+// live backend.
 function isProcessAlive(pid: number): boolean {
     if (!Number.isInteger(pid) || pid <= 0) return false;
     if (process.platform === 'win32') {
@@ -253,7 +272,7 @@ function isProcessAlive(pid: number): boolean {
         // misread as "can't query".
         const out = spawnSync('powershell', ['-NoProfile', '-Command',
             `if (Get-CimInstance Win32_Process -Filter "ProcessId=${pid}") {'ALIVE'} else {'DEAD'}`],
-            { encoding: 'utf8' });
+            PROBE_SPAWN);
         if (out.error || out.status !== 0 || typeof out.stdout !== 'string') return true; // can't query → assume alive
         return out.stdout.includes('ALIVE');
     }
@@ -278,20 +297,22 @@ function backendProcInfo(pid: number): { ppid: number } | null {
         // kill an unrelated orphaned python that happens to hold the port.
         const out = spawnSync('powershell', ['-NoProfile', '-Command',
             `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; `
-            + `if($p){"$($p.Name)|$($p.ParentProcessId)|$($p.CommandLine)"}`], { encoding: 'utf8' });
-        if (typeof out.stdout !== 'string') return null;
+            + `if($p){"$($p.Name)|$($p.ParentProcessId)|$($p.CommandLine)"}`], PROBE_SPAWN);
+        if (out.error || typeof out.stdout !== 'string') return null;
         const [name, ppidStr, ...cmdParts] = out.stdout.trim().split('|');
         const cmd = cmdParts.join('|');
         if (!/^python(w)?\.exe$/i.test((name || '').trim())) return null;
-        if (!cmd.includes('uvicorn') || !cmd.includes('server:app')) return null;
+        if (!isOurBackendCmd(cmd)) return null;
         const ppid = Number(ppidStr);
         if (!Number.isInteger(ppid) || ppid <= 0) return null;
         return { ppid };
     }
-    const out = spawnSync('ps', ['-p', String(pid), '-o', 'ppid=,command='], { encoding: 'utf8' });
-    if (typeof out.stdout !== 'string') return null;
+    // -ww disables column truncation so the full command line is visible
+    // (consistent with reapOrphanedPythonBackends).
+    const out = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'ppid=,command='], PROBE_SPAWN);
+    if (out.error || typeof out.stdout !== 'string') return null;
     const m = out.stdout.trim().match(/^(\d+)\s+(.+)$/);
-    if (!m || !m[2].includes('uvicorn server:app')) return null;
+    if (!m || !isOurBackendCmd(m[2])) return null;
     const ppid = Number(m[1]);
     if (!Number.isInteger(ppid) || ppid <= 0) return null;
     return { ppid };
@@ -324,8 +345,8 @@ function reclaimPort(port: number): void {
         }
         try {
             if (process.platform === 'win32') {
-                const r = spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'], { encoding: 'utf8' });
-                if (r.status !== 0) {
+                const r = spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'], PROBE_SPAWN);
+                if (r.error || r.status !== 0) {
                     console.warn(`[python] taskkill failed for port-${port} holder pid ${pid} `
                         + `(status=${r.status}${r.error ? `, ${r.error.message}` : ''}): ${(r.stderr || '').trim()}`);
                     continue;
