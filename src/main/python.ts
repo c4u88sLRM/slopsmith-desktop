@@ -239,16 +239,23 @@ function findPidsOnPort(port: number): number[] {
 // Is `pid` currently a live process? POSIX: signal 0 probes without killing.
 // Windows: tasklist filtered to the exact pid, parsing the CSV pid column so
 // e.g. pid 123 doesn't match a row for 5123.
+//
+// Fails SAFE: if we cannot positively query the process table (tasklist
+// errored / non-zero / unparseable), assume the process is alive. The only
+// caller uses this to decide whether a port holder is orphaned, and a query
+// failure must never let us conclude "parent is dead" and kill a live backend.
 function isProcessAlive(pid: number): boolean {
     if (!Number.isInteger(pid) || pid <= 0) return false;
     if (process.platform === 'win32') {
-        const out = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8' });
-        if (typeof out.stdout !== 'string') return false;
-        // CSV row: "image.exe","1234","Console","1","12,345 K"
-        return out.stdout.split('\n').some((line) => {
-            const m = line.match(/^"[^"]*","(\d+)"/);
-            return !!m && Number(m[1]) === pid;
-        });
+        // PowerShell CIM gives a deterministic ALIVE/DEAD answer — unlike
+        // `tasklist /FI`, whose exit status on a no-match (i.e. the process is
+        // genuinely gone) varies by Windows version and could otherwise be
+        // misread as "can't query".
+        const out = spawnSync('powershell', ['-NoProfile', '-Command',
+            `if (Get-CimInstance Win32_Process -Filter "ProcessId=${pid}") {'ALIVE'} else {'DEAD'}`],
+            { encoding: 'utf8' });
+        if (out.error || out.status !== 0 || typeof out.stdout !== 'string') return true; // can't query → assume alive
+        return out.stdout.includes('ALIVE');
     }
     try {
         process.kill(pid, 0);
@@ -444,16 +451,20 @@ export async function startPython(): Promise<void> {
     serverReady = false;
 
     const pythonPath = findPythonExecutable();
-    // Free the preferred port before binding so the renderer origin stays
-    // stable across launches (#491): (1) command-line reap of stale POSIX
-    // backends, (2) port-targeted reclaim of the actual listener on every
-    // platform incl. Windows, (3) wait for the OS to release it. Only after
-    // that do we let findPort drift to 18001+ as a last resort.
+    // Keep the renderer origin stable across launches (#491): the renderer
+    // loads from http://127.0.0.1:${serverPort}, so if a leftover backend
+    // still holds the preferred port, findPort drifts to 18001+ and wipes
+    // origin-keyed localStorage settings. Reap any orphaned POSIX backend
+    // (cheap, single `ps`), then — ONLY if the preferred port is actually
+    // busy — reclaim its (orphaned) holder and wait for the OS to release it.
+    // The common case (port already free) does no netstat/lsof/ps probing.
     reapOrphanedPythonBackends(pythonPath);
-    reclaimPort(PREFERRED_PORT);
-    if (!(await waitForPortFree(PREFERRED_PORT, 3000))) {
-        console.warn(`[python] preferred port ${PREFERRED_PORT} still busy after reclaim; `
-            + 'renderer origin may drift and reset localStorage-backed settings');
+    if (!(await isPortFree(PREFERRED_PORT))) {
+        reclaimPort(PREFERRED_PORT);
+        if (!(await waitForPortFree(PREFERRED_PORT, 3000))) {
+            console.warn(`[python] preferred port ${PREFERRED_PORT} still busy after reclaim; `
+                + 'renderer origin may drift and reset localStorage-backed settings');
+        }
     }
     serverPort = await findPort(PREFERRED_PORT);
     const configDir = getConfigDir();
