@@ -20,6 +20,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <cstdarg>
 #include <cstdio>
@@ -209,28 +210,54 @@ bool parseArgs(int argc, wchar_t** argv, Args& out, juce::String& whyFailed)
 class EditorWindow : public juce::DocumentWindow
 {
 public:
-    EditorWindow(const juce::String& name, juce::AudioProcessorEditor* ed)
+    // Reaper-style top-level plugin-editor window. The sandbox child owns
+    // both the HWND and the plugin's render context, so paint surfaces
+    // (D3D11, OpenGL) live in the same process as their window — the
+    // earlier cross-process SetParent path produced a blank rendered
+    // surface for GPU-using plugins (Neural DSP Archetypes etc.) because
+    // the render context didn't survive reparenting across processes.
+    //
+    // closeCb is invoked when the user clicks the native close button.
+    // It posts event::kEditorClosed back to the host over the control
+    // channel and asynchronously destroys the editor + window — the host
+    // also sends op::kCloseEditor when ClosePluginEditor is called from
+    // the renderer, so the teardown path is idempotent.
+    EditorWindow(const juce::String& name,
+                 juce::AudioProcessorEditor* ed,
+                 std::function<void()> closeCb)
         : DocumentWindow(name, juce::Colours::darkgrey,
-                         /*buttonsNeeded*/ 0)
+                         /*buttonsNeeded*/ DocumentWindow::closeButton),
+          onClose(std::move(closeCb))
     {
-        // No buttons: the window is reparented into the Electron renderer
-        // and the host controls open/close via op::kOpenEditor /
-        // op::kCloseEditor. JUCE-drawn title bar (NOT native) so
-        // buttonsNeeded=0 in the DocumentWindow ctor above actually takes
-        // effect — Windows' native title bar always renders min/max/close
-        // regardless of the buttonsNeeded flag, and a user click on the
-        // native close would fire closeButtonPressed() (default no-op
-        // here), producing the "looks broken" UX this class is trying to
-        // avoid.
-        setUsingNativeTitleBar(false);
+        // Native title bar gives users the standard Windows close / move /
+        // resize behaviour they expect from any DAW's plugin editor.
+        setUsingNativeTitleBar(true);
         setResizable(true, false);
         setContentNonOwned(ed, true);
-        // Size first, then move offscreen. centreWithSize() would otherwise
-        // reposition the window onto the active display before the host has
-        // a chance to reparent it, producing a visible flash.
-        setSize(ed->getWidth(), ed->getHeight());
-        setTopLeftPosition(-32000, -32000);
+        // Centre on the active display so the window is visible on first
+        // open. Reaper-equivalent default; per-plugin position memory is
+        // a follow-up.
+        centreWithSize(ed->getWidth(), ed->getHeight());
     }
+
+    void closeButtonPressed() override
+    {
+        // Hide the window first so the user always sees an instant
+        // response to the X click — independent of whether the onClose
+        // callback can schedule its async teardown. The teardown path
+        // resets the window unique_ptr anyway (next message-loop tick
+        // in the normal case), but two paths could otherwise leave a
+        // visible window behind: (a) the in-flight CAS already taken
+        // by a racing kOpenEditor / kCloseEditor handler, in which case
+        // onClose returns early; (b) MessageManager::callAsync rejects
+        // the post during shutdown. setVisible(false) here ensures the
+        // close button still does what the user expects in both cases.
+        setVisible(false);
+        if (onClose) onClose();
+    }
+
+private:
+    std::function<void()> onClose;
 };
 
 // Single-plugin host state, owned by the main thread; the worker thread reads
@@ -258,6 +285,15 @@ struct HostState
     // without this guard a host retrying kOpenEditor (timeout, double-click,
     // etc.) could race two async lambdas on st.editor / st.editorWindow.
     std::atomic<bool> editorRequestInFlight{false};
+    // Set true when the user clicks the editor window's X while another
+    // op (kOpenEditor toFront / kCloseEditor / close-button-destroy) still
+    // holds editorRequestInFlight. The in-flight op's CAS-release site
+    // (always on the message thread, via releaseEditorFlag) drains this
+    // flag — destroys the editor and sends event::kEditorClosed — so the
+    // user's close intent is honoured even when their click landed during
+    // a tiny in-flight window. Without this, the close would be silently
+    // dropped and the host would think the editor is still open.
+    std::atomic<bool> userCloseRequestedFromButton{false};
     std::thread audioThread;
     std::atomic<int> sampleRate{48000};
     std::atomic<int> blockSize{256};
@@ -593,6 +629,39 @@ void runAudioThread(HostState& st)
     st.audioPausedAck.signal();
 }
 
+// Release the editor-op flag and, on the way out, drain any user-close
+// intent the X button captured while we held the flag. Called by every
+// kOpenEditor / kCloseEditor / close-button lambda exit path — anywhere
+// editorRequestInFlight transitions back to false. All call sites are on
+// the message thread, so the destroy + sendEvent here are sequenced with
+// every other state-mutating op on st.editor / st.editorWindow.
+static void releaseEditorFlag(HostState& st)
+{
+    // Drain user-close intent only while the message loop is alive and the
+    // control channel is owned by us. During shutdown (st.running=false)
+    // ~HostState will destroy editor/window anyway, and st.control is
+    // sequencing its own teardown — touching it here can either block the
+    // message thread on a pipe write to a closing peer or race
+    // control.stop()'s join. Skipping the drain on the shutdown path is
+    // observably correct: any host that opened the editor learns about
+    // the close via the sandbox process exiting (crash callback or wait
+    // status), which already flips SandboxedProcessor::editorOpen=false.
+    if (st.running.load(std::memory_order_acquire))
+    {
+        if (st.userCloseRequestedFromButton.exchange(false, std::memory_order_acq_rel))
+        {
+            if (st.editorWindow) st.editorWindow.reset();
+            if (st.editor)       st.editor.reset();
+            st.control.sendEvent(event::kEditorClosed, {});
+        }
+    }
+    else
+    {
+        st.userCloseRequestedFromButton.store(false, std::memory_order_release);
+    }
+    st.editorRequestInFlight.store(false, std::memory_order_release);
+}
+
 void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                      const juce::var& args)
 {
@@ -799,18 +868,48 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
           // open fails, but the child (and the plugin's audio) survives.
           try
           {
-            // Tear down any prior editor BEFORE replacing st.editor. The
-            // existing EditorWindow holds st.editor.get() via
-            // setContentNonOwned, so resetting st.editor first would leave
-            // a dangling content pointer in the window. Resetting the
-            // window first detaches its content before we touch the editor.
-            if (st.editorWindow) st.editorWindow.reset();
-            if (st.editor)       st.editor.reset();
+            // Repeat-open fast path: the renderer's "Edit" click for a slot
+            // that already has its editor open just brings the existing
+            // window to front. Avoids recreating the editor (which for some
+            // plugins resets unsaved state) and matches DAW behaviour.
+            if (st.editorWindow)
+            {
+                // If the user X'd the window while this lambda was queued
+                // (CAS-fail path in closeButtonPressed set the flag), do
+                // NOT report success — releaseEditorFlag will destroy the
+                // window + send kEditorClosed in that branch, and replying
+                // success here would race that event on the host side
+                // (event arrives first sets editorOpen=false, then the
+                // true reply restores editorOpen=true on a destroyed
+                // window — stuck-open state).
+                //
+                // Check BEFORE setVisible/toFront so we don't briefly
+                // re-show a window the user just dismissed — otherwise
+                // there's a visible flicker as the X-hidden window
+                // momentarily reappears before the drain destroys it.
+                if (st.userCloseRequestedFromButton.load(std::memory_order_acquire))
+                {
+                    releaseEditorFlag(st);  // drains: destroys + sends event
+                    reply(false, {}, "user closed editor during open");
+                    return;
+                }
+                st.editorWindow->setVisible(true);
+                st.editorWindow->toFront(true);
+                HWND existing = (HWND)st.editorWindow->getWindowHandle();
+                juce::DynamicObject::Ptr res(new juce::DynamicObject());
+                res->setProperty("hwnd", "0x" + juce::String::toHexString(
+                                              (juce::int64)(uintptr_t)existing));
+                res->setProperty("w", st.editor ? st.editor->getWidth()  : 0);
+                res->setProperty("h", st.editor ? st.editor->getHeight() : 0);
+                releaseEditorFlag(st);
+                reply(true, juce::var(res.get()));
+                return;
+            }
 
             st.editor.reset(st.plugin->createEditorAndMakeActive());
             if (!st.editor)
             {
-                st.editorRequestInFlight.store(false, std::memory_order_release);
+                releaseEditorFlag(st);
                 reply(false, {}, "createEditorAndMakeActive null");
                 return;
             }
@@ -818,7 +917,99 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                 st.editor->setSize(slopsmith::sandbox::kDefaultEditorWidth,
                                    slopsmith::sandbox::kDefaultEditorHeight);
             st.editorWindow = std::make_unique<EditorWindow>(
-                st.plugin->getName(), st.editor.get());
+                st.plugin->getName(), st.editor.get(),
+                [&st]
+                {
+                    // User clicked the editor window's close button. Tell
+                    // the host so its SandboxedProcessor flips editorOpen
+                    // back to false (next "Edit" click in the renderer
+                    // sends a fresh kOpenEditor). Then defer the actual
+                    // destroy — closeButtonPressed is called *during* the
+                    // window's own message dispatch, so tearing it down
+                    // here would unwind through its own stack. The host's
+                    // op::kCloseEditor path lands at the same teardown
+                    // code, so this is idempotent if both fire.
+                    //
+                    // Take editorRequestInFlight first: between this
+                    // callback returning and the queued destroy lambda
+                    // running, an op::kOpenEditor from the host would
+                    // otherwise hit the repeat-open fast path and return
+                    // success on a window about to be destroyed. Holding
+                    // the in-flight flag rejects that with "already in
+                    // flight" until the destroy completes.
+                    //
+                    // If the flag is already taken (a kOpenEditor or
+                    // kCloseEditor is mid-flight), set the user-close
+                    // intent flag. releaseEditorFlag() — called by
+                    // every editorRequestInFlight clear site on the
+                    // message thread — drains it: destroys the editor
+                    // and sends event::kEditorClosed once the in-flight
+                    // op finishes. Without that, the host could receive
+                    // a successful kOpenEditor reply after the user had
+                    // already clicked X, leaving editorOpen=true on the
+                    // host side for a window the user already dismissed.
+                    bool closeExpected = false;
+                    if (! st.editorRequestInFlight.compare_exchange_strong(
+                            closeExpected, true, std::memory_order_acq_rel))
+                    {
+                        st.userCloseRequestedFromButton.store(true,
+                                                              std::memory_order_release);
+                        return;
+                    }
+                    // Defer destruction + the kEditorClosed send to the
+                    // next message-loop tick. Doing the send inside
+                    // closeButtonPressed (this callback) would block the
+                    // close-button UX until sendEvent's pipe write
+                    // returned (up to ~5s on a stalled host reader). A
+                    // detached background thread would dodge that but
+                    // captures HostState by reference and can outlive
+                    // WinMain's unwind → use-after-free against
+                    // st.control's mutex.
+                    //
+                    // The callAsync runs on the same message thread, but
+                    // only after closeButtonPressed has unwound and JUCE
+                    // has resolved the click visually. Order matters
+                    // inside the lambda: destroy the window first so the
+                    // user sees it vanish immediately, then send the
+                    // event — even if sendEvent burns the full timeout
+                    // there's no visible editor frame still waiting.
+                    //
+                    // st-lifetime safety: WinMain's main dispatch loop
+                    // (~line 1536) exits as soon as st.running goes
+                    // false, BEFORE any ~HostState destruction starts.
+                    // Once the loop exits no callAsync lambda can fire —
+                    // queued ones are destructed (capture refs released
+                    // without invocation, no UAF). The defensive running
+                    // check below is belt-and-braces: if the loop is
+                    // mid-tick when running flips, we bail rather than
+                    // touch st.control / st.editorWindow while shutdown
+                    // teardown logic is racing against us elsewhere.
+                    // callAsync returns false if the message queue can't
+                    // accept the post (queue already torn down during a
+                    // racing shutdown). Clear the in-flight flag on that
+                    // path so subsequent open/close requests in the same
+                    // process lifetime aren't permanently rejected as
+                    // "already in flight". The op::kCloseEditor handler
+                    // (~line 946) does the same.
+                    const bool queued = juce::MessageManager::callAsync([&st]
+                    {
+                        if (! st.running.load(std::memory_order_acquire))
+                        {
+                            releaseEditorFlag(st);
+                            return;
+                        }
+                        if (st.editorWindow) st.editorWindow.reset();
+                        if (st.editor)       st.editor.reset();
+                        st.control.sendEvent(event::kEditorClosed, {});
+                        releaseEditorFlag(st);
+                    });
+                    if (! queued)
+                    {
+                        hostLogf("editor close-button: callAsync rejected — "
+                                 "message queue likely shutting down");
+                        releaseEditorFlag(st);
+                    }
+                });
             st.editorWindow->setVisible(true);
             HWND hwnd = (HWND)st.editorWindow->getWindowHandle();
             wchar_t winsta[128] = L"?";
@@ -836,22 +1027,32 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
                 // following up with a redundant kCloseEditor on hwnd==null.
                 st.editorWindow.reset();
                 st.editor.reset();
-                st.editorRequestInFlight.store(false, std::memory_order_release);
+                releaseEditorFlag(st);
                 reply(false, {}, "failed to obtain native window handle");
+                return;
+            }
+            // Same user-close-during-open guard as the repeat-open path:
+            // setVisible(true) above can yield to the message loop briefly
+            // (peer creation pumps messages on Windows), so an X click
+            // queued during creation could land before we get here.
+            if (st.userCloseRequestedFromButton.load(std::memory_order_acquire))
+            {
+                releaseEditorFlag(st);
+                reply(false, {}, "user closed editor during open");
                 return;
             }
             juce::DynamicObject::Ptr res(new juce::DynamicObject());
             res->setProperty("hwnd", "0x" + juce::String::toHexString((juce::int64)(uintptr_t)hwnd));
             res->setProperty("w", st.editor->getWidth());
             res->setProperty("h", st.editor->getHeight());
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(true, juce::var(res.get()));
           }
           catch (const std::exception& e)
           {
             st.editorWindow.reset();
             st.editor.reset();
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             hostLogf("kOpenEditor: editor creation threw: %s", e.what());
             reply(false, {}, juce::String("editor creation threw: ") + e.what());
           }
@@ -859,7 +1060,7 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
           {
             st.editorWindow.reset();
             st.editor.reset();
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             hostLogf("kOpenEditor: editor creation threw (unknown exception)");
             reply(false, {}, "editor creation threw (unknown exception)");
           }
@@ -869,7 +1070,7 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
             // Lambda never runs, so undo the in-flight flag here and surface
             // the failure to the host — otherwise editorRequestInFlight would
             // stay true forever and block all subsequent open/close requests.
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(false, {}, "message queue unavailable (shutdown)");
         }
     }
@@ -886,11 +1087,11 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
         {
             st.editorWindow.reset();
             st.editor.reset();
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(true, {});
         }))
         {
-            st.editorRequestInFlight.store(false, std::memory_order_release);
+            releaseEditorFlag(st);
             reply(false, {}, "message queue unavailable (shutdown)");
         }
     }

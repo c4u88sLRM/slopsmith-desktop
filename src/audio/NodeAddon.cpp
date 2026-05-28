@@ -1986,7 +1986,57 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
 
     int slotId = info[0].As<Napi::Number>().Int32Value();
 
-    // If already open, bring to front
+    auto slot = liveEngine->getSignalChain().getSlot(slotId);
+    if (!slot || !slot->processor || !slot->processor->hasEditor())
+        return Napi::Boolean::New(env, false);
+
+    // Sandboxed plugins: the editor is a top-level window owned by the
+    // sandbox child process. No host-side PluginEditorWindow and no
+    // cross-process SetParent reparent — that path produced a blank
+    // rendered surface for D3D / OpenGL plugins (Neural DSP Archetypes,
+    // etc.) because their render context lives in the child. The child's
+    // kOpenEditor handler brings the existing window to front on a repeat
+    // click, so re-entry is cheap and we don't track host-side state.
+    //
+    // Dispatch off the N-API call thread: requestOpenEditor() uses a
+    // blocking control->request (kDefaultReplyTimeoutMs = 10s), which on
+    // a slow or hung sandbox would otherwise stall V8's JS thread for
+    // the full timeout. Capture slotId rather than a raw processor
+    // pointer and re-resolve inside the message-thread lambda — that
+    // closes a UAF window where the slot could be removed (or the engine
+    // torn down) between this call returning and the async firing.
+    // Return optimistically; matches the in-process path below.
+    if (auto* sb = dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
+    {
+        // Synchronous gate: if the sandbox child is already gone (crashed
+        // or shut down) there's no point scheduling the IPC. Return false
+        // so the renderer can surface "editor unavailable" rather than
+        // toggling its UI into a fake-open state that no event will ever
+        // contradict. hasEditor() above already gated on isAlive() but a
+        // crash between then and now is possible — re-check here.
+        if (!sb->isAlive())
+            return Napi::Boolean::New(env, false);
+        const bool queued = juce::MessageManager::callAsync([slotId]()
+        {
+            auto liveEngine = snapshotEngine();
+            if (!liveEngine) return;
+            if (auto* slot = liveEngine->getSignalChain().getSlot(slotId))
+                if (auto* sb = dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
+                    sb->requestOpenEditor();
+        });
+        if (!queued)
+        {
+            // Message queue refused the post — typically only during
+            // shutdown. Surface the failure so the renderer doesn't
+            // toggle its UI into a fake-open state.
+            return Napi::Boolean::New(env, false);
+        }
+        return Napi::Boolean::New(env, true);
+    }
+
+    // In-process plugin — host-side PluginEditorWindow flow. If a window
+    // already exists for this slot, bring it to front rather than creating
+    // a duplicate.
     auto it = editorWindows.find(slotId);
     if (it != editorWindows.end() && it->second)
     {
@@ -1999,16 +2049,19 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
         editorWindows.erase(it);
     }
 
-    auto slot = liveEngine->getSignalChain().getSlot(slotId);
-    if (!slot || !slot->processor || !slot->processor->hasEditor())
-        return Napi::Boolean::New(env, false);
-
-    // Create editor on the message thread
-    auto* processor = slot->processor.get();
-    auto name = slot->name;
-
-    juce::MessageManager::callAsync([processor, name, slotId]()
+    // Create editor on the message thread. Capture slotId only — re-resolve
+    // the slot via snapshotEngine() + getSlot(slotId) inside the lambda so a
+    // SignalChain::removeProcessor() between this call returning and the
+    // async firing can't leave us calling createEditorAndMakeActive() on a
+    // dangling juce::AudioProcessor*. Mirrors the sandbox branch's pattern.
+    const bool queued = juce::MessageManager::callAsync([slotId]()
     {
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) return;
+        auto* slot = liveEngine->getSignalChain().getSlot(slotId);
+        if (!slot || !slot->processor) return;
+        auto* processor = slot->processor.get();
+        auto name = slot->name;
         juce::AudioProcessorEditor* editor = nullptr;
         try {
             editor = processor->createEditorAndMakeActive();
@@ -2025,7 +2078,7 @@ static Napi::Value OpenPluginEditor(const Napi::CallbackInfo& info)
         }
     });
 
-    return Napi::Boolean::New(env, true);
+    return Napi::Boolean::New(env, queued);
 }
 
 static Napi::Value ClosePluginEditor(const Napi::CallbackInfo& info)
@@ -2034,6 +2087,38 @@ static Napi::Value ClosePluginEditor(const Napi::CallbackInfo& info)
     if (info.Length() < 1) return Napi::Boolean::New(env, false);
 
     int slotId = info[0].As<Napi::Number>().Int32Value();
+
+    // Sandboxed plugins: route the close to the sandbox child via IPC.
+    // No host-side PluginEditorWindow exists for these.
+    //
+    // Same shape as the open path: dispatch off the N-API thread and
+    // re-resolve the slot inside the lambda. requestCloseEditor()
+    // ultimately writes to the control pipe (writeFrame can block up
+    // to ~5s on a stalled reader), so running it synchronously here
+    // would freeze JS / the renderer UI on a slow sandbox; the
+    // re-resolve guards against slot-removal UAF between the napi call
+    // and the async firing.
+    if (auto liveEngine = snapshotEngine())
+    {
+        if (auto* slot = liveEngine->getSignalChain().getSlot(slotId))
+        {
+            if (slot->processor
+                && dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
+            {
+                const bool queued = juce::MessageManager::callAsync([slotId]()
+                {
+                    auto liveEngine = snapshotEngine();
+                    if (!liveEngine) return;
+                    if (auto* slot = liveEngine->getSignalChain().getSlot(slotId))
+                        if (auto* sb = dynamic_cast<slopsmith::sandbox::SandboxedProcessor*>(slot->processor.get()))
+                            sb->requestCloseEditor();
+                });
+                return Napi::Boolean::New(env, queued);
+            }
+        }
+    }
+
+    // In-process plugin — tear down the host-side editor window.
     auto it = editorWindows.find(slotId);
     if (it != editorWindows.end())
     {
