@@ -203,25 +203,30 @@ async function waitForPortFree(port: number, timeoutMs: number): Promise<boolean
     }
 }
 
-// PIDs listening on 127.0.0.1:<port>. Cross-platform; returns [] when the
-// query tool is unavailable or nothing is listening.
+// PIDs listening on the loopback interface (127.0.0.1 / ::1) at <port> — the
+// interface our backend binds (`uvicorn --host 127.0.0.1`). Cross-platform;
+// returns [] when the query tool is unavailable or nothing is listening.
 function findPidsOnPort(port: number): number[] {
     const pids = new Set<number>();
+    const isLoopback = (addr: string): boolean =>
+        addr === '127.0.0.1' || addr === '[::1]' || addr === '::1';
     if (process.platform === 'win32') {
         const out = spawnSync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8' });
         if (typeof out.stdout !== 'string') return [];
         for (const line of out.stdout.split('\n')) {
             // Proto  Local Address        Foreign Address  State      PID
             //  TCP   127.0.0.1:18000      0.0.0.0:0        LISTENING  1234
-            const m = line.trim().match(/^TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
-            if (!m || Number(m[1]) !== port) continue;
-            const pid = Number(m[2]);
+            const m = line.trim().match(/^TCP\s+(\S+):(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
+            if (!m || Number(m[2]) !== port || !isLoopback(m[1])) continue;
+            const pid = Number(m[3]);
             if (Number.isInteger(pid) && pid > 0) pids.add(pid);
         }
     } else {
-        // lsof ships with macOS and most Linux installs.
-        const out = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
-        if (typeof out.stdout === 'string') {
+        // lsof ships with macOS and most Linux installs. Scope to loopback so
+        // we never match a listener on another interface.
+        for (const host of ['127.0.0.1', '[::1]']) {
+            const out = spawnSync('lsof', ['-nP', `-iTCP@${host}:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
+            if (typeof out.stdout !== 'string') continue;
             for (const tok of out.stdout.split(/\s+/)) {
                 const pid = Number(tok);
                 if (Number.isInteger(pid) && pid > 0) pids.add(pid);
@@ -232,12 +237,18 @@ function findPidsOnPort(port: number): number[] {
 }
 
 // Is `pid` currently a live process? POSIX: signal 0 probes without killing.
-// Windows: tasklist reports a row only for a running pid.
+// Windows: tasklist filtered to the exact pid, parsing the CSV pid column so
+// e.g. pid 123 doesn't match a row for 5123.
 function isProcessAlive(pid: number): boolean {
     if (!Number.isInteger(pid) || pid <= 0) return false;
     if (process.platform === 'win32') {
-        const out = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH'], { encoding: 'utf8' });
-        return typeof out.stdout === 'string' && out.stdout.includes(String(pid));
+        const out = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8' });
+        if (typeof out.stdout !== 'string') return false;
+        // CSV row: "image.exe","1234","Console","1","12,345 K"
+        return out.stdout.split('\n').some((line) => {
+            const m = line.match(/^"[^"]*","(\d+)"/);
+            return !!m && Number(m[1]) === pid;
+        });
     }
     try {
         process.kill(pid, 0);
@@ -250,23 +261,33 @@ function isProcessAlive(pid: number): boolean {
 
 // Process identity for the port holder: is it one of our Python/uvicorn
 // backends, and what is its parent pid? Returns null when the query tool is
-// unavailable or the process is gone — callers then leave it alone.
+// unavailable, the process is gone, it isn't our uvicorn backend, or the
+// parent pid doesn't parse — callers then leave it alone (never kill on a
+// guess).
 function backendProcInfo(pid: number): { ppid: number } | null {
     if (process.platform === 'win32') {
         // wmic is deprecated/removed on newer Windows; PowerShell CIM is stable.
+        // Verify the full command line, not just the image name, so we don't
+        // kill an unrelated orphaned python that happens to hold the port.
         const out = spawnSync('powershell', ['-NoProfile', '-Command',
             `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; `
-            + `if($p){"$($p.Name)|$($p.ParentProcessId)"}`], { encoding: 'utf8' });
+            + `if($p){"$($p.Name)|$($p.ParentProcessId)|$($p.CommandLine)"}`], { encoding: 'utf8' });
         if (typeof out.stdout !== 'string') return null;
-        const [name, ppidStr] = out.stdout.trim().split('|');
+        const [name, ppidStr, ...cmdParts] = out.stdout.trim().split('|');
+        const cmd = cmdParts.join('|');
         if (!/^python(w)?\.exe$/i.test((name || '').trim())) return null;
-        return { ppid: Number(ppidStr) };
+        if (!cmd.includes('uvicorn') || !cmd.includes('server:app')) return null;
+        const ppid = Number(ppidStr);
+        if (!Number.isInteger(ppid) || ppid <= 0) return null;
+        return { ppid };
     }
     const out = spawnSync('ps', ['-p', String(pid), '-o', 'ppid=,command='], { encoding: 'utf8' });
     if (typeof out.stdout !== 'string') return null;
     const m = out.stdout.trim().match(/^(\d+)\s+(.+)$/);
     if (!m || !m[2].includes('uvicorn server:app')) return null;
-    return { ppid: Number(m[1]) };
+    const ppid = Number(m[1]);
+    if (!Number.isInteger(ppid) || ppid <= 0) return null;
+    return { ppid };
 }
 
 // Kill the backend holding `port` — but ONLY if it's orphaned (its parent is
@@ -296,7 +317,12 @@ function reclaimPort(port: number): void {
         }
         try {
             if (process.platform === 'win32') {
-                spawnSync('taskkill', ['/PID', String(pid), '/F', '/T']);
+                const r = spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'], { encoding: 'utf8' });
+                if (r.status !== 0) {
+                    console.warn(`[python] taskkill failed for port-${port} holder pid ${pid} `
+                        + `(status=${r.status}${r.error ? `, ${r.error.message}` : ''}): ${(r.stderr || '').trim()}`);
+                    continue;
+                }
             } else {
                 process.kill(pid, 'SIGKILL');
             }
