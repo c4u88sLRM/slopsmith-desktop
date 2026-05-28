@@ -91,10 +91,14 @@ inline constexpr int kReadyTimeoutMs = 30000;
 // the heartbeat is a fixed timer — not a real plugin-progress signal — so a
 // plugin whose load hangs while the sandbox's message loop stays responsive
 // would otherwise heartbeat forever and never trip the watchdog. This cap
-// fails the spawn regardless of heartbeats. Generous (4x kReadyTimeoutMs) so
-// a genuinely slow first-run load — cold license validation, network round
-// trips — still completes; a load that exceeds it is presumed stuck.
-inline constexpr int kReadyAbsoluteTimeoutMs = 120000;
+// fails the spawn regardless of heartbeats. Bumped to 20x kReadyTimeoutMs
+// (10 min) after a tester reproduced Archetype Gojira X tripping the
+// previous 5-min cap with ~58 kLoading heartbeats from a healthy sandbox
+// — Neural DSP's large neural-net models can genuinely take that long on
+// a cold cache + slow disk. The heartbeat-silence watchdog (kReadyTimeoutMs,
+// 30 s) is the real hang detector; this absolute cap is just a backstop
+// against a sandbox that keeps heart-beating but never finishes.
+inline constexpr int kReadyAbsoluteTimeoutMs = 600000;
 
 // Control channel — operation names.
 //
