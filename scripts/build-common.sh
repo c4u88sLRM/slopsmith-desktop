@@ -143,6 +143,7 @@ clone_slopsmith() {
 		byrongamatos/slopsmith-plugin-tabimport
 		byrongamatos/slopsmith-plugin-tabview
 		byrongamatos/slopsmith-plugin-tones
+		byrongamatos/slopsmith-plugin-tutorials
 		# Community plugins
 		alleexx/slopsmith-plugin-transpose-chords
 		ChrisBeWithYou/slopsmith-plugin-slopscale
