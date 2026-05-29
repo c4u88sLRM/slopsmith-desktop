@@ -12,7 +12,12 @@ import { getActiveSoundfontPath } from './soundfont-manager';
 import { isDebugEnabled } from './debug-log';
 
 let pythonProcess: ChildProcess | null = null;
-let serverPort = 18000; // Use 18000+ to avoid conflicting with Docker Slopsmith on 8000
+// Use 18000+ to avoid conflicting with Docker Slopsmith on 8000. The renderer
+// loads from http://127.0.0.1:${serverPort}, so this is also the localStorage
+// origin — keeping it stable across launches is what stops origin-keyed UI /
+// plugin settings (left-handed mode, volume, …) from resetting (#491).
+const PREFERRED_PORT = 18000;
+let serverPort = PREFERRED_PORT;
 let serverReady = false;
 // Set by startPython when the backend cannot even be spawned (e.g. server.py
 // missing). waitForPython checks this so a config error fails fast with a
@@ -131,7 +136,7 @@ function findPythonExecutable(): string {
 
 function reapOrphanedPythonBackends(pythonPath: string): void {
     if (process.platform === 'win32') return;
-    const result = spawnSync('ps', ['-ww', '-axo', 'pid=,ppid=,command='], { encoding: 'utf8' });
+    const result = spawnSync('ps', ['-ww', '-axo', 'pid=,ppid=,command='], PROBE_SPAWN);
     if (result.error || result.status !== 0 || typeof result.stdout !== 'string') return;
 
     const expectedPrefixes = new Set<string>();
@@ -150,6 +155,11 @@ function reapOrphanedPythonBackends(pythonPath: string): void {
         const pid = Number(match[1]);
         const ppid = Number(match[2]);
         const command = match[3];
+        // Only reap fully-orphaned backends (reparented to init). A matching
+        // uvicorn process with a live parent could be another app instance's
+        // managed backend or a developer's own `uvicorn server:app` on a
+        // different port — killing those would be a cross-process regression.
+        // The actual port-18000 holder is handled precisely by reclaimPort().
         if (!Number.isInteger(pid) || ppid !== 1) continue;
         if (!expectedPrefixList.some(prefix => command.startsWith(prefix))) continue;
         stalePids.push(pid);
@@ -165,6 +175,190 @@ function reapOrphanedPythonBackends(pythonPath: string): void {
     }
     if (stalePids.length) {
         console.log(`[python] Reaped orphaned backend PIDs: ${stalePids.join(', ')}`);
+    }
+}
+
+// True if the TCP port can be bound on 127.0.0.1 right now.
+function isPortFree(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const probe = net.createServer();
+        probe.once('error', () => resolve(false));
+        probe.listen(port, '127.0.0.1', () => {
+            probe.close(() => resolve(true));
+        });
+    });
+}
+
+// Poll until `port` is bindable or `timeoutMs` elapses; returns whether it
+// became free. Killing a stale backend is asynchronous (SIGTERM/SIGKILL) and
+// the OS can hold the listener briefly after the process dies, so binding
+// immediately would drift to 18001 and change the renderer origin anyway.
+// In the common case the first probe succeeds, so this adds no startup delay.
+async function waitForPortFree(port: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if (await isPortFree(port)) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise((r) => setTimeout(r, 150));
+    }
+}
+
+// Shared spawnSync options for the startup port-reclaim probes: a short
+// timeout so a hung query (netstat / lsof / ps / powershell / taskkill) can
+// never freeze app startup, and windowsHide so none of them flash a console
+// window on Windows. On timeout, spawnSync sets `.error` (ETIMEDOUT), which
+// every caller already treats as "couldn't query".
+const PROBE_SPAWN: { encoding: BufferEncoding; timeout: number; windowsHide: boolean } = {
+    encoding: 'utf8', timeout: 5000, windowsHide: true,
+};
+
+// Our backend is always launched as
+//   python -m uvicorn server:app --host 127.0.0.1 --port <p> …
+// Match on that full signature (not just the python image) so we never kill
+// an unrelated orphaned uvicorn `server:app` that happens to hold the port.
+function isOurBackendCmd(cmd: string): boolean {
+    return cmd.includes('uvicorn')
+        && cmd.includes('server:app')
+        && cmd.includes('--host 127.0.0.1');
+}
+
+// PIDs listening on the loopback interface (127.0.0.1 / ::1) at <port> — the
+// interface our backend binds (`uvicorn --host 127.0.0.1`). Cross-platform;
+// returns [] when the query tool is unavailable, hangs, or nothing is listening.
+function findPidsOnPort(port: number): number[] {
+    const pids = new Set<number>();
+    const isLoopback = (addr: string): boolean =>
+        addr === '127.0.0.1' || addr === '[::1]' || addr === '::1';
+    if (process.platform === 'win32') {
+        const out = spawnSync('netstat', ['-ano', '-p', 'tcp'], PROBE_SPAWN);
+        if (out.error || typeof out.stdout !== 'string') return [];
+        for (const line of out.stdout.split('\n')) {
+            // Proto  Local Address        Foreign Address  State      PID
+            //  TCP   127.0.0.1:18000      0.0.0.0:0        LISTENING  1234
+            const m = line.trim().match(/^TCP\s+(\S+):(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
+            if (!m || Number(m[2]) !== port || !isLoopback(m[1])) continue;
+            const pid = Number(m[3]);
+            if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+        }
+    } else {
+        // lsof ships with macOS and most Linux installs. Scope to loopback so
+        // we never match a listener on another interface.
+        for (const host of ['127.0.0.1', '[::1]']) {
+            const out = spawnSync('lsof', ['-nP', `-iTCP@${host}:${port}`, '-sTCP:LISTEN', '-t'], PROBE_SPAWN);
+            if (out.error || typeof out.stdout !== 'string') continue;
+            for (const tok of out.stdout.split(/\s+/)) {
+                const pid = Number(tok);
+                if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+            }
+        }
+    }
+    return [...pids];
+}
+
+// Is `pid` currently a live process? POSIX: signal 0 probes without killing.
+// Windows: a PowerShell CIM query that prints a deterministic ALIVE/DEAD token.
+//
+// Fails SAFE: if we cannot positively query the process (PowerShell errored /
+// non-zero / unparseable, or signal probe inconclusive), assume the process is
+// alive. The only caller uses this to decide whether a port holder is orphaned,
+// and a query failure must never let us conclude "parent is dead" and kill a
+// live backend.
+function isProcessAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    if (process.platform === 'win32') {
+        // PowerShell CIM gives a deterministic ALIVE/DEAD answer — unlike
+        // `tasklist /FI`, whose exit status on a no-match (i.e. the process is
+        // genuinely gone) varies by Windows version and could otherwise be
+        // misread as "can't query".
+        const out = spawnSync('powershell', ['-NoProfile', '-Command',
+            `if (Get-CimInstance Win32_Process -Filter "ProcessId=${pid}") {'ALIVE'} else {'DEAD'}`],
+            PROBE_SPAWN);
+        if (out.error || out.status !== 0 || typeof out.stdout !== 'string') return true; // can't query → assume alive
+        return out.stdout.includes('ALIVE');
+    }
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (e: unknown) {
+        // EPERM means it exists but we can't signal it (still "alive").
+        return (e as NodeJS.ErrnoException)?.code === 'EPERM';
+    }
+}
+
+// Process identity for the port holder: is it one of our Python/uvicorn
+// backends, and what is its parent pid? Returns null when the query tool is
+// unavailable, the process is gone, it isn't our uvicorn backend, or the
+// parent pid doesn't parse — callers then leave it alone (never kill on a
+// guess).
+function backendProcInfo(pid: number): { ppid: number } | null {
+    if (process.platform === 'win32') {
+        // wmic is deprecated/removed on newer Windows; PowerShell CIM is stable.
+        // Verify the full command line, not just the image name, so we don't
+        // kill an unrelated orphaned python that happens to hold the port.
+        const out = spawnSync('powershell', ['-NoProfile', '-Command',
+            `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; `
+            + `if($p){"$($p.Name)|$($p.ParentProcessId)|$($p.CommandLine)"}`], PROBE_SPAWN);
+        if (out.error || typeof out.stdout !== 'string') return null;
+        const [name, ppidStr, ...cmdParts] = out.stdout.trim().split('|');
+        const cmd = cmdParts.join('|');
+        if (!/^python(w)?\.exe$/i.test((name || '').trim())) return null;
+        if (!isOurBackendCmd(cmd)) return null;
+        const ppid = Number(ppidStr);
+        if (!Number.isInteger(ppid) || ppid <= 0) return null;
+        return { ppid };
+    }
+    // -ww disables column truncation so the full command line is visible
+    // (consistent with reapOrphanedPythonBackends).
+    const out = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'ppid=,command='], PROBE_SPAWN);
+    if (out.error || typeof out.stdout !== 'string') return null;
+    const m = out.stdout.trim().match(/^(\d+)\s+(.+)$/);
+    if (!m || !isOurBackendCmd(m[2])) return null;
+    const ppid = Number(m[1]);
+    if (!Number.isInteger(ppid) || ppid <= 0) return null;
+    return { ppid };
+}
+
+// Kill the backend holding `port` — but ONLY if it's orphaned (its parent is
+// gone). This covers the real bug (a backend left over from the previous run
+// still holding 18000) on every platform, including Windows where the
+// command-line reaper is a no-op, while never touching a *live* sibling
+// instance's managed backend. If we can't positively confirm both "our
+// backend" and "orphaned", we leave it and let waitForPortFree / findPort
+// degrade gracefully to the current drift behavior.
+function reclaimPort(port: number): void {
+    for (const pid of findPidsOnPort(port)) {
+        const info = backendProcInfo(pid);
+        if (!info) {
+            console.warn(`[python] port ${port} held by pid ${pid} (not a recognizable backend); leaving it alone`);
+            continue;
+        }
+        // Orphan signal is platform-specific: POSIX reparents a dead parent's
+        // child to init (ppid===1); Windows keeps the original ppid, so we
+        // check whether that parent is still alive. A live non-init parent
+        // means a running sibling instance owns it — never kill those.
+        const orphaned = process.platform === 'win32'
+            ? !isProcessAlive(info.ppid)
+            : info.ppid === 1;
+        if (!orphaned) {
+            console.warn(`[python] port ${port} held by pid ${pid} with live parent ${info.ppid} (another running instance?); leaving it alone`);
+            continue;
+        }
+        try {
+            if (process.platform === 'win32') {
+                const r = spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'], PROBE_SPAWN);
+                if (r.error || r.status !== 0) {
+                    console.warn(`[python] taskkill failed for port-${port} holder pid ${pid} `
+                        + `(status=${r.status}${r.error ? `, ${r.error.message}` : ''}): ${(r.stderr || '').trim()}`);
+                    continue;
+                }
+            } else {
+                process.kill(pid, 'SIGKILL');
+            }
+            console.log(`[python] reclaimed port ${port} from orphaned backend pid ${pid}`);
+        } catch (e: unknown) {
+            const code = (e as NodeJS.ErrnoException)?.code;
+            if (code !== 'ESRCH') console.warn(`[python] failed to reclaim port ${port} from pid ${pid} (${code})`);
+        }
     }
 }
 
@@ -278,8 +472,22 @@ export async function startPython(): Promise<void> {
     serverReady = false;
 
     const pythonPath = findPythonExecutable();
+    // Keep the renderer origin stable across launches (#491): the renderer
+    // loads from http://127.0.0.1:${serverPort}, so if a leftover backend
+    // still holds the preferred port, findPort drifts to 18001+ and wipes
+    // origin-keyed localStorage settings. Reap any orphaned POSIX backend
+    // (cheap, single `ps`), then — ONLY if the preferred port is actually
+    // busy — reclaim its (orphaned) holder and wait for the OS to release it.
+    // The common case (port already free) does no netstat/lsof/ps probing.
     reapOrphanedPythonBackends(pythonPath);
-    serverPort = await findPort(18000);
+    if (!(await isPortFree(PREFERRED_PORT))) {
+        reclaimPort(PREFERRED_PORT);
+        if (!(await waitForPortFree(PREFERRED_PORT, 3000))) {
+            console.warn(`[python] preferred port ${PREFERRED_PORT} still busy after reclaim; `
+                + 'renderer origin may drift and reset localStorage-backed settings');
+        }
+    }
+    serverPort = await findPort(PREFERRED_PORT);
     const configDir = getConfigDir();
     const dlcDir = getDLCDir();
     const pluginsDir = getPluginsDir();
