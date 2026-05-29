@@ -114,6 +114,12 @@
     const lanToggle = $('pm-lan-toggle');
     const lanStatus = $('pm-lan-status');
 
+    // Escape before interpolating into innerHTML — this renderer runs with
+    // webSecurity:false, and extraNote can carry a main-process error string.
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+
     function renderLanStatus(enabled, urls, extraNote) {
         if (!lanStatus) return;
         if (!enabled) {
@@ -123,11 +129,11 @@
             return;
         }
         const list = (urls && urls.length)
-            ? urls.map((u) => `<li><code class="text-emerald-300">${u}</code></li>`).join('')
+            ? urls.map((u) => `<li><code class="text-emerald-300">${esc(u)}</code></li>`).join('')
             : '<li class="text-slate-400 italic">No network address detected — are you connected to Wi-Fi/Ethernet?</li>';
         lanStatus.className = 'mt-3 text-xs text-slate-300';
         lanStatus.innerHTML = `
-            ${extraNote ? `<div class="text-amber-300 mb-1">${extraNote}</div>` : ''}
+            ${extraNote ? `<div class="text-amber-300 mb-1">${esc(extraNote)}</div>` : ''}
             <div class="text-slate-400">Other devices on your network can open:</div>
             <ul class="list-disc list-inside mt-1 space-y-0.5">${list}</ul>
             <div class="text-slate-500 mt-2">Your OS firewall may prompt the first time — allow Slopsmith Desktop so other devices can connect.</div>

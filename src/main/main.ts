@@ -675,13 +675,22 @@ async function startup(): Promise<void> {
         enabled: !!getDesktopConfig().lanAccess,
         urls: getLanUrls(),
     }));
-    ipcMain.handle('network:setLanAccess', (_event, enabled: unknown) => {
+    ipcMain.handle('network:setLanAccess', async (_event, enabled: unknown) => {
         const on = enabled === true;
         setDesktopConfig({ lanAccess: on });
         // Re-spawn uvicorn with the new --host. Same port is reused (the old
         // process releases it first), so the already-loaded 127.0.0.1
         // renderer keeps working once the backend is back up.
         restartPython();
+        // Wait for the backend to actually rebind before resolving, so the UI
+        // doesn't hand out a LAN URL that 404s during the ~restart window. If
+        // it doesn't come back in time we still report the intended state —
+        // the renderer surfaces failures through the normal startup path.
+        try {
+            await waitForPython();
+        } catch {
+            /* backend slow/failed to restart — return intended state anyway */
+        }
         return { success: true, enabled: on, urls: getLanUrls() };
     });
 
