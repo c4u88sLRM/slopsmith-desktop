@@ -70,7 +70,7 @@ crashReporter.start({
     uploadToServer: false,
     compress: false,
 });
-import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus } from './python';
+import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus, restartPython, getLanUrls } from './python';
 import {
     IPC_STARTUP_STATUS,
     IPC_STARTUP_GET_STATUS,
@@ -83,7 +83,7 @@ import {
 import { initAudioBridge, shutdownAudio } from './audio-bridge';
 import { initDebugLogging, isDebugEnabled } from './debug-log';
 import { initPluginManager } from './plugin-manager';
-import { initSoundfontManager } from './soundfont-manager';
+import { initSoundfontManager, getDesktopConfig, setDesktopConfig } from './soundfont-manager';
 import * as updateManager from './update-manager';
 import type { UpdateChannel } from './update-manager';
 
@@ -665,6 +665,24 @@ async function startup(): Promise<void> {
     // Config directory
     ipcMain.handle('app:getConfigDir', () => {
         return app.getPath('userData');
+    });
+
+    // LAN access — opt-in toggle to bind the backend to 0.0.0.0 so other
+    // devices on the network can reach the library / sync room (issue #441).
+    // Default is loopback-only; enabling restarts the Python backend so the
+    // new bind address takes effect on the same port.
+    ipcMain.handle('network:getLanAccess', () => ({
+        enabled: !!getDesktopConfig().lanAccess,
+        urls: getLanUrls(),
+    }));
+    ipcMain.handle('network:setLanAccess', (_event, enabled: unknown) => {
+        const on = enabled === true;
+        setDesktopConfig({ lanAccess: on });
+        // Re-spawn uvicorn with the new --host. Same port is reused (the old
+        // process releases it first), so the already-loaded 127.0.0.1
+        // renderer keeps working once the backend is back up.
+        restartPython();
+        return { success: true, enabled: on, urls: getLanUrls() };
     });
 
     // Auto-update (Velopack). The renderer Settings panel reads the persisted
