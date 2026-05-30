@@ -120,29 +120,6 @@ clone_slopsmith() {
 	cd "$clone_dir/plugins"
 	local plugins=(
 		# byrongamatos plugins
-		byrongamatos/slopsmith-plugin-drum-highway-3d
-		byrongamatos/slopsmith-plugin-drums
-		byrongamatos/slopsmith-plugin-editor
-		byrongamatos/slopsmith-plugin-flappy-bend
-		byrongamatos/slopsmith-plugin-fretboard
-		byrongamatos/slopsmith-plugin-jumpingtab
-		byrongamatos/slopsmith-plugin-lyrics-karaoke
-		byrongamatos/slopsmith-plugin-metronome
-		byrongamatos/slopsmith-plugin-midi
-		byrongamatos/slopsmith-plugin-multiplayer
-		byrongamatos/slopsmith-plugin-nam-tone
-		byrongamatos/slopsmith-plugin-notedetect
-		byrongamatos/slopsmith-plugin-piano
-		byrongamatos/slopsmith-plugin-practice
-		byrongamatos/slopsmith-plugin-profileimport
-		byrongamatos/slopsmith-plugin-sectionmap
-		byrongamatos/slopsmith-plugin-setlist
-		byrongamatos/slopsmith-plugin-stepmode
-		byrongamatos/slopsmith-plugin-studio
-		byrongamatos/slopsmith-plugin-tabimport
-		byrongamatos/slopsmith-plugin-tabview
-		byrongamatos/slopsmith-plugin-tones
-		byrongamatos/slopsmith-plugin-tutorials
 		slopsmith/slopsmith-plugin-drum-highway-3d
 		slopsmith/slopsmith-plugin-drums
 		slopsmith/slopsmith-plugin-editor
