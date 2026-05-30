@@ -258,6 +258,96 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         return value !== undefined && value !== null && value !== '';
     }
 
+    function safeKeyPart(value) {
+        return String(value || 'default')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'default';
+    }
+
+    function currentAudioDeviceSnapshot() {
+        return {
+            inputType: deviceTypeSelect?.value || '',
+            inputDevice: inputDeviceSelect?.value || '',
+            outputType: outputDeviceTypeSelect?.value || deviceTypeSelect?.value || '',
+            outputDevice: outputDeviceSelect?.value || '',
+            sampleRate: parseFloat(sampleRateSelect?.value || '48000'),
+            bufferSize: parseInt(bufferSizeSelect?.value || '256', 10),
+        };
+    }
+
+    async function audioInputOpenHandler(request) {
+        const source = (request && request.logicalSourceKey) ? String(request.logicalSourceKey) : '';
+        const match = /^desktop-audio:([^:]+):input:(\d+)$/.exec(source);
+        const inputType = match ? match[1] : safeKeyPart(deviceTypeSelect?.value || 'default');
+        const inputIndex = match ? Number(match[2]) : -1;
+        const typeInfo = currentDeviceTypes.find(t => safeKeyPart(t && t.name) === inputType)
+            || currentDeviceTypes.find(t => t && t.name === deviceTypeSelect?.value)
+            || currentDeviceTypes[0]
+            || null;
+        const inputDevice = inputIndex >= 0 && typeInfo && Array.isArray(typeInfo.inputs)
+            ? (typeInfo.inputs[inputIndex] || '')
+            : (inputDeviceSelect?.value || '');
+        const snapshot = currentAudioDeviceSnapshot();
+        const result = await api.setDevice({
+            inputType: typeInfo && typeInfo.name ? typeInfo.name : snapshot.inputType,
+            inputDevice,
+            outputType: snapshot.outputType || (typeInfo && typeInfo.name) || snapshot.inputType,
+            outputDevice: snapshot.outputDevice,
+            sampleRate: snapshot.sampleRate,
+            bufferSize: snapshot.bufferSize,
+        });
+        const ok = typeof result === 'boolean' ? result : !!result?.ok;
+        if (!ok) return { outcome: 'failed', status: 'failed', reason: result && result.error ? String(result.error) : 'Native audio device open failed' };
+        if (typeof api.startAudio === 'function') await api.startAudio();
+        return { outcome: 'handled', status: 'open' };
+    }
+
+    async function audioInputCloseHandler() {
+        return { outcome: 'handled', status: 'closed' };
+    }
+
+    function registerAudioSessionInputSources() {
+        const audioSession = window.slopsmith && window.slopsmith.audioSession;
+        if (!audioSession || typeof audioSession.registerInputSource !== 'function') return;
+        const typeList = Array.isArray(currentDeviceTypes) ? currentDeviceTypes : [];
+        typeList.forEach((typeInfo) => {
+            const typeName = typeInfo && typeInfo.name ? String(typeInfo.name) : '';
+            const inputs = Array.isArray(typeInfo && typeInfo.inputs) ? typeInfo.inputs : [];
+            inputs.forEach((_deviceName, index) => {
+                const logicalSourceKey = `desktop-audio:${safeKeyPart(typeName)}:input:${index}`;
+                audioSession.registerInputSource({
+                    sourceId: `audio_engine:${logicalSourceKey}`,
+                    logicalSourceKey,
+                    providerId: 'audio_engine',
+                    ownerPluginId: 'audio_engine',
+                    kind: 'instrument',
+                    labelPseudonym: `Desktop input ${index + 1}`,
+                    labelSafe: true,
+                    availability: 'available',
+                    sourceMode: 'native',
+                    channelSummary: { channelCount: 2, channelShape: 'stereo', supports: ['mono', 'stereo'] },
+                    operations: ['source.open', 'source.close'],
+                    operationHandlers: {
+                        'source.open': audioInputOpenHandler,
+                        'source.close': audioInputCloseHandler,
+                    },
+                });
+            });
+        });
+        if (typeof audioSession.recordBridgeHit === 'function') {
+            audioSession.recordBridgeHit({
+                domain: 'audio-input',
+                bridgeId: 'audio-input.legacy-source',
+                legacySurface: 'window.slopsmithDesktop.audio',
+                participantId: 'audio_engine',
+                logicalSourceKey: currentAudioDeviceSnapshot().inputDevice ? 'desktop-audio:selected-input' : '',
+                outcome: 'handled',
+                status: 'native-provider',
+            });
+        }
+    }
+
     function selectHasValue(select, value) {
         if (!select) return false;
         const s = String(value);
@@ -821,6 +911,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }
 
         await refreshDeviceOptions();
+        registerAudioSessionInputSources();
     }
 
     function updateInputDeviceDropdown(typeInfo) {
@@ -1022,6 +1113,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 if (!outputDeviceTypeSelect) updateOutputDeviceDropdown(typeInfo);
             }
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         if (outputDeviceTypeSelect) {
@@ -1029,15 +1121,18 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 const typeInfo = currentDeviceTypes.find(t => t.name === outputDeviceTypeSelect.value);
                 if (typeInfo) updateOutputDeviceDropdown(typeInfo);
                 await refreshDeviceOptions();
+                registerAudioSessionInputSources();
             });
         }
 
         inputDeviceSelect.addEventListener('change', async () => {
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         outputDeviceSelect.addEventListener('change', async () => {
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         sampleRateSelect.addEventListener('change', () => {
