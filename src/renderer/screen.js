@@ -222,23 +222,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         return pendingDeviceSave;
     }
 
-    async function saveAppliedDeviceSettings(overrides = {}) {
-        if (lastAppliedDeviceSettings) {
-            const settings = {
-                ...cloneDeviceSettings(lastAppliedDeviceSettings),
-                ...overrides,
-            };
-            rememberAppliedDeviceSettings(settings);
-            return saveDeviceSettings(settings);
-        }
-        // No applied device this session (no saved config, or saved config
-        // probe was incompatible). Preserve any previously-persisted device
-        // selection and only update the override keys (e.g. monitorMute) so
-        // user-toggleable prefs survive a restart even before Apply lands.
-        // Do NOT update lastAppliedDeviceSettings — isDeviceFormApplied()
-        // must keep returning false until an actual Apply succeeds.
-        const base = (await loadDeviceSettings()) || captureDeviceSettings();
-        return saveDeviceSettings({ ...cloneDeviceSettings(base), ...overrides });
+    function saveAppliedDeviceSettings(overrides = {}) {
+        if (!lastAppliedDeviceSettings) return Promise.resolve(null);
+        const settings = {
+            ...cloneDeviceSettings(lastAppliedDeviceSettings),
+            ...overrides,
+        };
+        rememberAppliedDeviceSettings(settings);
+        return saveDeviceSettings(settings);
     }
 
     async function loadDeviceSettings() {
@@ -265,6 +256,96 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     function hasSettingValue(value) {
         return value !== undefined && value !== null && value !== '';
+    }
+
+    function safeKeyPart(value) {
+        return String(value || 'default')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'default';
+    }
+
+    function currentAudioDeviceSnapshot() {
+        return {
+            inputType: deviceTypeSelect?.value || '',
+            inputDevice: inputDeviceSelect?.value || '',
+            outputType: outputDeviceTypeSelect?.value || deviceTypeSelect?.value || '',
+            outputDevice: outputDeviceSelect?.value || '',
+            sampleRate: parseFloat(sampleRateSelect?.value || '48000'),
+            bufferSize: parseInt(bufferSizeSelect?.value || '256', 10),
+        };
+    }
+
+    async function audioInputOpenHandler(request) {
+        const source = (request && request.logicalSourceKey) ? String(request.logicalSourceKey) : '';
+        const match = /^desktop-audio:([^:]+):input:(\d+)$/.exec(source);
+        const inputType = match ? match[1] : safeKeyPart(deviceTypeSelect?.value || 'default');
+        const inputIndex = match ? Number(match[2]) : -1;
+        const typeInfo = currentDeviceTypes.find(t => safeKeyPart(t && t.name) === inputType)
+            || currentDeviceTypes.find(t => t && t.name === deviceTypeSelect?.value)
+            || currentDeviceTypes[0]
+            || null;
+        const inputDevice = inputIndex >= 0 && typeInfo && Array.isArray(typeInfo.inputs)
+            ? (typeInfo.inputs[inputIndex] || '')
+            : (inputDeviceSelect?.value || '');
+        const snapshot = currentAudioDeviceSnapshot();
+        const result = await api.setDevice({
+            inputType: typeInfo && typeInfo.name ? typeInfo.name : snapshot.inputType,
+            inputDevice,
+            outputType: snapshot.outputType || (typeInfo && typeInfo.name) || snapshot.inputType,
+            outputDevice: snapshot.outputDevice,
+            sampleRate: snapshot.sampleRate,
+            bufferSize: snapshot.bufferSize,
+        });
+        const ok = typeof result === 'boolean' ? result : !!result?.ok;
+        if (!ok) return { outcome: 'failed', status: 'failed', reason: result && result.error ? String(result.error) : 'Native audio device open failed' };
+        if (typeof api.startAudio === 'function') await api.startAudio();
+        return { outcome: 'handled', status: 'open' };
+    }
+
+    async function audioInputCloseHandler() {
+        return { outcome: 'handled', status: 'closed' };
+    }
+
+    function registerAudioSessionInputSources() {
+        const audioSession = window.slopsmith && window.slopsmith.audioSession;
+        if (!audioSession || typeof audioSession.registerInputSource !== 'function') return;
+        const typeList = Array.isArray(currentDeviceTypes) ? currentDeviceTypes : [];
+        typeList.forEach((typeInfo) => {
+            const typeName = typeInfo && typeInfo.name ? String(typeInfo.name) : '';
+            const inputs = Array.isArray(typeInfo && typeInfo.inputs) ? typeInfo.inputs : [];
+            inputs.forEach((_deviceName, index) => {
+                const logicalSourceKey = `desktop-audio:${safeKeyPart(typeName)}:input:${index}`;
+                audioSession.registerInputSource({
+                    sourceId: `audio_engine:${logicalSourceKey}`,
+                    logicalSourceKey,
+                    providerId: 'audio_engine',
+                    ownerPluginId: 'audio_engine',
+                    kind: 'instrument',
+                    labelPseudonym: `Desktop input ${index + 1}`,
+                    labelSafe: true,
+                    availability: 'available',
+                    sourceMode: 'native',
+                    channelSummary: { channelCount: 2, channelShape: 'stereo', supports: ['mono', 'stereo'] },
+                    operations: ['source.open', 'source.close'],
+                    operationHandlers: {
+                        'source.open': audioInputOpenHandler,
+                        'source.close': audioInputCloseHandler,
+                    },
+                });
+            });
+        });
+        if (typeof audioSession.recordBridgeHit === 'function') {
+            audioSession.recordBridgeHit({
+                domain: 'audio-input',
+                bridgeId: 'audio-input.legacy-source',
+                legacySurface: 'window.slopsmithDesktop.audio',
+                participantId: 'audio_engine',
+                logicalSourceKey: currentAudioDeviceSnapshot().inputDevice ? 'desktop-audio:selected-input' : '',
+                outcome: 'handled',
+                status: 'native-provider',
+            });
+        }
     }
 
     function selectHasValue(select, value) {
@@ -658,15 +739,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             setSelectValueIfPresent(sampleRateSelect, saved.sampleRate);
             setSelectValueIfPresent(bufferSizeSelect, saved.bufferSize);
             setSelectValueIfPresent(inputChannelSelect, saved.inputChannel);
-            if (saved.monitorMute !== undefined) {
-                monitorMuteCheckbox.checked = saved.monitorMute;
-                // Push to the engine immediately so the native state matches the
-                // UI even when the device probe below fails (incompatible saved
-                // config). Otherwise the AudioEngine stays at its `monitorMuted{true}`
-                // default while the checkbox says false → UI lies.
-                try { await api.setMonitorMute(saved.monitorMute); }
-                catch (e) { console.warn('[audio-engine] setMonitorMute restore failed:', e); }
-            }
+            if (saved.monitorMute !== undefined) monitorMuteCheckbox.checked = saved.monitorMute;
 
             // Respect refreshDeviceOptions's fail-closed verdict: if the
             // probe didn't explicitly confirm compatible=true, skip the
@@ -693,6 +766,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 if (ok) {
                     const inputChannel = parseInt(inputChannelSelect.value);
                     if (Number.isFinite(inputChannel)) await api.setInputChannel(inputChannel);
+                    if (saved.monitorMute !== undefined) await api.setMonitorMute(saved.monitorMute);
                     await api.startAudio();
                     audioRunning = true;
                     toggleBtn.textContent = 'Stop';
@@ -837,6 +911,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }
 
         await refreshDeviceOptions();
+        registerAudioSessionInputSources();
     }
 
     function updateInputDeviceDropdown(typeInfo) {
@@ -1038,6 +1113,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 if (!outputDeviceTypeSelect) updateOutputDeviceDropdown(typeInfo);
             }
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         if (outputDeviceTypeSelect) {
@@ -1045,15 +1121,18 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 const typeInfo = currentDeviceTypes.find(t => t.name === outputDeviceTypeSelect.value);
                 if (typeInfo) updateOutputDeviceDropdown(typeInfo);
                 await refreshDeviceOptions();
+                registerAudioSessionInputSources();
             });
         }
 
         inputDeviceSelect.addEventListener('change', async () => {
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         outputDeviceSelect.addEventListener('change', async () => {
             await refreshDeviceOptions();
+            registerAudioSessionInputSources();
         });
 
         sampleRateSelect.addEventListener('change', () => {
@@ -3417,50 +3496,20 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     // Called by clearChainForNewSong (IIFE 1) and the preload below.
     window._aeBeginChainRebuildGuard = function () { aeSetMonitorMuteSuppressed(true); };
 
-    const MONITOR_MUTE_HINT_DISMISSED_KEY = 'slopsmith-monitor-mute-hint-dismissed';
     function showMonitorMuteHint() {
-        try { if (localStorage.getItem(MONITOR_MUTE_HINT_DISMISSED_KEY) === '1') return; } catch (_) {}
         let toast = document.getElementById('monitor-mute-hint');
         if (!toast) {
             toast = document.createElement('div');
             toast.id = 'monitor-mute-hint';
-            toast.style.cssText = 'position:fixed;top:60px;right:20px;z-index:9999;max-width:320px;padding:10px 16px;border-radius:8px;background:rgba(180,83,9,0.95);color:white;font-size:12px;font-weight:600;transition:opacity 0.5s;pointer-events:auto;';
-
-            const msg = document.createElement('div');
-            msg.textContent = 'Monitor mute is on and no tone is loaded — add an amp/VST or load a preset to hear a processed tone.';
-            msg.style.marginBottom = '8px';
-            toast.appendChild(msg);
-
-            const actions = document.createElement('div');
-            actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;';
-            const mkBtn = (label, onClick) => {
-                const b = document.createElement('button');
-                // Explicit type='button' — HTML defaults to 'submit', which
-                // would trigger form submission if this toast ever lands
-                // inside a form ancestor.
-                b.type = 'button';
-                b.textContent = label;
-                b.style.cssText = 'background:rgba(255,255,255,0.15);border:0;color:white;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;';
-                b.addEventListener('click', onClick);
-                return b;
-            };
-            actions.appendChild(mkBtn('Dismiss', () => toast.remove()));
-            actions.appendChild(mkBtn("Don't show again", () => {
-                try { localStorage.setItem(MONITOR_MUTE_HINT_DISMISSED_KEY, '1'); } catch (_) {}
-                toast.remove();
-            }));
-            toast.appendChild(actions);
+            toast.style.cssText = 'position:fixed;top:60px;right:20px;z-index:9999;max-width:320px;padding:10px 16px;border-radius:8px;background:rgba(180,83,9,0.95);color:white;font-size:12px;font-weight:600;cursor:pointer;transition:opacity 0.5s;';
+            toast.title = 'Click to dismiss';
+            toast.addEventListener('click', () => toast.remove());
             document.body.appendChild(toast);
         }
+        toast.textContent = 'Monitor mute is on and no tone is loaded — add an amp/VST or load a preset to hear a processed tone.';
         toast.style.opacity = '1';
-        toast.style.pointerEvents = 'auto';
         clearTimeout(toast._timer);
-        toast._timer = setTimeout(() => {
-            toast.style.opacity = '0';
-            // Drop pointer-events with the fade so the invisible container can't
-            // swallow clicks in the top-right corner of the app afterwards.
-            toast.style.pointerEvents = 'none';
-        }, 6000);
+        toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 6000);
     }
 
     // Run once the rebuild has settled: if a real chain exists, restore normal
