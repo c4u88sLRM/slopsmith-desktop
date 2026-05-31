@@ -2,18 +2,53 @@
 // of Slopsmith plugins via git operations.
 
 import { ipcMain } from 'electron';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getPluginsDir, restartPython } from './python';
 
-function execAsync(cmd: string, cwd?: string): Promise<string> {
+// Run git with an explicit argv array — never via a shell. This removes the
+// OS command-injection vector that `exec(`git clone ${gitUrl} ...`)` had:
+// gitUrl/name are no longer interpolated into a shell string.
+function execFileAsync(file: string, args: string[], cwd?: string): Promise<string> {
     return new Promise((resolve, reject) => {
-        exec(cmd, { cwd, timeout: 60000 }, (error, stdout, stderr) => {
+        execFile(file, args, { cwd, timeout: 60000 }, (error, stdout, stderr) => {
             if (error) reject(new Error(stderr || error.message));
             else resolve(stdout.trim());
         });
     });
+}
+
+// Plugin directory names are a single path segment directly under the
+// plugins dir. Reject separators, traversal, and leading dot/dash so a
+// renderer-supplied `name` can't escape the plugins dir (which would let
+// remove/update/install operate on an arbitrary directory).
+const SAFE_PLUGIN_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+function resolveSafePluginDir(pluginsDir: string, name: string): string | null {
+    // `name` arrives over IPC and may not be a string; guard before
+    // path.resolve (which throws on non-string args).
+    if (typeof name !== 'string' || !name || !SAFE_PLUGIN_NAME.test(name)) return null;
+    const root = path.resolve(pluginsDir);
+    const target = path.resolve(root, name);
+    const rel = path.relative(root, target);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel) || rel.includes(path.sep)) {
+        return null;
+    }
+    return target;
+}
+
+// Require a well-formed https:// URL with a hostname so a renderer can't
+// point git at a local path / file:// / ext:: transport (or a malformed
+// `https:///` with no host). Parsing with URL also rejects whitespace and
+// junk a bare prefix regex would let through. (Shell injection is already
+// gone via execFile — this is transport/host hardening.)
+function isValidGitUrl(url: string): boolean {
+    try {
+        const u = new URL(url);
+        return u.protocol === 'https:' && u.hostname.length > 0;
+    } catch {
+        return false;
+    }
 }
 
 interface InstalledPlugin {
@@ -61,7 +96,7 @@ async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
         // Try to get git version info
         if (fs.existsSync(gitDir)) {
             try {
-                const hash = await execAsync('git rev-parse --short HEAD', pluginPath);
+                const hash = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], pluginPath);
                 version = `${version} (${hash})`;
             } catch { /* not a git repo */ }
         }
@@ -81,6 +116,10 @@ async function listInstalledPlugins(): Promise<InstalledPlugin[]> {
 async function installPlugin(gitUrl: string, name?: string): Promise<{ success: boolean; message: string }> {
     const pluginsDir = getPluginsDir();
 
+    if (typeof gitUrl !== 'string' || !isValidGitUrl(gitUrl)) {
+        return { success: false, message: 'Invalid git URL — only https:// remotes are allowed' };
+    }
+
     // Derive directory name from URL if not provided
     if (!name) {
         // https://github.com/user/slopsmith-plugin-foo.git -> slopsmith-plugin-foo
@@ -88,14 +127,17 @@ async function installPlugin(gitUrl: string, name?: string): Promise<{ success: 
         name = urlParts[urlParts.length - 1] || 'plugin';
     }
 
-    const targetDir = path.join(pluginsDir, name);
+    const targetDir = resolveSafePluginDir(pluginsDir, name);
+    if (!targetDir) {
+        return { success: false, message: `Invalid plugin name "${name}"` };
+    }
 
     if (fs.existsSync(targetDir)) {
         return { success: false, message: `Plugin directory "${name}" already exists` };
     }
 
     try {
-        await execAsync(`git clone ${gitUrl} ${JSON.stringify(targetDir)}`);
+        await execFileAsync('git', ['clone', gitUrl, targetDir]);
 
         // Verify it has a plugin.json
         const manifestPath = path.join(targetDir, 'plugin.json');
@@ -113,7 +155,10 @@ async function installPlugin(gitUrl: string, name?: string): Promise<{ success: 
 
 async function removePlugin(name: string): Promise<{ success: boolean; message: string }> {
     const pluginsDir = getPluginsDir();
-    const targetDir = path.join(pluginsDir, name);
+    const targetDir = resolveSafePluginDir(pluginsDir, name);
+    if (!targetDir) {
+        return { success: false, message: `Invalid plugin name "${name}"` };
+    }
 
     if (!fs.existsSync(targetDir)) {
         return { success: false, message: `Plugin "${name}" not found` };
@@ -129,7 +174,10 @@ async function removePlugin(name: string): Promise<{ success: boolean; message: 
 
 async function updatePlugin(name: string): Promise<{ success: boolean; message: string }> {
     const pluginsDir = getPluginsDir();
-    const targetDir = path.join(pluginsDir, name);
+    const targetDir = resolveSafePluginDir(pluginsDir, name);
+    if (!targetDir) {
+        return { success: false, message: `Invalid plugin name "${name}"` };
+    }
 
     if (!fs.existsSync(targetDir)) {
         return { success: false, message: `Plugin "${name}" not found` };
@@ -140,7 +188,7 @@ async function updatePlugin(name: string): Promise<{ success: boolean; message: 
     }
 
     try {
-        const output = await execAsync('git pull', targetDir);
+        const output = await execFileAsync('git', ['pull'], targetDir);
         if (output.includes('Already up to date')) {
             return { success: true, message: `"${name}" is already up to date` };
         }
