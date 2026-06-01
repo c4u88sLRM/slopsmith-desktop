@@ -101,17 +101,13 @@ public:
     // ClosePluginEditor branches on dynamic_cast<SandboxedProcessor*>
     // to skip the host-side PluginEditorWindow creation entirely.
     juce::AudioProcessorEditor* createEditor() override { return nullptr; }
-   #if JUCE_LINUX
-    // JUCE's VST3 plugin-editor hosting on Linux (X11 IRunLoop / XEmbed) is too
-    // fragile to drive reliably — opening one can crash the hosted view — and
-    // is out of scope for the macOS port (issue #264). Don't advertise an
-    // editor on Linux so the renderer offers no Edit button. Audio + state
-    // hosting are fully functional. Windows + macOS open a floating editor
-    // window in the sandbox child.
-    bool hasEditor() const override { return false; }
-   #else
+    // The sandbox child owns a floating top-level editor window in its own
+    // process — Windows (HWND), macOS (NSWindow), and Linux (X11) alike. On
+    // Linux this rides JUCE 8's VST3 editor hosting (Steinberg::Linux::IRunLoop
+    // integrated with the child's MessageManager X11 event loop); the host
+    // never reparents the window, so a plugin's GL/Qt render context stays in
+    // the process that created it. Audio + state hosting are platform-neutral.
     bool hasEditor() const override { return isAlive() && hasEditorCached; }
-   #endif
 
     // Show the sandbox plugin's editor in a top-level window owned by the
     // sandbox child. Idempotent: a second call while the editor is already

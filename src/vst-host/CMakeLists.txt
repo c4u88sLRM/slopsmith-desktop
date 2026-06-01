@@ -88,6 +88,17 @@ if(APPLE)
         "-framework CoreFoundation" "-framework Accelerate")
 endif()
 
+if(UNIX AND NOT APPLE)
+    # Linux: main.cpp calls XInitThreads/XSetErrorHandler directly to install a
+    # non-fatal X error handler so a benign plugin-editor X protocol error can't
+    # exit() this child (JUCE only auto-installs those handlers for standalone
+    # JUCEApplications — see installLinuxX11Safety in main.cpp). JUCE dlopen()s
+    # libX11 for its own use; our direct calls need it at link time.
+    find_package(X11 REQUIRED)
+    target_link_libraries(slopsmith-vst-host PRIVATE ${X11_LIBRARIES})
+    target_include_directories(slopsmith-vst-host PRIVATE ${X11_INCLUDE_DIR})
+endif()
+
 if(WIN32)
     if(MSVC)
         # /EHa for SEH-aware catch in VSTHost.cpp (matches src/audio/CMakeLists.txt).

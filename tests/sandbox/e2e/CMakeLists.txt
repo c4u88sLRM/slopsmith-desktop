@@ -62,6 +62,15 @@ target_compile_definitions(slopsmith-vst-host PRIVATE
     JUCE_PLUGINHOST_VST3=1 JUCE_PLUGINHOST_AU=0 JUCE_PLUGINHOST_LV2=0
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_STANDALONE_APPLICATION=1 JUCE_REPORT_APP_USAGE=0)
+# main.cpp calls XInitThreads/XSetErrorHandler directly on Linux to install a
+# non-fatal X error handler (JUCE only does this for standalone JUCEApplications,
+# which this child is not). JUCE itself dlopen()s libX11, but our direct calls
+# need it link-time. Mirrors src/vst-host/CMakeLists.txt.
+if(UNIX AND NOT APPLE)
+    find_package(X11 REQUIRED)
+    target_link_libraries(slopsmith-vst-host PRIVATE ${X11_LIBRARIES})
+    target_include_directories(slopsmith-vst-host PRIVATE ${X11_INCLUDE_DIR})
+endif()
 
 # --- host-side e2e driver ---
 add_executable(sandbox_e2e_test
@@ -86,3 +95,16 @@ add_test(NAME sandbox_e2e_test
     COMMAND sandbox_e2e_test
         "$<TARGET_FILE:slopsmith-vst-host>"
         "${CMAKE_BINARY_DIR}/SlopPassThrough_artefacts/$<CONFIG>/VST3/SlopPassThrough.vst3")
+
+# Orphan-cleanup regression (issue #265): host crash → child must not orphan.
+# Linux-only — the driver's leak path + PR_SET_PDEATHSIG are JUCE_LINUX-gated;
+# on macOS the env var is a no-op so this would assert clean-shutdown, not the
+# crash path, which would be misleading. (UNIX AND NOT APPLE matches the X11
+# linkage block above and excludes any other non-mac POSIX target.)
+if(UNIX AND NOT APPLE)
+    add_test(NAME sandbox_e2e_leak
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/leak_test.sh"
+            "$<TARGET_FILE:sandbox_e2e_test>"
+            "$<TARGET_FILE:slopsmith-vst-host>"
+            "${CMAKE_BINARY_DIR}/SlopPassThrough_artefacts/$<CONFIG>/VST3/SlopPassThrough.vst3")
+endif()

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 using namespace slopsmith::sandbox;
@@ -50,6 +51,21 @@ int main(int argc, char** argv)
     CHECK(sb != nullptr);
     if (!sb) { std::fprintf(stderr, "spawn failed: %s\n", err.toRawUTF8()); return 1; }
     CHECK(sb->isAlive());
+
+   #if JUCE_LINUX
+    // Orphan-cleanup check (issue #265). When SLOPSMITH_E2E_LEAK_TEST is set,
+    // simulate a host *crash*: exit RIGHT NOW via _Exit, skipping sb's
+    // destructor — so no `shutdown` op and no SIGTERM→SIGKILL ladder ever runs.
+    // The child must still die, via PR_SET_PDEATHSIG (installLinuxParentDeathSignal
+    // in the child). The leak_test.sh wrapper reads the child pid from its log
+    // and asserts it is gone after this parent vanishes.
+    if (std::getenv("SLOPSMITH_E2E_LEAK_TEST") != nullptr)
+    {
+        std::printf("LEAK_TEST: child alive; crashing host without shutdown\n");
+        std::fflush(stdout);
+        std::_Exit(0);
+    }
+   #endif
 
     sb->prepareToPlay(48000.0, 256);
 
@@ -117,11 +133,13 @@ int main(int argc, char** argv)
     sb->setStateInformation(state.getData(), (int)state.getSize());
     CHECK(sb->isAlive());   // setState shouldn't have torn the sandbox down
 
-   #if JUCE_MAC
-    // Editor open/close protocol (macOS): the child becomes a foreground app
-    // and opens a floating NSWindow. Proves the kOpenEditor round-trip +
-    // editorOpen tracking + kCloseEditor. Visual focus/DPI is the one thing a
-    // headless runner can't verify (manual on a real Mac).
+   #if JUCE_MAC || JUCE_LINUX
+    // Editor open/close protocol: the child opens a floating top-level editor
+    // window in its own process (NSWindow on macOS, X11 window on Linux via
+    // JUCE 8's VST3 IRunLoop hosting) and the host tracks only the open bit.
+    // Proves the kOpenEditor round-trip + editorOpen tracking + kCloseEditor.
+    // Runs under xvfb on the Linux CI runner; visual focus/DPI is the one thing
+    // a headless runner can't verify (manual on real hardware).
     CHECK(sb->hasEditor());
     const bool opened = sb->requestOpenEditor();
     CHECK(opened);
@@ -129,13 +147,6 @@ int main(int argc, char** argv)
     sb->requestCloseEditor();
     CHECK(!sb->isEditorOpen());
     CHECK(sb->isAlive());   // open/close must not crash the child
-   #elif JUCE_LINUX
-    // Linux: the sandbox doesn't advertise an editor (JUCE VST3 editor hosting
-    // on X11 is too fragile — see SandboxedProcessor::hasEditor). Audio + state
-    // are covered above. (Scoped to JUCE_LINUX, not a bare #else: on Windows
-    // hasEditor() returns the cached value, so a `!hasEditor()` assertion would
-    // be wrong there — this harness is POSIX-only via CMake regardless.)
-    CHECK(! sb->hasEditor());
    #endif
 
     sb.reset();   // destructor → shutdown op → SIGTERM ladder; must not hang

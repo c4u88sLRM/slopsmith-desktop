@@ -41,6 +41,14 @@
  #include <unistd.h>   // getpid
 #endif
 
+#if JUCE_LINUX
+ #include <X11/Xlib.h>     // XInitThreads, XSetErrorHandler (see installLinuxX11Safety)
+ #include <sys/prctl.h>    // prctl(PR_SET_PDEATHSIG) (see installLinuxParentDeathSignal)
+ #include <csignal>        // SIGTERM
+ #include <cerrno>         // errno (strerror(errno) in installLinuxParentDeathSignal)
+ #include <cstring>        // strerror
+#endif
+
 #include "../audio/Sandbox/Protocol.h"
 #include "../audio/Sandbox/ControlChannel.h"
 #include "../audio/Sandbox/AudioChannel.h"
@@ -886,6 +894,9 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
     {
         if (!st.plugin || !st.plugin->hasEditor())
         {
+            hostLogf("kOpenEditor: rejected — no editor (plugin=%p hasEditor=%d)",
+                     (void*)st.plugin.get(),
+                     st.plugin ? (int)st.plugin->hasEditor() : -1);
             reply(false, {}, "no editor");
             return;
         }
@@ -956,10 +967,13 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
             st.editor.reset(st.plugin->createEditorAndMakeActive());
             if (!st.editor)
             {
+                hostLogf("kOpenEditor: createEditorAndMakeActive returned null");
                 releaseEditorFlag(st);
                 reply(false, {}, "createEditorAndMakeActive null");
                 return;
             }
+            hostLogf("kOpenEditor: editor created (%dx%d)",
+                     st.editor->getWidth(), st.editor->getHeight());
             if (st.editor->getWidth() < 16 || st.editor->getHeight() < 16)
                 st.editor->setSize(slopsmith::sandbox::kDefaultEditorWidth,
                                    slopsmith::sandbox::kDefaultEditorHeight);
@@ -1347,6 +1361,117 @@ struct HostLogCloser {
     }
 };
 
+#if JUCE_LINUX
+// JUCE installs its (non-fatal) X11 error handlers + calls XInitThreads only
+// for standalone JUCEApplications — XWindowSystem's ctor gates both on
+// JUCEApplicationBase::isStandaloneApp() (juce_XWindowSystem_linux.cpp). This
+// sandbox child is NOT a JUCEApplication: it runs a bare main() with a
+// ScopedJuceInitialiser_GUI and pumps its own message loop, so isStandaloneApp()
+// is false and Xlib's DEFAULT error handler stays active — and that handler
+// calls exit() on any protocol error. A benign BadAtom (e.g. JUCE querying
+// _NET_WM_STATE via isMinimised() during addToDesktop on a window-manager-less
+// server, or a plugin editor doing unusual X during embedding) would then take
+// the whole child down — and with it the plugin's audio. Install our own
+// non-fatal handler so a stray X error is logged and survived, mirroring the
+// SIGPIPE suppression (AudioChannel/ControlChannel) and the createEditor
+// exception containment already in this file. JUCE never overrides it for a
+// non-standalone host, so this baseline persists for the process lifetime.
+static int sandboxXErrorHandler(::Display* d, ::XErrorEvent* e)
+{
+    // Cap logging: a window-manager-less server (e.g. the xvfb CI runner) makes
+    // JUCE's repeated _NET_WM_* property queries each raise a benign BadAtom, so
+    // the handler can fire hundreds of times. Log the first few in detail, then
+    // suppress to keep the per-PID log bounded and off the message thread's back
+    // (this runs inside Xlib's reply processing). The handler must still always
+    // return 0 — suppressing the *log* line, never the survival.
+    constexpr int kMaxLogged = 16;
+    static std::atomic<int> seen{0};
+    const int n = seen.fetch_add(1, std::memory_order_relaxed);
+    if (n < kMaxLogged)
+    {
+        char buf[128] = { 0 };
+        if (d != nullptr) XGetErrorText(d, e->error_code, buf, sizeof(buf) - 1);
+        hostLogf("X11 non-fatal error: %s (code=%d request=%d.%d resid=0x%lx serial=%lu)",
+                 buf, (int)e->error_code, (int)e->request_code, (int)e->minor_code,
+                 (unsigned long)e->resourceid, (unsigned long)e->serial);
+    }
+    else if (n == kMaxLogged)
+    {
+        hostLogf("X11 non-fatal error: further occurrences suppressed (logged %d)",
+                 kMaxLogged);
+    }
+    return 0;   // never exit — the default Xlib handler would kill the child
+}
+
+static void installLinuxX11Safety()
+{
+    // Mirror JUCE's standalone init: make libX11 thread-safe before the display
+    // is opened (JUCE opens it lazily on the first editor window). Our own X
+    // access is message-thread-only (the audio worker never touches X), but an
+    // untrusted plugin editor may spin up its own threads that call Xlib, so
+    // enable threading up front. A failure is logged, not fatal: aborting (or
+    // disabling the editor) would be disproportionate on a quirk where our
+    // single-threaded X use would have been safe anyway — and XSetErrorHandler
+    // below still contains any fallout non-fatally.
+    if (XInitThreads() == 0)
+        hostLogf("XInitThreads() failed — continuing (our X use is message-thread-only)");
+    XSetErrorHandler(sandboxXErrorHandler);
+}
+
+// Orphan cleanup backstop: if the host (Electron/node) dies, this posix_spawn'd
+// child must not linger holding the audio device + shm.
+//
+// The PRIMARY cleanup already exists and isn't Linux-specific: when the host
+// dies its end of the control socketpair closes, the child's I/O thread reads
+// EOF, and the onDisconnect callback (control.start, below) tears the child
+// down. That covers a *healthy* child on a clean host crash by itself (verified
+// here: the child still exits promptly with this prctl removed).
+//
+// What that path can't cover is a *wedged* child — and wedged plugins are the
+// whole reason the sandbox exists. onDisconnect tears down via the message
+// thread (MessageManager::callAsync → teardown → stopDispatchLoop); a plugin
+// stuck in a modal loop, an infinite paint, or a processBlock deadlock blocks
+// that chain, so the disconnect teardown never completes and the child orphans.
+// PR_SET_PDEATHSIG sidesteps all of it: the kernel delivers SIGTERM (the same
+// signal SubprocessHandle's shutdown ladder uses — no new shutdown path) on
+// parent death, and with no SIGTERM handler installed the default action
+// terminates the process regardless of which threads are wedged. Robust under
+// subreapers too, unlike polling getppid()==1.
+//
+// Caveat (why this can't misfire): PDEATHSIG tracks the parent *thread* that
+// forked us, not the parent process — if that thread exited while the host
+// process lived, we'd be killed spuriously. Here the spawn runs in
+// NodeAddon's LoadVSTWorker::Execute() on a libuv threadpool worker, and libuv
+// never reaps pool threads before process exit — so the spawning thread lives
+// exactly as long as the host process, and PDEATHSIG tracks process lifetime in
+// practice. Even if that ever changed, the PRIMARY cleanup (the control-socket
+// disconnect, above) is process-scoped (the host's fds close only on process
+// death, not thread death), so a healthy child is never killed early. macOS has
+// no equivalent (a kqueue EVFILT_PROC watcher is the documented fallback) —
+// this is Linux-only.
+static void installLinuxParentDeathSignal()
+{
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0)
+    {
+        hostLogf("PR_SET_PDEATHSIG failed: %s", strerror(errno));
+        return;
+    }
+    // Best-effort close on the tiny race where the host died between
+    // posix_spawn and this prctl: the death already happened, so PDEATHSIG will
+    // never fire. getppid()==1 means we were reparented to init — a definite
+    // orphan; bail out. (Under a subreaper like systemd --user the reparent
+    // target isn't pid 1, so this check can't catch that case without knowing
+    // the host pid; the race window is sub-millisecond and PDEATHSIG covers
+    // every non-race host death, so this stays a cheap backstop, not the
+    // primary mechanism.)
+    if (getppid() == 1)
+    {
+        hostLogf("parent already gone at startup (getppid==1) — exiting");
+        std::_Exit(0);
+    }
+}
+#endif
+
 #if JUCE_WINDOWS
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
@@ -1441,6 +1566,14 @@ int main(int argc, char** argv)
                      (int)::getpid());
     }
     HostLogCloser hostLogCloser;
+
+   #if JUCE_LINUX
+    // Earliest: if the host crashes, don't linger as an orphan holding the
+    // audio device + shm. Then keep a benign plugin/editor X protocol error
+    // from exit()ing this child (before JUCE touches X11 on the first window).
+    installLinuxParentDeathSignal();
+    installLinuxX11Safety();
+   #endif
 
     juce::StringArray tokens;
     for (int i = 0; i < argc; ++i) tokens.add(juce::String::fromUTF8(argv[i]));

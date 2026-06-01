@@ -4,10 +4,10 @@ Date: 2026-05-13
 Companion to: `docs/VST-SANDBOX-DIAG.md`
 Status: Windows v1 shipped; POSIX (macOS/Linux) IPC foundation + runtime +
 editor wired and active (§11) — VST3 plugins route through the sandbox on all
-three desktop platforms. The macOS sandbox-child editor window (floating
-NSWindow + foreground activation policy) is implemented; Linux intentionally
-does not advertise an editor (`hasEditor()` returns false). True parent-window
-embedding (CARemoteLayer) remains out of scope.
+three desktop platforms, editor included. The sandbox-child editor is a floating
+top-level window on every platform (HWND / NSWindow + foreground activation
+policy / X11 via JUCE 8's VST3 IRunLoop hosting). True parent-window embedding
+(CARemoteLayer on macOS, XEmbed on Linux) remains out of scope.
 
 ## 1. Topology
 
@@ -410,9 +410,37 @@ the host never reparents it, it only tracks the open/closed bit). On macOS the c
 `juce::Process::makeForegroundProcess()` before showing the window so a `posix_spawn`'d
 executable (default background activation policy) can show + focus its `NSWindow`; NodeAddon's
 editor open/close IPC paths are widened from `#if JUCE_WINDOWS` to all platforms. The
-open/close protocol is asserted by the e2e on macOS CI; visual focus/DPI is the irreducible
-headless blind spot (manual on a real Mac). **Linux** deliberately does *not* advertise an
-editor (`hasEditor()` returns false): JUCE's VST3 plugin-editor hosting on X11
-(IRunLoop/XEmbed) is too fragile to drive reliably and is out of scope for the macOS port —
-audio + state hosting are fully functional there. True cross-process embedding
-(CARemoteLayer / Mach-port) and a packaged `.app` bundle / Dock polish remain future work.
+open/close protocol is asserted by the e2e on macOS + Linux CI; visual focus/DPI is the
+irreducible headless blind spot (manual on real hardware).
+
+**Linux** (issue #265) hosts the editor on the same top-level-window model via JUCE 8's VST3
+editor hosting (`Steinberg::Linux::IRunLoop` integrated with the child's `MessageManager` X11
+event loop); `getWindowHandle()` returns the X11 `Window`. One Linux-specific gotcha: JUCE only
+installs its non-fatal X11 error handlers (and calls `XInitThreads`) for *standalone
+JUCEApplications* — `XWindowSystem`'s ctor gates both on `isStandaloneApp()`. This sandbox
+child is not a `JUCEApplication` (bare `main()` + `ScopedJuceInitialiser_GUI`), so Xlib's
+DEFAULT handler stays active and `exit()`s the child on any protocol error — e.g. a benign
+`BadAtom` from JUCE querying `_NET_WM_STATE` on a window-manager-less server. The child
+therefore installs its own non-fatal handler at startup (`installLinuxX11Safety` in
+`src/vst-host/main.cpp`), mirroring the SIGPIPE suppression and the `createEditor` exception
+containment elsewhere. `slopsmith-vst-host` now link-time depends on `libX11` for those direct
+`XInitThreads`/`XSetErrorHandler` calls (JUCE otherwise `dlopen`s it). Verified on the e2e
+across bare Xvfb (CI), and manually on KWin/Xwayland; a non-EWMH WM (twm) fails the editor open
+*cleanly* (10s reply timeout, no crash) rather than hanging the audio path. True cross-process
+embedding (CARemoteLayer / Mach-port on macOS, XEmbed on Linux) remains future work.
+
+Orphan cleanup (Linux): a crashed host already triggers child teardown via the control-socket
+disconnect callback, but that runs on the message thread (`callAsync`) — which a wedged plugin
+(the sandbox's raison d'être) can block. As a kernel-level backstop the child sets
+`prctl(PR_SET_PDEATHSIG, SIGTERM)` at startup (`installLinuxParentDeathSignal`), so the OS
+reaps it on host death regardless of wedged threads. Covered by the `sandbox_e2e_leak` test
+(`tests/sandbox/e2e/leak_test.sh`): the driver crashes without a clean shutdown and asserts the
+child is gone. macOS equivalent (kqueue `EVFILT_PROC`) is future work.
+
+Packaging (Linux): electron-builder's `linux.files` + `linux.asarUnpack` ship `slopsmith-vst-host`
+into the **same** `app.asar.unpacked/build/Release/` directory as `slopsmith_audio.node`, so
+`resolveSandboxExe()` (dladdr on the addon → parent dir → `slopsmith-vst-host`) resolves in both
+AppImage and `.deb`. The exec bit survives the unpack, and the editor's X libraries (libX11 plus
+the libXext/libXrandr/libXcursor/… JUCE `dlopen`s) are a subset of Electron/Chromium's own runtime
+deps, so no extra `deb.depends` is required. Verified with an `electron-builder --linux dir` pack:
+the e2e drives the *packaged* host binary end-to-end (spawn → audio → state → editor → shutdown).
