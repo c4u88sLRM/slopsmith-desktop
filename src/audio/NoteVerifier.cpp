@@ -66,6 +66,9 @@ void NoteVerifier::setChart(const ChartUpdate& update)
     // The song-time-tagged onset log is stale for the new chart; run() drops
     // it on its next tick (the log itself is worker-thread only).
     onsetResetPending.store(true);
+    // Onset profile follows the arrangement; run() applies it to the
+    // worker-owned detector before its next onset pass.
+    wantBassProfile.store(update.arrangement == "bass");
 }
 
 void NoteVerifier::clearChart()
@@ -162,6 +165,17 @@ void NoteVerifier::run()
     if (onsetResetPending.exchange(false))
         onsetLog.clear();
 
+    // Apply the arrangement's onset profile before this tick's onset pass.
+    // setProfile() is a no-op when unchanged; on a real switch it reconfigures
+    // the flux band/threshold and resets the detector's history. Both this and
+    // the onsetDetector are worker-thread-only, so the call is race-free.
+    const bool wantBass = wantBassProfile.load();
+    if (wantBass != appliedBassProfile)
+    {
+        onsetDetector.setProfile(wantBass);
+        appliedBassProfile = wantBass;
+    }
+
     // The playhead for this whole pass — interpolated from the last push so
     // every note here is judged against the same chart position.
     const double playhead = currentPlayhead();
@@ -215,6 +229,7 @@ void NoteVerifier::run()
         ctx.capo            = chart.capo;
         ctx.pitchCheckCents = chart.pitchCheckCents;
         ctx.harmonicSnr     = chart.harmonicSnr;
+        ctx.fundamentalRatio = chart.fundamentalRatio;
         ctx.timingTolerance = chart.timingTolerance;
 
         // A drill A-B loop wrap (or a manual seek-back) jumps the playhead
@@ -287,6 +302,7 @@ void NoteVerifier::run()
         req.pitchCheckCents = ctx.pitchCheckCents;
         req.harmonicVerify = true;          // Rocksmith-style targeted check
         req.harmonicSnr = ctx.harmonicSnr;
+        req.fundamentalRatio = ctx.fundamentalRatio;
         req.notes.reserve(batch.size());
         for (const auto& c : batch)
             req.notes.push_back(c.note);
