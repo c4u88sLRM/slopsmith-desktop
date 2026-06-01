@@ -70,56 +70,6 @@ export interface StartupStatus {
     error?: string | null;
 }
 
-/** Shape of the raw JSON returned by the backend `/api/startup-status` endpoint. */
-interface RawStartupStatus {
-    running: boolean;
-    phase: string;
-    message: string;
-    current_plugin: string;
-    loaded: number;
-    total: number;
-    error?: string | null;
-}
-
-function isRawStartupStatus(value: unknown): value is RawStartupStatus {
-    if (typeof value !== 'object' || value === null) return false;
-    const v = value as Record<string, unknown>;
-    return (
-        typeof v['running'] === 'boolean' &&
-        typeof v['phase'] === 'string' &&
-        typeof v['message'] === 'string' &&
-        typeof v['current_plugin'] === 'string' &&
-        typeof v['loaded'] === 'number' && Number.isFinite(v['loaded']) &&
-        typeof v['total'] === 'number' && Number.isFinite(v['total']) &&
-        (v['error'] === undefined || v['error'] === null || typeof v['error'] === 'string')
-    );
-}
-
-function getJson(pathname: string, timeoutMs = 2000): Promise<unknown> {
-    return new Promise((resolve) => {
-        let settled = false;
-        const done = (value: unknown) => { if (!settled) { settled = true; resolve(value); } };
-
-        const req = http.get(`http://127.0.0.1:${serverPort}${pathname}`, (res) => {
-            let raw = '';
-            res.on('data', (chunk) => { raw += chunk.toString(); });
-            res.on('end', () => {
-                try {
-                    done(JSON.parse(raw));
-                } catch {
-                    done(null);
-                }
-            });
-            // Guard against mid-transfer stream errors (e.g. connection reset).
-            // Without this, Node emits an unhandled 'error' event that crashes
-            // the main process, or the promise never resolves.
-            res.on('error', () => done(null));
-        });
-        req.on('error', () => done(null));
-        req.setTimeout(timeoutMs, () => { req.destroy(); done(null); });
-    });
-}
-
 // Find an available port starting from 8000
 async function findPort(startPort: number): Promise<number> {
     // Probe on the SAME interface the backend will bind (getBindHost): with
@@ -809,20 +759,6 @@ export async function waitForPython(): Promise<number> {
     }
 
     throw new Error(`Python server failed to start on port ${serverPort} within ${(maxAttempts * intervalMs) / 1000}s`);
-}
-
-export async function getStartupStatus(): Promise<StartupStatus | null> {
-    const data = await getJson('/api/startup-status');
-    if (!isRawStartupStatus(data)) return null;
-    return {
-        running: data.running,
-        phase: data.phase,
-        message: data.message,
-        currentPlugin: data.current_plugin,
-        loaded: data.loaded,
-        total: data.total,
-        error: data.error,
-    };
 }
 
 // Kill the Python child *and any subprocesses it spawned* (uvicorn worker /

@@ -70,7 +70,7 @@ crashReporter.start({
     uploadToServer: false,
     compress: false,
 });
-import { startPython, stopPython, waitForPython, getPythonPort, getStartupStatus, StartupStatus, restartPython, getLanUrls } from './python';
+import { startPython, stopPython, waitForPython, getPythonPort, StartupStatus, restartPython, getLanUrls } from './python';
 import {
     IPC_STARTUP_STATUS,
     IPC_STARTUP_GET_STATUS,
@@ -128,16 +128,24 @@ process.on('unhandledRejection', (reason, promise) => {
 
 let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
-// Set to true when the user initiates a quit so the startup-status polling
-// loop can break out early instead of waiting for the 5-minute deadline.
+// Set to true when the user initiates a quit so any in-flight startup work
+// can bail out instead of racing the window teardown.
 let appQuitting = false;
-// Milliseconds to keep the splash visible after reaching a terminal state so
-// the renderer has time to paint the final status message before the window closes.
+// Set to true the moment WE programmatically dismiss the splash (renderer
+// painted, or the safety timeout fired). The splash 'close' handler treats a
+// non-terminal close as a user-initiated quit; this flag lets it distinguish
+// our intentional dismissal from the user hitting Alt+F4 on the splash.
+let splashDismissing = false;
+// Backstop timer: if the main window never finishes loading the renderer
+// (did-finish-load on the server origin), close the splash and surface an
+// error rather than leaving it spinning forever. The backend is already ready
+// when we arm this (we're past core-ready), so the renderer only needs to
+// fetch http://127.0.0.1:<port>/ and paint — a minute is very generous.
+let splashSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+const SPLASH_RENDERER_DEADLINE_MS = 60_000;
+// Milliseconds to keep the splash visible after a terminal error so the
+// renderer has time to paint the final message before the window closes.
 const SPLASH_CLOSE_DELAY_MS = 300;
-/** Total time budget for the plugin-startup polling loop. */
-const STARTUP_DEADLINE_MS = 300_000; // 5 minutes (300 000 ms)
-/** How often to poll /api/startup-status during the startup loop. */
-const STARTUP_POLL_INTERVAL_MS = 700;
 let startupStatusSnapshot: StartupStatus = {
     running: true,
     phase: 'booting',
@@ -165,6 +173,42 @@ function publishStartupStatus(status: Partial<StartupStatus>): void {
     }
 }
 
+// Programmatically dismiss the splash. Idempotent. Sets splashDismissing so
+// the 'close' handler below doesn't mistake this for a user-initiated quit,
+// and clears the safety timer so it can't fire after we're done.
+function dismissSplash(): void {
+    splashDismissing = true;
+    if (splashSafetyTimer) {
+        clearTimeout(splashSafetyTimer);
+        splashSafetyTimer = null;
+    }
+    if (splashWindow && !splashWindow.isDestroyed()) {
+        splashWindow.close();
+    }
+}
+
+// Terminal failure path: the renderer never painted, so the app is unusable.
+// Two callers race here — the did-fail-load give-up branch (load retries
+// exhausted) fires within ~30 s, while the splashSafetyTimer covers the case
+// where the load silently hangs (server accepts the socket but never responds,
+// so neither did-finish-load nor did-fail-load ever fires). Whichever fires
+// first wins: dismissSplash() sets splashDismissing, so the same guard that
+// makes dismissSplash idempotent short-circuits the second caller here too —
+// no double error dialog. Surface the failure, tear the splash down, and quit.
+function failRendererStartup(reason: string): void {
+    if (appQuitting || splashDismissing) return;
+    publishStartupStatus({ message: reason, phase: 'error', running: false });
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        dialog.showErrorBox(
+            'Slopsmith failed to start',
+            'The app window did not finish loading. Please restart Slopsmith. '
+            + 'If the problem persists, check the backend logs.',
+        );
+    }
+    dismissSplash();
+    app.quit();
+}
+
 function createSplashWindow(): void {
     splashWindow = new BrowserWindow({
         width: 560,
@@ -190,13 +234,18 @@ function createSplashWindow(): void {
 
     splashWindow.loadFile(path.join(__dirname, 'splash.html'));
 
-    // Treat a user-initiated close (Alt+F4 / Cmd+W) as an explicit quit so
-    // they are never stuck waiting for the full 5-minute startup deadline.
+    // Treat a user-initiated close (Alt+F4 / Cmd+W) before the renderer paints
+    // as an explicit quit, so they are never stuck staring at the splash.
     // preventDefault() keeps the splash visible while app.quit() propagates
-    // through before-quit → will-quit and clears the polling loop.
+    // through before-quit → will-quit and tears the rest of startup down.
     splashWindow.on('close', (event) => {
         const currentPhase = startupStatusSnapshot.phase;
-        if (!appQuitting && currentPhase !== 'complete' && currentPhase !== 'error') {
+        // A user-initiated close (Alt+F4 / Cmd+W) before startup finishes is a
+        // quit. But once the renderer has painted we dismiss the splash via
+        // dismissSplash() while the backend is only at core-ready (plugins
+        // still installing in the background, streamed to the renderer) — that
+        // intentional dismissal sets splashDismissing and must NOT quit.
+        if (!appQuitting && !splashDismissing && currentPhase !== 'complete' && currentPhase !== 'error') {
             event.preventDefault();
             app.quit();
         }
@@ -266,6 +315,10 @@ function createWindow(port: number): void {
         if (!retryableErrors.has(errorCode)) return;
         if (retryCount >= maxRetries) {
             console.log(`[main] gave up loading ${serverUrl} after ${maxRetries} retries (last errorCode=${errorCode})`);
+            // Retries are exhausted — the renderer will never paint. Surface the
+            // failure now rather than letting the splash spin until the safety
+            // timer's full deadline (the give-up budget is well under it).
+            failRendererStartup(`The app window failed to load (network error ${errorCode}). Please restart Slopsmith.`);
             return;
         }
         retryCount += 1;
@@ -275,17 +328,40 @@ function createWindow(port: number): void {
         }, retryIntervalMs);
     });
 
+    // "Is this exactly the renderer origin we loaded?" — reused by the
+    // did-finish-load paint check and the off-origin navigation guards below.
+    // Matches scheme+host+port exactly, so a stray load of some *other*
+    // loopback port can't be mistaken for our renderer.
+    const isRendererOrigin = makeRendererOriginPredicate(port);
+
     // Inject mutable sync offset after page loads (default 200ms, overridden by settings).
-    // Gate on the actual server URL — Chromium fires did-finish-load on its
+    // Gate on the actual renderer origin — Chromium fires did-finish-load on its
     // built-in error pages too, and those have a null origin, so reading
     // localStorage from them throws SecurityError. Only inject when we
-    // actually loaded the http://127.0.0.1 origin.
+    // actually loaded the renderer origin.
     mainWindow.webContents.on('did-finish-load', () => {
         const url = mainWindow?.webContents.getURL() || '';
-        if (!url.startsWith('http://127.0.0.1:')) return;
+        // Chromium fires did-finish-load on its built-in error pages too (null
+        // origin); only treat a load of the real renderer origin as "renderer
+        // painted". This also gates the splash dismissal below — an error page
+        // must NOT be taken as a successful paint.
+        //
+        // Note we deliberately do NOT distinguish a server-served 4xx/5xx body
+        // here: those share the real renderer origin, carry no status on this
+        // event, and aren't a realistic state anyway — waitForPython() already
+        // confirmed backend health (an /api/plugins probe) before this window
+        // was created, so a 5xx at / would be a fluke. Only the null-origin
+        // Chromium error pages (and any stray load of another loopback port)
+        // are filtered by the exact-origin check below.
+        if (!isRendererOrigin(url)) return;
         mainWindow?.webContents.executeJavaScript(`
             window._slopsmithSyncOffset = parseFloat(localStorage.getItem('slopsmith-sync-offset') || '0.2');
         `).catch(() => {});
+        // The renderer has painted, so the app is usable — dismiss the splash
+        // even though plugins may still be installing in the background. Their
+        // status streams to the renderer (SSE) and renders as disabled
+        // "installing…" nav entries; the splash no longer waits on them (#421).
+        dismissSplash();
     });
 
     // Block in-window navigation away from the renderer origin. The window
@@ -300,9 +376,9 @@ function createWindow(port: number): void {
     // Allow only navigations whose target matches the resolved renderer
     // origin. Anything else gets cancelled here and (via the
     // setWindowOpenHandler below) re-routed to the user's default browser
-    // via shell.openExternal. Re-derive the predicate locally — the
-    // permission handler captured it in a closure that isn't exposed.
-    const isRendererOrigin = makeRendererOriginPredicate(port);
+    // via shell.openExternal. (isRendererOrigin is derived once near the top
+    // of createWindow above and reused here — the permission handler keeps its
+    // own copy in a closure that isn't exposed.)
     // Block off-origin navigations at every layer Electron exposes:
     //
     // - `will-navigate`: user/script-initiated navigations on the main
@@ -719,27 +795,22 @@ async function startup(): Promise<void> {
     // in. Renderer will call setChannel() once it reads localStorage.
     updateManager.init('stable');
 
-    const startupDeadline = Date.now() + STARTUP_DEADLINE_MS;
-    let reachedTerminalState = false;
-    while (Date.now() < startupDeadline && !appQuitting) {
-        const status = await getStartupStatus();
-        if (appQuitting) break;
-        if (status) {
-            publishStartupStatus(status);
-            if (!status.running && (status.phase === 'complete' || status.phase === 'error')) {
-                reachedTerminalState = true;
-                break;
-            }
-        }
-        await new Promise((resolve) => setTimeout(resolve, STARTUP_POLL_INTERVAL_MS));
-    }
-    if (!reachedTerminalState && !appQuitting) {
-        publishStartupStatus({ message: 'Startup timed out', phase: 'error', running: false });
-    }
-    // Give the renderer a tick to paint the final status before closing
-    await new Promise((resolve) => setTimeout(resolve, SPLASH_CLOSE_DELAY_MS));
-    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.close();
-
+    // The splash now dismisses on the main window's did-finish-load (renderer
+    // painted) — see createWindow(). We no longer poll /api/startup-status to
+    // gate the splash on full plugin load: plugin status streams straight to
+    // the renderer over SSE and renders incrementally (#421). Arm a backstop
+    // so a renderer that never paints still tears the splash down and surfaces
+    // an error instead of spinning forever. (Exhausted load retries surface
+    // sooner, from the did-fail-load give-up branch in createWindow().)
+    splashSafetyTimer = setTimeout(() => {
+        splashSafetyTimer = null;
+        // Backstop for a silently hung load (no did-finish-load AND no
+        // did-fail-load — e.g. the socket is accepted but the response never
+        // arrives). The retry-exhaustion case surfaces earlier via the
+        // did-fail-load give-up branch; failRendererStartup() is idempotent so
+        // whichever path fires first wins.
+        failRendererStartup('The app window failed to load. Please restart Slopsmith.');
+    }, SPLASH_RENDERER_DEADLINE_MS);
 }
 
 app.whenReady().then(startup);
