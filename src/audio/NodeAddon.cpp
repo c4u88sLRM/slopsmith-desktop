@@ -948,7 +948,13 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
     if (reqObj.Has("harmonicSnr") && reqObj.Get("harmonicSnr").IsNumber())
         req.harmonicSnr = reqObj.Get("harmonicSnr").As<Napi::Number>().FloatValue();
     if (reqObj.Has("fundamentalRatio") && reqObj.Get("fundamentalRatio").IsNumber())
-        req.fundamentalRatio = reqObj.Get("fundamentalRatio").As<Napi::Number>().FloatValue();
+    {
+        // Drop NaN/Inf: a non-finite ratio poisons the fundamental-presence
+        // gate (fundMag >= NaN is always false -> every note false-rejected).
+        // Keep the safe 0.20 default instead.
+        const float v = reqObj.Get("fundamentalRatio").As<Napi::Number>().FloatValue();
+        if (std::isfinite(v)) req.fundamentalRatio = v;
+    }
 
     if (reqObj.Has("offsets") && reqObj.Get("offsets").IsArray())
     {
@@ -1106,7 +1112,12 @@ static Napi::Value SetChart(const Napi::CallbackInfo& info)
     if (reqObj.Has("harmonicSnr") && reqObj.Get("harmonicSnr").IsNumber())
         chart.harmonicSnr = reqObj.Get("harmonicSnr").As<Napi::Number>().FloatValue();
     if (reqObj.Has("fundamentalRatio") && reqObj.Get("fundamentalRatio").IsNumber())
-        chart.fundamentalRatio = reqObj.Get("fundamentalRatio").As<Napi::Number>().FloatValue();
+    {
+        // Drop NaN/Inf (see ScoreChord): a non-finite ratio poisons the
+        // fundamental-presence gate; keep the safe 0.20 default.
+        const float v = reqObj.Get("fundamentalRatio").As<Napi::Number>().FloatValue();
+        if (std::isfinite(v)) chart.fundamentalRatio = v;
+    }
     if (reqObj.Has("timingTolerance") && reqObj.Get("timingTolerance").IsNumber())
         chart.timingTolerance = reqObj.Get("timingTolerance").As<Napi::Number>().DoubleValue();
 
