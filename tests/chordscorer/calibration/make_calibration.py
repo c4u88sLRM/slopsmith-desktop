@@ -11,7 +11,7 @@ offset search removes.
 Outputs (in this directory):
   chart.txt   "<t_seconds> <midi> <sustain_seconds>" per line  (cs_bench input)
   click.wav   90 BPM click, 4-beat count-in, accented downbeats (play along)
-  notes.csv   t, beat, section, string, fret, midi, sus, note  (for the score)
+  notes.csv   t_s, beat, section, string, fret, midi, sus_s, note  (for the score)
 """
 import csv
 import math

@@ -1,6 +1,5 @@
 # CMake build output
 build/
-# Regenerable from make_calibration.py; large binary — keep out of git.
-calibration/click.wav
-# Local recordings / synthetic renders used for benching.
+# Generated click track (regenerable from make_calibration.py) plus local bass
+# recordings / synthetic renders used for benching — all large binaries.
 *.wav
