@@ -38,14 +38,14 @@ Notation: bass tab, one digit = fret on that string. `·` = that string silent.
 
 ### Section A — open strings (bars 2–3, quarter notes)
 Pluck each open string twice; **let every note ring**.
-```
+```text
 Bar 2:  E(open)  E(open)  A(open)  A(open)
 Bar 3:  D(open)  D(open)  G(open)  G(open)
 ```
 
 ### Section B — chromatic walk, frets 0–3 (bars 4–7, quarter notes)
 One note per click, up each string:
-```
+```text
 E string:  0  1  2  3
 A string:  0  1  2  3
 D string:  0  1  2  3
@@ -54,36 +54,36 @@ G string:  0  1  2  3
 
 ### Section C — sustains (bars 8–11, whole notes — let ring the full bar)
 One open string per bar, held for all 4 beats:
-```
+```text
 E (open) ——ring—— | A (open) ——ring—— | D (open) ——ring—— | G (open) ——ring——
 ```
 
 ### Section D — fast eighth notes (bars 12–14, two notes per click)
 Bar 12 — open **E** eighths ×8 (steady, even):
-```
+```text
 E| 0 0 0 0 0 0 0 0
 ```
 Bar 13 — **A-string walk** eighths (A B C# D E D C# B):
-```
+```text
 A| 0 2 4 · · · 4 2
 D| · · · 0 2 0 · ·
 ```
 Bar 14 — **octave jumps** E1↔E2 eighths (alternate, ×8):
-```
+```text
 D| · 2 · 2 · 2 · 2
 E| 0 · 0 · 0 · 0 ·
 ```
 
 ### Section E — low B (5-STRING ONLY — 4-string players skip)
 Open low **B** ring, then a B-string chromatic 0–3 (B C C# D):
-```
+```text
 B (open) ——ring—— ,  B(0) ,  B: 0  1  2  3
 ```
 
 ---
 
 ## What I do with it
-```
+```bash
 cd tests/chordscorer
 cmake --build build --target cs_bench
 ./build/cs_bench <bass_finger.wav> calibration/chart.txt bass 4   # or "bass 5"

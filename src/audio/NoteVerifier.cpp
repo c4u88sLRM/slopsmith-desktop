@@ -63,12 +63,14 @@ void NoteVerifier::setChart(const ChartUpdate& update)
     havePushedPlayhead.store(false);
     pushedPlaying = false;  // plain bool, guarded by `lock` (held here)
     lastPlayhead = 0.0;
+    // Onset profile follows the arrangement; publish it BEFORE the reset flag
+    // so the worker tick that observes onsetResetPending (and resets the
+    // detector) is guaranteed to also see the new desired profile for that same
+    // tick, rather than re-applying the previous arrangement's profile.
+    wantBassProfile.store(update.arrangement == "bass");
     // The song-time-tagged onset log is stale for the new chart; run() drops
     // it on its next tick (the log itself is worker-thread only).
     onsetResetPending.store(true);
-    // Onset profile follows the arrangement; run() applies it to the
-    // worker-owned detector before its next onset pass.
-    wantBassProfile.store(update.arrangement == "bass");
 }
 
 void NoteVerifier::clearChart()

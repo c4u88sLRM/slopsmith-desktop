@@ -17,6 +17,11 @@ import csv
 import math
 import struct
 import wave
+from pathlib import Path
+
+# Anchor outputs next to this script (as the module docstring promises),
+# independent of the caller's working directory.
+OUT_DIR = Path(__file__).resolve().parent
 
 BPM = 90
 SR = 48000
@@ -84,7 +89,8 @@ for i, m in enumerate([23, 24, 25, 26]):
 events.sort(key=lambda e: e[0])
 
 # ── Write the machine chart + notes table ───────────────────────────────────
-with open("chart.txt", "w") as cf, open("notes.csv", "w", newline="") as nf:
+with open(OUT_DIR / "chart.txt", "w") as cf, \
+     open(OUT_DIR / "notes.csv", "w", newline="") as nf:
     w = csv.writer(nf)
     w.writerow(["t_s", "beat", "section", "string", "fret", "midi", "sus_s", "note"])
     for beat, midi, sus_beats, section, tech in events:
@@ -134,7 +140,7 @@ while t < total_beats * BEAT:
 
 pcm = b"".join(struct.pack("<h", max(-32767, min(32767, int(v * 32767))))
                for v in buf)
-with wave.open("click.wav", "wb") as wv:
+with wave.open(str(OUT_DIR / "click.wav"), "wb") as wv:
     wv.setnchannels(1)
     wv.setsampwidth(2)
     wv.setframerate(SR)
