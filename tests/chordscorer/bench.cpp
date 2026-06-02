@@ -129,7 +129,7 @@ int main(int argc, char** argv)
     // fundamental-presence gate (DI fundamental is weak) and widens the cents
     // window (low bins resolve pitch coarsely); guitar keeps the shipped values.
     const bool bass = (arrangement == "bass");
-    float harmonicSnr      = (argc > 6) ? (float) std::atof(argv[6]) : 3.0f;
+    float harmonicSnr      = (argc > 6) ? (float) std::atof(argv[6]) : (bass ? 2.0f : 3.0f);
     float fundamentalRatio = (argc > 7) ? (float) std::atof(argv[7]) : (bass ? 0.08f : 0.20f);
     float pitchCheckCents  = (argc > 8) ? (float) std::atof(argv[8]) : (bass ? 60.0f : 50.0f);
 
@@ -261,14 +261,16 @@ int main(int argc, char** argv)
 
     // --- Report at the best offset ------------------------------------------
     const double tol = 0.10;  // ±100 ms timing-match window (mlnd_bench parity)
+    const bool verbose = std::getenv("CS_BENCH_VERBOSE") != nullptr;
     int hits = 0;
     std::vector<double> te;   // timing errors of hits that claimed an onset
+    std::vector<const ChartNote*> missed;
     for (const auto& cn : chart)
     {
         const double audioT = cn.t + bestDelta;
         // Full sounding span for the recall report — a sustained bass note that
         // rings into its window is a legitimate hit.
-        if (!presentAt(cn, audioT, std::max(cn.sus, 0.0) + 0.10)) continue;
+        if (!presentAt(cn, audioT, std::max(cn.sus, 0.0) + 0.10)) { missed.push_back(&cn); continue; }
         ++hits;
         double best = 1e9;
         for (double ot : onsetTimes)
@@ -293,5 +295,20 @@ int main(int argc, char** argv)
     }
     std::cout << "onsets/note:      " << (double(onsetTimes.size()) / (double) chart.size())
               << "  (>1 = extra attacks: noise, double-triggers)\n";
+
+    if (verbose && !missed.empty())
+    {
+        static const char* names[12] =
+            {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+        std::cout << "\n=== missed notes (" << missed.size() << ") ===\n";
+        for (const ChartNote* cn : missed)
+        {
+            const int oct = cn->midi / 12 - 1;
+            std::cout << "  t=" << (cn->t + bestDelta) << "s  midi=" << cn->midi
+                      << " (" << names[cn->midi % 12] << oct << ")"
+                      << "  str=" << cn->string << " fret=" << cn->fret
+                      << "  sus=" << cn->sus << "s\n";
+        }
+    }
     return 0;
 }
