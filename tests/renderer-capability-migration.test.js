@@ -36,6 +36,7 @@ test('renderer uses playback lifecycle instead of global transport wrappers', ()
     assert.equal(source.includes("playback:loading"), true);
     assert.equal(source.includes("playback:ready"), true);
     assert.equal(source.includes("playback:stopped"), true);
+    assert.equal(source.includes("playback:ended"), true);
     assert.equal(source.includes('settingsKey'), true);
     assert.equal(source.includes('_slopsmithPlaybackSettingsKey'), true);
 });
