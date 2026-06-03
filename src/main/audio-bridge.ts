@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import { app } from 'electron';
 import { isDebugEnabled, getDebugLogPath } from './debug-log';
 import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel } from './vst-crash-guard';
+import { createAudioEffectsExecutor } from './audio-effects-executor';
 
 type AudioModule = Record<string, (...args: any[]) => any>;
 
@@ -248,6 +249,7 @@ function loadNativeAddon(): AudioModule | null {
 
 export function initAudioBridge(): void {
     audio = loadNativeAddon();
+    const audioEffects = createAudioEffectsExecutor(() => audio);
 
     if (audio) {
         // Redirect native stderr to the debug log before init() runs — that's
@@ -902,6 +904,28 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:setMultiBypass', (_event, changes: Array<{slotId: number, bypassed: boolean}>) => {
         return audio?.setMultiBypass(changes) ?? false;
+    });
+
+    // ── Audio-effects executor ─────────────────────────────────────────────
+
+    ipcMain.handle('audio-effects:loadChainPlan', (_event, request: unknown) => {
+        return audioEffects.loadChainPlan(request);
+    });
+
+    ipcMain.handle('audio-effects:inspectRoute', (_event, routeKey?: string) => {
+        return audioEffects.inspectRoute(routeKey);
+    });
+
+    ipcMain.handle('audio-effects:activateSegment', (_event, request: unknown) => {
+        return audioEffects.activateSegment(request);
+    });
+
+    ipcMain.handle('audio-effects:setStageBypass', (_event, request: unknown) => {
+        return audioEffects.setStageBypass(request);
+    });
+
+    ipcMain.handle('audio-effects:setStageParameter', (_event, request: unknown) => {
+        return audioEffects.setStageParameter(request);
     });
 }
 

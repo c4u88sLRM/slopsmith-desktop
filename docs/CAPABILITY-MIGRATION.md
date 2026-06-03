@@ -61,6 +61,36 @@ inspect `localStorage.slopsmith-tone-mappings`: the same mapping should appear
 under both the old filename key and the new `settings-v1-...` key after the
 `playback:loading` event.
 
+## Audio Effects Executor
+
+Core `audio-effects` owns provider selection, policy, safe diagnostics, and the
+`slopsmith.audio_effects.chain_plan.v1` schema. Desktop owns the trusted physical
+executor. Renderer plugins may pass a core-resolved chain plan plus a private
+trusted asset map to `window.slopsmithDesktop.audioEffects.loadChainPlan(...)`;
+desktop validates the schema, authorization, stage kinds, stage counts, opaque
+asset references, local asset paths, and extension/kind compatibility before it
+builds the native preset JSON and calls the existing native `loadPreset` path.
+
+The preload surface is:
+
+- `loadChainPlan(request)` — validates and loads a chain plan through the native
+  engine. The request must include `authorization: "user-action"`,
+  `"restore-selection"`, or `"playback-session"`.
+- `inspectRoute(routeKey)` — returns a redaction-safe route summary: route key,
+  provider id, plan id, state, stage-kind counts, active segment, and last
+  outcome.
+- `activateSegment(request)` — applies a segment by translating plan stage ids
+  to loaded native slot ids and calling `setMultiBypass`.
+- `setStageBypass(request)` and `setStageParameter(request)` — route stage-level
+  controls to the loaded native slot.
+
+The executor accepts raw paths only inside the trusted asset map passed to
+desktop. It never echoes local paths, filenames, model names, IR names, VST state
+blobs, native preset JSON, handles, callbacks, DOM nodes, audio buffers, samples,
+or waveforms in its public outcomes. Failed rich-provider loads return structured
+`failed`, `degraded`, `unavailable`, or `no-target` outcomes so NAM Tone/core can
+fall back cleanly instead of leaving a partially described chain in public state.
+
 ### Maintainer Checklist
 
 When migrating more desktop integrations to capabilities:
@@ -70,6 +100,9 @@ When migrating more desktop integrations to capabilities:
 - Use `target.settingsKey` for local per-song plugin settings.
 - Use `targetId` only for arrangement/session correlation, not persistent
   per-song settings.
+- Route effect-chain execution through `window.slopsmithDesktop.audioEffects`
+  rather than passing raw native preset JSON through plugin-visible capability
+  state.
 - Keep raw filename fallback code behind a capability-version check.
 - Add static migration guards under `tests/` for any removed global wrapper or
   new capability declaration.

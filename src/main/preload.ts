@@ -351,6 +351,17 @@ const slopsmithDesktopApi = {
             ipcRenderer.invoke('audio:setMultiBypass', changes),
     },
 
+    // Trusted executor for core audio-effects chain plans. Providers pass
+    // opaque plan refs through core; desktop receives the private asset map,
+    // validates the plan, and physically loads/applies native stages.
+    audioEffects: {
+        loadChainPlan: (request: unknown) => ipcRenderer.invoke('audio-effects:loadChainPlan', request),
+        inspectRoute: (routeKey?: string) => ipcRenderer.invoke('audio-effects:inspectRoute', routeKey),
+        activateSegment: (request: unknown) => ipcRenderer.invoke('audio-effects:activateSegment', request),
+        setStageBypass: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageBypass', request),
+        setStageParameter: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageParameter', request),
+    },
+
     // Plugin management
     plugins: {
         install: (gitUrl: string, name?: string) => ipcRenderer.invoke('plugins:install', gitUrl, name),
