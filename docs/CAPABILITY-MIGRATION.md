@@ -40,45 +40,26 @@ core builds are written under `settingsKey`. Existing filename-keyed buckets are
 left in place so older core builds and older desktop releases can still read
 them.
 
-### Manual Migration For Existing Mappings
+### Automatic Migration For Existing Mappings
 
-Until desktop ships an automatic one-time rewrite, existing per-song tone
-mappings can be moved manually from a filename key to the current playback
-settings key:
+When playback capability v1 emits `playback:loading`, desktop receives both the
+safe `target.settingsKey` and the legacy filename fallback. If
+`localStorage.slopsmith-tone-mappings` contains a filename-keyed `songs` or
+`midiPC` bucket for the legacy filename and the corresponding `settingsKey`
+bucket is missing or empty, desktop copies that bucket to the safe key and leaves
+the original bucket untouched.
 
-1. Open the target song in a playback-capable Slopsmith core.
-2. In the webview developer console, read the current safe key:
+This migration is intentionally copy-only:
 
-   ```js
-   window._slopsmithPlaybackSettingsKey
-   ```
+- Existing `settingsKey` buckets win and are not overwritten.
+- Filename-keyed buckets remain available to older desktop builds or embedded
+  Slopsmith cores without playback capability v1.
+- Corrupt or missing mapping stores fall back to the normal empty-store behavior.
 
-3. Inspect the existing mapping store:
-
-   ```js
-   JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}')
-   ```
-
-4. Copy the old filename-keyed entries to the safe key. Replace
-   `/old/raw/song.psarc` with the old key shown in your store:
-
-   ```js
-   const store = JSON.parse(localStorage.getItem('slopsmith-tone-mappings') || '{}');
-   const oldKey = '/old/raw/song.psarc';
-   const newKey = window._slopsmithPlaybackSettingsKey;
-   store.songs = store.songs || {};
-   store.midiPC = store.midiPC || {};
-   if (store.songs[oldKey] && !store.songs[newKey]) store.songs[newKey] = store.songs[oldKey];
-   if (store.midiPC[oldKey] && !store.midiPC[newKey]) store.midiPC[newKey] = store.midiPC[oldKey];
-   localStorage.setItem('slopsmith-tone-mappings', JSON.stringify(store));
-   ```
-
-5. Reload the song and confirm the Tone Switching panel shows the migrated
-   mapping.
-
-Do not delete the old bucket until the migrated mapping has been verified. The
-old bucket is harmless and remains useful if the same desktop profile is opened
-with an older embedded Slopsmith core.
+For review/debugging, open a song with an existing filename-keyed mapping and
+inspect `localStorage.slopsmith-tone-mappings`: the same mapping should appear
+under both the old filename key and the new `settings-v1-...` key after the
+`playback:loading` event.
 
 ### Maintainer Checklist
 

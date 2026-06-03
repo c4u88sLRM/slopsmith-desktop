@@ -2257,6 +2257,44 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         const songMappings = songKey ? (all.songs[songKey] || {}) : {};
         return { ...all.global, ...songMappings };
     }
+    function cloneToneMappingBucket(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function isEmptyToneMappingBucket(value) {
+        return !value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length === 0;
+    }
+
+    function migrateToneMappingsToPlaybackSettingsKey(settingsKey, legacySongKey) {
+        const newKey = normalizeSongKey(settingsKey);
+        const oldKey = normalizeSongKey(legacySongKey);
+        if (!newKey || !oldKey || newKey === oldKey) return false;
+
+        const all = readToneMappingsStore();
+        let migrated = false;
+        const migrateBucket = (section) => {
+            const src = cloneToneMappingBucket(all[section]?.[oldKey]);
+            if (!src || !isEmptyToneMappingBucket(all[section]?.[newKey])) return;
+            all[section][newKey] = src;
+            migrated = true;
+        };
+
+        migrateBucket('songs');
+        migrateBucket('midiPC');
+        if (!migrated) return false;
+
+        try {
+            localStorage.setItem('slopsmith-tone-mappings', JSON.stringify(all));
+            window._toneMappingsDirty = true;
+            console.log('[tone-switcher] Migrated tone mappings to playback settings key:', oldKey, '→', newKey);
+            return true;
+        } catch (e) {
+            console.warn('[tone-switcher] Failed to persist migrated tone mappings:', e);
+            return false;
+        }
+    }
+    window._aeMigrateToneMappingsToPlaybackSettingsKey = migrateToneMappingsToPlaybackSettingsKey;
 
     function saveToneMappings(songKey, mappings) {
         const all = readToneMappingsStore();
@@ -3712,6 +3750,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             window._slopsmithPlaybackSettingsKey = settingsKey;
             window._currentSongFile = legacyFilename;
             window._slopsmithSongKey = settingsKey || normalizeSongKey(legacyFilename);
+            if (settingsKey && legacyFilename && window._aeMigrateToneMappingsToPlaybackSettingsKey) {
+                window._aeMigrateToneMappingsToPlaybackSettingsKey(settingsKey, legacyFilename);
+            }
             hookState.toneAutoLoadGeneration = (hookState.toneAutoLoadGeneration || 0) + 1;
             hookState.toneAutoReadyGeneration = 0;
             // Reset preload tracking when the song file changes (not when only arrangement/track changes)
