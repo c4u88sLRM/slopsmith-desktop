@@ -178,7 +178,7 @@ function normalizeDeviceConfigResult(result: unknown, fallbackError = '') {
     const outputBlockSize = Number(record.outputBlockSize);
     return {
         ok: record.ok === true,
-        error: String(record.error ?? ''),
+        error: String(record.error ?? fallbackError ?? ''),
         duplex: record.duplex !== false,
         sampleRate: Number.isFinite(sampleRate) ? sampleRate : 0,
         inputBlockSize: Number.isFinite(inputBlockSize) ? inputBlockSize : 0,
@@ -365,7 +365,8 @@ export function initAudioBridge(): void {
                 error: probeError,
                 compatible: false,
             });
-            if (isDual && (!normalized.compatible || normalized.output === outputType)) {
+            const looksLikeLegacyOverload = normalized.output === outputType;
+            if (isDual && looksLikeLegacyOverload) {
                 try {
                     const legacyOptions = audio.probeDeviceOptions(inputType, inputName, outputName);
                     return normalizeDeviceOptions(legacyOptions, {
