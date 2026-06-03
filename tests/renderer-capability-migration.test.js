@@ -40,6 +40,19 @@ test('renderer uses playback lifecycle instead of global transport wrappers', ()
     assert.equal(source.includes('_slopsmithPlaybackSettingsKey'), true);
 });
 
+test('renderer migrates legacy filename tone mappings to playback settings key', () => {
+    const source = readText('src/renderer/screen.js');
+    const docs = readText('docs/CAPABILITY-MIGRATION.md');
+
+    assert.equal(source.includes('migrateToneMappingsToPlaybackSettingsKey'), true);
+    assert.equal(source.includes('window._aeMigrateToneMappingsToPlaybackSettingsKey'), true);
+    assert.equal(source.includes("migrateBucket('songs')"), true);
+    assert.equal(source.includes("migrateBucket('midiPC')"), true);
+
+    assert.equal(docs.includes('Automatic Migration For Existing Mappings'), true);
+    assert.equal(docs.includes('Existing `settingsKey` buckets win and are not overwritten.'), true);
+});
+
 test('renderer registers native audio-mix fader participants', () => {
     const source = readText('src/renderer/screen.js');
 
