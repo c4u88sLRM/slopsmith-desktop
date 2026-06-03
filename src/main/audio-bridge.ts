@@ -456,6 +456,21 @@ export function initAudioBridge(): void {
         return audio?.getPitchDetection() ?? { frequency: -1, confidence: 0, midiNote: -1, cents: 0, noteName: '' };
     });
 
+    // Raw YIN pitch, always — bypasses the ML preference so the tuner gets a
+    // continuous (sub-Hz) frequency and real cents even when a Basic Pitch model
+    // is loaded. The YIN detector reads the post-noise-gate signal, so this is
+    // silent when the gate is closed. typeof-guarded so a downlevel addon (no
+    // getRawPitchDetection) fails soft to the empty detection instead of throwing.
+    ipcMain.handle('audio:getRawPitch', () => {
+        if (!audio || typeof audio.getRawPitchDetection !== 'function')
+            return { frequency: -1, confidence: 0, midiNote: -1, cents: 0, noteName: '' };
+        try {
+            return audio.getRawPitchDetection();
+        } catch {
+            return { frequency: -1, confidence: 0, midiNote: -1, cents: 0, noteName: '' };
+        }
+    });
+
     // Whether the polyphonic ML note detector (Basic Pitch) is active. When
     // false the engine is on the YIN PitchDetector / ChordScorer fallback.
     // typeof-guarded so a downlevel addon simply reports false.
