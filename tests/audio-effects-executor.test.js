@@ -75,9 +75,9 @@ test('audio-effects executor validates and loads a trusted chain plan without le
         },
     });
     const inspected = executor.inspectRoute('desktop-main');
-    const segment = executor.activateSegment({ routeKey: 'desktop-main', segmentId: 'lead' });
-    const bypass = executor.setStageBypass({ routeKey: 'desktop-main', stageId: 'pre', bypassed: true });
-    const param = executor.setStageParameter({ routeKey: 'desktop-main', stageId: 'pre', paramIndex: 2, value: 0.75 });
+    const segment = await executor.activateSegment({ routeKey: 'desktop-main', segmentId: 'lead' });
+    const bypass = await executor.setStageBypass({ routeKey: 'desktop-main', stageId: 'pre', bypassed: true });
+    const param = await executor.setStageParameter({ routeKey: 'desktop-main', stageId: 'pre', paramIndex: 2, value: 0.75 });
     const encoded = JSON.stringify({ loaded, inspected, segment, bypass, param });
 
     assert.equal(loaded.outcome, 'handled');
@@ -149,6 +149,69 @@ test('audio-effects executor rolls back and avoids route state on partial native
     assert.equal(calls[1], 'previous-preset');
     assert.equal(encoded.includes(namPath), false);
     assert.equal(encoded.includes(irPath), false);
+});
+
+test('audio-effects executor reports native control failures without throwing IPC errors', async () => {
+    const { createAudioEffectsExecutor } = loadExecutorModule();
+    const namPath = tempAsset('.nam');
+    const irPath = tempAsset('.wav');
+    const executor = createAudioEffectsExecutor(() => ({
+        loadPreset: () => ({ success: true, slotsLoaded: 2 }),
+        getChainState: () => [{ id: 10 }, { id: 11 }],
+        setBypass: async () => { throw new Error('plugin crash /Users/example/private.nam'); },
+        setParameter: async () => ({ success: false }),
+        setMultiBypass: async () => false,
+    }));
+
+    const loaded = await executor.loadChainPlan({
+        authorization: 'playback-session',
+        plan: plan(),
+        assets: {
+            'asset:pre': { kind: 'nam', path: namPath, safeName: 'pre' },
+            'asset:cab': { kind: 'ir', path: irPath, safeName: 'cab' },
+        },
+    });
+    const bypass = await executor.setStageBypass({ routeKey: 'desktop-main', stageId: 'pre', bypassed: true });
+    const param = await executor.setStageParameter({ routeKey: 'desktop-main', stageId: 'pre', paramIndex: 2, value: 0.75 });
+    const segment = await executor.activateSegment({ routeKey: 'desktop-main', segmentId: 'lead' });
+    const encoded = JSON.stringify({ bypass, param, segment });
+
+    assert.equal(loaded.outcome, 'handled');
+    assert.equal(bypass.outcome, 'failed');
+    assert.equal(bypass.reason, 'Native stage bypass threw');
+    assert.equal(param.outcome, 'failed');
+    assert.equal(param.reason, 'Native stage parameter returned failure');
+    assert.equal(segment.outcome, 'failed');
+    assert.equal(segment.reason, 'Native multi-bypass returned failure');
+    assert.equal(encoded.includes('/Users/example'), false);
+    assert.equal(encoded.includes('private.nam'), false);
+});
+
+test('audio-effects executor rejects coerced parameter indices', async () => {
+    const { createAudioEffectsExecutor } = loadExecutorModule();
+    const namPath = tempAsset('.nam');
+    const irPath = tempAsset('.wav');
+    const calls = [];
+    const executor = createAudioEffectsExecutor(() => ({
+        loadPreset: () => ({ success: true, slotsLoaded: 2 }),
+        getChainState: () => [{ id: 10 }, { id: 11 }],
+        setParameter: (...args) => { calls.push(args); return true; },
+    }));
+
+    await executor.loadChainPlan({
+        authorization: 'playback-session',
+        plan: plan(),
+        assets: {
+            'asset:pre': { kind: 'nam', path: namPath, safeName: 'pre' },
+            'asset:cab': { kind: 'ir', path: irPath, safeName: 'cab' },
+        },
+    });
+
+    assert.equal((await executor.setStageParameter({ routeKey: 'desktop-main', stageId: 'pre', paramIndex: false, value: 0.75 })).outcome, 'failed');
+    assert.equal((await executor.setStageParameter({ routeKey: 'desktop-main', stageId: 'pre', paramIndex: '', value: 0.75 })).outcome, 'failed');
+    assert.equal((await executor.setStageParameter({ routeKey: 'desktop-main', stageId: 'pre', paramIndex: 4096, value: 0.75 })).outcome, 'failed');
+    assert.equal((await executor.setStageParameter({ routeKey: 'desktop-main', stageId: 'pre', paramIndex: '2', value: '0.75' })).outcome, 'handled');
+    assert.deepEqual(calls, [[10, 2, 0.75]]);
 });
 
 test('preload exposes the trusted audio-effects executor surface', () => {

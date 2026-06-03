@@ -5,6 +5,7 @@ const PLAN_SCHEMA = 'slopsmith.audio_effects.chain_plan.v1';
 const DEFAULT_ROUTE_KEY = 'desktop-main';
 const MAX_STAGES = 24;
 const MAX_SEGMENTS = 80;
+const MAX_PARAM_INDEX = 4095;
 const MAX_SEQUENTIAL_NAM = 8;
 const VALID_KINDS = new Set(['nam', 'ir', 'vst', 'utility', 'bypass']);
 const VALID_ROLES = new Set(['input', 'pre-pedal', 'pedal', 'amp', 'post-pedal', 'rack', 'cab', 'master-pre', 'master-post', 'utility', 'unknown']);
@@ -107,6 +108,25 @@ function safeId(value: unknown, fallback: string): string {
 function safeNumber(value: unknown, fallback = 0): number {
     const numberValue = Number(value);
     return Number.isFinite(numberValue) ? numberValue : fallback;
+}
+
+function parseStrictNumber(value: unknown): number {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : Number.NaN;
+    if (typeof value !== 'string') return Number.NaN;
+    const trimmed = value.trim();
+    if (!trimmed || !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(trimmed)) return Number.NaN;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function parseParamIndex(input: Dict): number {
+    const paramIndex = parseStrictNumber(input.paramIndex);
+    if (Number.isFinite(paramIndex)) return paramIndex;
+    return parseStrictNumber(input.parameterId);
+}
+
+function nativeFailure(result: unknown): boolean {
+    return result === false || asRecord(result)?.success === false;
 }
 
 function safeBool(value: unknown, fallback = false): boolean {
@@ -323,8 +343,8 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         try {
             result = normalizeLoadResult(await nativeAudio.loadPreset(validation.presetJson));
         } catch (error) {
-            await restorePreset(nativeAudio, rollbackPreset);
-            return safeOutcome('failed', 'Native audio-effects plan load threw', { error: bounded(error instanceof Error ? error.message : String(error)) });
+            const rollbackApplied = await restorePreset(nativeAudio, rollbackPreset);
+            return safeOutcome('failed', 'Native audio-effects plan load threw', { error: bounded(error instanceof Error ? error.message : String(error)), rollbackApplied });
         }
 
         const nativeStages = validation.plan.stages.filter((stage) => stage.native);
@@ -393,7 +413,7 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         return safeOutcome('handled', 'Audio-effects route inspected', { route: safeRoute(route) });
     }
 
-    function setStageBypass(request: unknown): SafeOutcome {
+    async function setStageBypass(request: unknown): Promise<SafeOutcome> {
         const input = asRecord(request) || {};
         const routeKey = safeId(input.routeKey ?? DEFAULT_ROUTE_KEY, DEFAULT_ROUTE_KEY);
         const stageId = safeId(input.stageId, '');
@@ -403,11 +423,16 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         if (slotId == null) return updateOutcome(route, safeOutcome('no-target', 'Audio-effects stage is not mapped to a native slot', { routeKey, stageId }));
         const nativeAudio = getAudio();
         if (!nativeAudio || typeof nativeAudio.setBypass !== 'function') return updateOutcome(route, safeOutcome('unavailable', 'Native stage bypass is unavailable', { routeKey, stageId }));
-        nativeAudio.setBypass(slotId, safeBool(input.bypassed, false));
+        try {
+            const result = await nativeAudio.setBypass(slotId, safeBool(input.bypassed, false));
+            if (nativeFailure(result)) return updateOutcome(route, safeOutcome('failed', 'Native stage bypass returned failure', { routeKey, stageId }));
+        } catch (error) {
+            return updateOutcome(route, safeOutcome('failed', 'Native stage bypass threw', { routeKey, stageId, error: bounded(error instanceof Error ? error.message : String(error)) }));
+        }
         return updateOutcome(route, safeOutcome('handled', 'Audio-effects stage bypass applied', { route: safeRoute(route), stageId }));
     }
 
-    function setStageParameter(request: unknown): SafeOutcome {
+    async function setStageParameter(request: unknown): Promise<SafeOutcome> {
         const input = asRecord(request) || {};
         const routeKey = safeId(input.routeKey ?? DEFAULT_ROUTE_KEY, DEFAULT_ROUTE_KEY);
         const stageId = safeId(input.stageId, '');
@@ -415,20 +440,23 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         if (!route) return safeOutcome('no-target', 'No audio-effects route has been loaded', { routeKey });
         const slotId = route.stageSlots.get(stageId);
         if (slotId == null) return updateOutcome(route, safeOutcome('no-target', 'Audio-effects stage is not mapped to a native slot', { routeKey, stageId }));
-        const paramIndex = Number.isFinite(Number(input.paramIndex))
-            ? Number(input.paramIndex)
-            : Number(input.parameterId);
-        const value = Number(input.value);
-        if (!Number.isInteger(paramIndex) || paramIndex < 0 || !Number.isFinite(value)) {
+        const paramIndex = parseParamIndex(input);
+        const value = parseStrictNumber(input.value);
+        if (!Number.isInteger(paramIndex) || paramIndex < 0 || paramIndex > MAX_PARAM_INDEX || !Number.isFinite(value)) {
             return updateOutcome(route, safeOutcome('failed', 'Audio-effects stage parameter request is invalid', { routeKey, stageId }));
         }
         const nativeAudio = getAudio();
         if (!nativeAudio || typeof nativeAudio.setParameter !== 'function') return updateOutcome(route, safeOutcome('unavailable', 'Native stage parameter control is unavailable', { routeKey, stageId }));
-        nativeAudio.setParameter(slotId, paramIndex, value);
+        try {
+            const result = await nativeAudio.setParameter(slotId, paramIndex, value);
+            if (nativeFailure(result)) return updateOutcome(route, safeOutcome('failed', 'Native stage parameter returned failure', { routeKey, stageId, paramIndex }));
+        } catch (error) {
+            return updateOutcome(route, safeOutcome('failed', 'Native stage parameter threw', { routeKey, stageId, paramIndex, error: bounded(error instanceof Error ? error.message : String(error)) }));
+        }
         return updateOutcome(route, safeOutcome('handled', 'Audio-effects stage parameter applied', { route: safeRoute(route), stageId, paramIndex }));
     }
 
-    function activateSegment(request: unknown): SafeOutcome {
+    async function activateSegment(request: unknown): Promise<SafeOutcome> {
         const input = asRecord(request) || {};
         const routeKey = safeId(input.routeKey ?? DEFAULT_ROUTE_KEY, DEFAULT_ROUTE_KEY);
         const segmentId = safeId(input.segmentId ?? input.toneKey, '');
@@ -443,7 +471,12 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
             slotId,
             bypassed: !active.has(stageId),
         }));
-        nativeAudio.setMultiBypass(changes);
+        try {
+            const result = await nativeAudio.setMultiBypass(changes);
+            if (nativeFailure(result)) return updateOutcome(route, safeOutcome('failed', 'Native multi-bypass returned failure', { routeKey, segmentId, changedCount: changes.length }));
+        } catch (error) {
+            return updateOutcome(route, safeOutcome('failed', 'Native multi-bypass threw', { routeKey, segmentId, changedCount: changes.length, error: bounded(error instanceof Error ? error.message : String(error)) }));
+        }
         route.activeSegmentId = segment.segmentId;
         return updateOutcome(route, safeOutcome('handled', 'Audio-effects segment activated', { route: safeRoute(route), segmentId, changedCount: changes.length }));
     }
