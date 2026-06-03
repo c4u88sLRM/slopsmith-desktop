@@ -223,6 +223,7 @@ function validatePlan(request: unknown): { ok: true; plan: ValidPlan; presetJson
     const states = normalizeAssetMap(input.states ?? input.trustedStates);
     const stages: ValidStage[] = [];
     const nativePresetChain: Dict[] = [];
+    const seenStageIds = new Set<string>();
     let sequentialNam = 0;
 
     rawStages.slice(0, MAX_STAGES).forEach((entry, index) => {
@@ -231,6 +232,11 @@ function validatePlan(request: unknown): { ok: true; plan: ValidPlan; presetJson
         const roleCandidate = safeId(stageInput.role ?? stageInput.slot, 'unknown');
         const role = VALID_ROLES.has(roleCandidate) ? roleCandidate : 'unknown';
         const stageId = safeId(stageInput.stageId ?? stageInput.id ?? `${kind}-${index}`, `stage-${index}`);
+        if (seenStageIds.has(stageId)) {
+            errors.push(`Duplicate stageId ${stageId}`);
+            return;
+        }
+        seenStageIds.add(stageId);
         const assetRef = String(stageInput.assetRef ?? stageInput.ref ?? '').trim();
         const stateRef = String(stageInput.stateRef ?? '').trim();
         const native = kind === 'nam' || kind === 'ir' || kind === 'vst';

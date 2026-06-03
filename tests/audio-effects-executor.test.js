@@ -117,6 +117,35 @@ test('audio-effects executor rejects unauthorised, missing, and raw-path-like pl
     assert.equal(encoded.includes('model.nam'), false);
 });
 
+test('audio-effects executor rejects duplicate stage ids before native load', async () => {
+    const { createAudioEffectsExecutor } = loadExecutorModule();
+    let loadCount = 0;
+    const namPath = tempAsset('.nam');
+    const irPath = tempAsset('.wav');
+    const executor = createAudioEffectsExecutor(() => ({
+        loadPreset: () => { loadCount += 1; return { success: true, slotsLoaded: 2 }; },
+        getChainState: () => [{ id: 1 }, { id: 2 }],
+    }));
+
+    const result = await executor.loadChainPlan({
+        authorization: 'user-action',
+        plan: plan({
+            stages: [
+                { stageId: 'dup', kind: 'nam', role: 'amp', assetRef: 'asset:pre' },
+                { stageId: 'dup', kind: 'ir', role: 'cab', assetRef: 'asset:cab' },
+            ],
+        }),
+        assets: {
+            'asset:pre': { kind: 'nam', path: namPath, safeName: 'pre' },
+            'asset:cab': { kind: 'ir', path: irPath, safeName: 'cab' },
+        },
+    });
+
+    assert.equal(result.outcome, 'failed');
+    assert.equal(loadCount, 0);
+    assert.equal(JSON.stringify(result).includes('Duplicate stageId dup'), true);
+});
+
 test('audio-effects executor rolls back and avoids route state on partial native loads', async () => {
     const { createAudioEffectsExecutor } = loadExecutorModule();
     const calls = [];
@@ -231,4 +260,7 @@ test('preload exposes the trusted audio-effects executor surface', () => {
     ]) {
         assert.equal(bridge.includes(channel), true);
     }
+    assert.equal(bridge.includes("ipcMain.handle('audio-effects:loadChainPlan', async"), true);
+    assert.equal(bridge.includes('vstSlotPaths.clear();\n        return await audioEffects.loadChainPlan(request);'), true);
+    assert.equal(bridge.includes('if (normalizedPayload.inputType !== normalizedPayload.outputType)'), true);
 });

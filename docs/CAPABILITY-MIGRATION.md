@@ -88,7 +88,7 @@ The executor accepts raw paths only inside the trusted asset map passed to
 desktop. It never echoes local paths, filenames, model names, IR names, VST state
 blobs, native preset JSON, handles, callbacks, DOM nodes, audio buffers, samples,
 or waveforms in its public outcomes. Failed rich-provider loads return structured
-`failed`, `degraded`, `unavailable`, or `no-target` outcomes so NAM Tone/core can
+`failed`, `degraded`, `unavailable`, or `no-target` outcomes so NAM Tone or core can
 fall back cleanly instead of leaving a partially described chain in public state.
 
 ### Maintainer Checklist

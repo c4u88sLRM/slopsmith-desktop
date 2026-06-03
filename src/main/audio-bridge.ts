@@ -446,6 +446,9 @@ export function initAudioBridge(): void {
                 } catch (e: unknown) {
                     const objectError = e instanceof Error ? e.message : String(e);
                     console.warn(`[audio] setDevice object call threw: ${objectError}; retrying legacy device call`);
+                    if (normalizedPayload.inputType !== normalizedPayload.outputType) {
+                        return normalizeDeviceConfigResult(false, objectError);
+                    }
                     try {
                         return normalizeDeviceConfigResult(
                             audio.setDevice(
@@ -908,8 +911,9 @@ export function initAudioBridge(): void {
 
     // ── Audio-effects executor ─────────────────────────────────────────────
 
-    ipcMain.handle('audio-effects:loadChainPlan', (_event, request: unknown) => {
-        return audioEffects.loadChainPlan(request);
+    ipcMain.handle('audio-effects:loadChainPlan', async (_event, request: unknown) => {
+        vstSlotPaths.clear();
+        return await audioEffects.loadChainPlan(request);
     });
 
     ipcMain.handle('audio-effects:inspectRoute', (_event, routeKey?: string) => {
