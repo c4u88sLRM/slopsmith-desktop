@@ -222,6 +222,11 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
         // same result shape either way.
         getPitchDetection: () => ipcRenderer.invoke('audio:getPitchDetection'),
 
+        // Raw YIN pitch for tuners: always the continuous (sub-Hz) frequency and
+        // real cents, bypassing the ML note-snapping. Reads the post-noise-gate
+        // signal, so it goes silent (frequency -1) when the gate is closed.
+        getRawPitch: () => ipcRenderer.invoke('audio:getRawPitch'),
+
         // Whether the ML note detector (Basic Pitch) is active vs. the YIN
         // fallback. Resolves false on a downlevel addon.
         isMlNoteDetection: (): Promise<boolean> => ipcRenderer.invoke('audio:isMlNoteDetection'),

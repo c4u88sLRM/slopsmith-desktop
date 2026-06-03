@@ -40,6 +40,13 @@ public:
     // identical either way so the getPitchDetection bridge is detector-agnostic.
     PitchDetector::Detection getActiveDetection() const;
 
+    // Raw monophonic YIN detection, always — bypasses the ML preference so the
+    // continuous frequency (sub-Hz, parabolically interpolated) and real cents
+    // survive even when a Basic Pitch model is loaded. Backs the tuner's
+    // getRawPitch bridge endpoint; the YIN detector reads the post-noise-gate
+    // signal, so this is silent (frequency -1) when the gate is closed.
+    PitchDetector::Detection getRawPitchDetection() const;
+
     // Device enumeration
     struct DeviceTypeInfo
     {

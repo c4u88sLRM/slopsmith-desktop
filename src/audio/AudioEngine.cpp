@@ -1676,9 +1676,13 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         if (peak > prevPeak) inputPeak.store(peak);
     }
 
-    // Feed pitch detector + ring with the pre-FX dry guitar. Buffer ch 0 holds
-    // the post-gain mono signal in both duplex and split paths. Zero-output
-    // duplex setups (input-only ASIO/JACK) need the scratch fallback.
+    // Build the mono guitar source. The ML detector and the getInputFrame() ring
+    // are fed here, pre-gate (note-detection scoring expects the raw dry signal);
+    // the YIN pitch detector is fed lower down, AFTER the noise gate (both the
+    // monitored path and the zero-output fallback), so the tuner reads silence as
+    // "no pitch" instead of chasing gated noise. Buffer ch 0 holds the post-gain
+    // mono signal in both duplex and split paths. Zero-output duplex setups
+    // (input-only ASIO/JACK) need the scratch fallback.
     const float* monoSource = nullptr;
     if (effectiveOutputChannels > 0)
     {
@@ -1716,8 +1720,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
     if (monoSource != nullptr)
     {
-        pitchDetector.pushSamples(monoSource, numSamples);
-        // Feed the polyphonic ML detector the same dry mono signal. Lock-free
+        // Feed the polyphonic ML detector the dry mono signal (pre-gate). Lock-free
         // and a no-op when ONNX support isn't compiled in.
         mlNoteDetector.pushSamples(monoSource, numSamples);
 
@@ -1737,6 +1740,30 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     }
 
     noiseGate.processBlock(buffer);
+
+    // Feed the YIN pitch detector from the POST-gate signal so the tuner reports
+    // silence as "no pitch" instead of chasing gated noise.
+    if (monoSource != nullptr)
+    {
+        if (effectiveOutputChannels > 0)
+        {
+            // monoSource aliases buffer ch0, which the gate just processed in place.
+            pitchDetector.pushSamples(monoSource, numSamples);
+        }
+        else
+        {
+            // Zero-output (input-only ASIO/JACK) fallback: buffer has no channel,
+            // so the processBlock above was a no-op (NoiseGate early-returns and
+            // leaves its envelope untouched when numChannels <= 0). Run the gate
+            // once on the scratch mono here — a single real gate pass — so the
+            // tuner is gated in this path too. ML / input-frame ring already
+            // copied the pre-gate samples above, so gating in place is safe.
+            float* scratchPtr = inputCaptureScratch.data();
+            juce::AudioBuffer<float> scratchGate(&scratchPtr, 1, numSamples);
+            noiseGate.processBlock(scratchGate);
+            pitchDetector.pushSamples(scratchPtr, numSamples);
+        }
+    }
 
     // Process through signal chain (VSTs, NAM, IR)
     bool hasProcessors = signalChain.getNumSlots() > 0;
@@ -2089,6 +2116,19 @@ PitchDetector::Detection AudioEngine::getActiveDetection() const
         }
         return d;
     }
+    return pitchDetector.getLatestDetection();
+}
+
+PitchDetector::Detection AudioEngine::getRawPitchDetection() const
+{
+    // Same stopped/cold-start guard as getActiveDetection() so a halted engine
+    // returns no detection rather than a stale note.
+    if (! audioRunning.load(std::memory_order_relaxed))
+        return {};
+
+    // Always the raw YIN result — never the ML override. The frequency is the
+    // continuous, parabolically interpolated estimate and cents is the real
+    // deviation, so a tuner can read sub-Hz sharp/flat even with a model loaded.
     return pitchDetector.getLatestDetection();
 }
 

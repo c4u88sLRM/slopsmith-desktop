@@ -805,6 +805,36 @@ static Napi::Value GetPitchDetection(const Napi::CallbackInfo& info)
     return obj;
 }
 
+static Napi::Value GetRawPitchDetection(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto obj = Napi::Object::New(env);
+    auto liveEngine = snapshotEngine();
+
+    if (liveEngine)
+    {
+        // Always the raw YIN detection — bypasses the ML preference so frequency
+        // stays continuous (sub-Hz) and cents stays real even with a model loaded.
+        // Backs the tuner's audio:getRawPitch endpoint.
+        auto det = liveEngine->getRawPitchDetection();
+        obj.Set("frequency", det.frequency);
+        obj.Set("confidence", det.confidence);
+        obj.Set("midiNote", det.midiNote);
+        obj.Set("cents", det.cents);
+        obj.Set("noteName", det.noteName.toStdString());
+    }
+    else
+    {
+        obj.Set("frequency", -1.0);
+        obj.Set("confidence", 0.0);
+        obj.Set("midiNote", -1);
+        obj.Set("cents", 0.0);
+        obj.Set("noteName", "");
+    }
+
+    return obj;
+}
+
 // Score a polyphonic chord against the engine's most recent input
 // samples. Renderer (notedetect plugin's matchNotes chord branch)
 // supplies the chord context — chart notes plus tuning/arrangement
@@ -2637,6 +2667,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
 
     // Pitch detection
     exports.Set("getPitchDetection", Napi::Function::New(env, GetPitchDetection));
+    exports.Set("getRawPitchDetection", Napi::Function::New(env, GetRawPitchDetection));
     exports.Set("scoreChord", Napi::Function::New(env, ScoreChord));
     exports.Set("setChart", Napi::Function::New(env, SetChart));
     exports.Set("getNoteVerdicts", Napi::Function::New(env, GetNoteVerdicts));
