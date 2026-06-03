@@ -68,8 +68,10 @@ type RouteState = {
     lastOutcome: SafeOutcome | null;
 };
 
+type AudioEffectsOutcome = 'handled' | 'degraded' | 'failed' | 'unavailable' | 'no-target' | 'user-action-required';
+
 type SafeOutcome = {
-    outcome: string;
+    outcome: AudioEffectsOutcome;
     status: string;
     reason: string;
     payload?: Dict;
@@ -133,7 +135,7 @@ function safeBool(value: unknown, fallback = false): boolean {
     return value === true || value === false ? value : fallback;
 }
 
-function safeOutcome(outcome: string, reason: unknown, payload?: Dict, status?: string): SafeOutcome {
+function safeOutcome(outcome: AudioEffectsOutcome, reason: unknown, payload?: Dict, status?: string): SafeOutcome {
     return {
         outcome,
         status: status || outcome,
