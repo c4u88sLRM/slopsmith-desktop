@@ -80,11 +80,10 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('summarizeActiveProviderManagedRoute'), true);
     assert.equal(source.includes('summarizeProviderManagedMappings(await fetchAudioEffectMappingsForSong(songKey)) || summarizeActiveProviderManagedRoute()'), true);
     assert.equal(source.includes('window.RbMegaChain'), true);
-    assert.equal(source.includes('window.__rbToneOwnership'), true);
-    assert.equal(source.includes("rbOwner.providerId === 'rig_builder.effects'"), true);
     assert.equal(source.includes('RbMegaChain.isPending'), true);
     assert.equal(source.includes("providerId: 'rig_builder.effects'"), true);
-    assert.equal(source.includes("const rigBuilderState = (rigBuilderPending || rbOwnerPending) ? 'loading' : 'loaded'"), true);
+    assert.equal(source.includes("const rigBuilderState = rigBuilderPending ? 'selected' : 'loaded'"), true);
+    assert.equal(source.includes("['selected', 'resolving', 'loading'].includes(inspected.state)"), true);
     assert.equal(source.includes("'loading'") && source.includes('Loading chain'), true);
     assert.equal(source.includes('Provider-managed audio-effects chain active'), true);
     assert.equal(source.includes("const panelMode = providerManaged ? 'provider'"), true);
