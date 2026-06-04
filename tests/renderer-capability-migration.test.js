@@ -79,6 +79,9 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes("String(inspected?.providerId || '').trim() === 'nam-tone'"), true);
     assert.equal(source.includes('window._aeShouldShowPlayerChainButton'), true);
     assert.equal(source.includes('window._aeInjectPlayerToneButton = injectPlayerToneButton'), true);
+    assert.equal(source.includes('function rigBuilderToneOwnershipState()'), true);
+    assert.equal(source.includes("window.__rbMegaChainSetting === true"), true);
+    assert.equal(source.includes("state: pending ? 'selected' : failed ? 'fallback' : active ? 'loaded' : 'selected'"), true);
     assert.equal(source.includes('function removePlayerChainButton()'), true);
     assert.equal(source.includes("document.getElementById('btn-chain-switch')"), true);
     assert.equal(source.includes('if (!shouldShowPlayerChainButton())'), true);
@@ -91,9 +94,10 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('summarizeActiveProviderManagedRoute'), true);
     assert.equal(source.includes('summarizeProviderManagedMappings(await fetchAudioEffectMappingsForSong(songKey)) || summarizeActiveProviderManagedRoute()'), true);
     assert.equal(source.includes('window.RbMegaChain'), true);
-    assert.equal(source.includes('RbMegaChain.isPending'), true);
+    assert.equal(source.includes("typeof rb.isPending === 'function'"), true);
+    assert.equal(source.includes("typeof rb.state === 'function'"), true);
     assert.equal(source.includes("providerId: 'rig_builder.effects'"), true);
-    assert.equal(source.includes("const rigBuilderState = rigBuilderPending ? 'selected' : 'loaded'"), true);
+    assert.equal(source.includes('const rigBuilderOwner = rigBuilderToneOwnershipState();'), true);
     assert.equal(source.includes("['selected', 'resolving', 'resolved', 'loaded', 'degraded', 'loading', 'fallback'].includes(state)"), true);
     assert.equal(source.includes("if (inspected.state === 'fallback') label = 'Chain failed'"), true);
     assert.equal(source.includes("else if (inspected.state === 'degraded') label = 'Chain degraded'"), true);

@@ -2317,12 +2317,31 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         };
     }
 
+    function rigBuilderToneOwnershipState() {
+        const rb = window.RbMegaChain;
+        let state = null;
+        try {
+            if (rb && typeof rb.state === 'function') state = rb.state();
+        } catch (_) { state = null; }
+        const active = !!(state?.active || (rb && typeof rb.isActive === 'function' && rb.isActive()));
+        const pending = !!(state?.pending || (rb && typeof rb.isPending === 'function' && rb.isPending()));
+        const failed = !!state?.failed;
+        const enabled = !!(state?.enabled || window.__rbMegaChainSetting === true || (rb && typeof rb.settingOn === 'function' && rb.settingOn()));
+        if (!active && !pending && !failed && !enabled) return null;
+        return {
+            active,
+            pending,
+            failed,
+            enabled,
+            state: pending ? 'selected' : failed ? 'fallback' : active ? 'loaded' : 'selected',
+        };
+    }
+
     function inspectProviderManagedAudioEffectsRoute() {
         const api = window.slopsmith?.audioEffects;
-        const rigBuilderActive = !!(window.RbMegaChain && typeof window.RbMegaChain.isActive === 'function' && window.RbMegaChain.isActive());
-        const rigBuilderPending = !!(window.RbMegaChain && typeof window.RbMegaChain.isPending === 'function' && window.RbMegaChain.isPending());
-        const rigBuilderManaged = rigBuilderActive || rigBuilderPending;
-        const rigBuilderState = rigBuilderPending ? 'selected' : 'loaded';
+        const rigBuilderOwner = rigBuilderToneOwnershipState();
+        const rigBuilderManaged = !!rigBuilderOwner;
+        const rigBuilderState = rigBuilderOwner?.state || 'selected';
         if (!api || typeof api.inspectRoute !== 'function') {
             return rigBuilderManaged ? { route: { state: rigBuilderState }, provider: null, providerId: 'rig_builder.effects', state: rigBuilderState } : null;
         }
