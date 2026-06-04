@@ -2313,19 +2313,43 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         };
     }
 
-    function hasProviderManagedAudioEffectsChain() {
+    function inspectProviderManagedAudioEffectsRoute() {
         const api = window.slopsmith?.audioEffects;
-        if (!api || typeof api.inspectRoute !== 'function') return false;
+        if (!api || typeof api.inspectRoute !== 'function') return null;
         let route = null;
+        let provider = null;
         try {
             const result = api.inspectRoute({ routeKey: 'desktop-main' });
             route = result && result.payload && result.payload.route;
+            provider = result && result.payload && result.payload.provider;
         } catch (_) {
             route = null;
+            provider = null;
         }
-        const providerId = String(route?.providerId || '').trim();
+        const providerId = String(route?.providerId || provider?.providerId || '').trim();
         const state = String(route?.state || '').trim();
-        return !!providerId && providerId !== 'nam-tone' && ['selected', 'resolved', 'loaded', 'degraded'].includes(state);
+        if (!providerId || providerId === 'nam-tone' || !['selected', 'resolved', 'loaded', 'degraded'].includes(state)) return null;
+        return { route, provider, providerId, state };
+    }
+
+    function summarizeActiveProviderManagedRoute() {
+        const inspected = inspectProviderManagedAudioEffectsRoute();
+        if (!inspected) return null;
+        const route = inspected.route || {};
+        const planSummary = route.planSummary || {};
+        const stageCount = Number(planSummary.stageCount || 0);
+        const label = stageCount > 0 ? `${stageCount} loaded stage${stageCount === 1 ? '' : 's'}` : inspected.state;
+        return {
+            providerId: inspected.providerId,
+            providerLabel: String(inspected.provider?.label || '').trim() || audioEffectsProviderLabel(inspected.providerId),
+            rows: [{ tone_key: route.activeSegmentId || 'Active chain', label }],
+            toneCount: 1,
+            routeManaged: true,
+        };
+    }
+
+    function hasProviderManagedAudioEffectsChain() {
+        return !!inspectProviderManagedAudioEffectsRoute();
     }
 
     window._aeHasProviderManagedChain = hasProviderManagedAudioEffectsChain;
@@ -2793,7 +2817,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 console.warn('[audio-engine] tone mappings JSON invalid:', e);
                 mappings = {};
             }
-            providerManaged = summarizeProviderManagedMappings(await fetchAudioEffectMappingsForSong(songKey));
+            providerManaged = summarizeProviderManagedMappings(await fetchAudioEffectMappingsForSong(songKey)) || summarizeActiveProviderManagedRoute();
             try {
                 midiConfig = getMidiPCConfig(songKey);
             } catch (e) {
