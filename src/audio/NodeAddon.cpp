@@ -1172,6 +1172,15 @@ static Napi::Value SetChart(const Napi::CallbackInfo& info)
         const float v = reqObj.Get("fundamentalRatio").As<Napi::Number>().FloatValue();
         if (std::isfinite(v)) chart.fundamentalRatio = v;
     }
+    if (reqObj.Has("presenceRatio") && reqObj.Get("presenceRatio").IsNumber())
+    {
+        // Temporal-persistence floor, clamped to [0,1]. Saturate rather than
+        // reject an out-of-range value: a stray >1 must NOT silently fall back to
+        // 0 (legacy ever-present), which would reintroduce the false-accept this
+        // guards against. Non-finite is ignored (keeps the 0 default).
+        const float v = reqObj.Get("presenceRatio").As<Napi::Number>().FloatValue();
+        if (std::isfinite(v)) chart.presenceRatio = (v < 0.0f) ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }
     if (reqObj.Has("timingTolerance") && reqObj.Get("timingTolerance").IsNumber())
         chart.timingTolerance = reqObj.Get("timingTolerance").As<Napi::Number>().DoubleValue();
 

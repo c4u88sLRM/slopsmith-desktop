@@ -69,6 +69,14 @@ public:
         float pitchCheckCents = 0.0f;
         float harmonicSnr = 3.0f;
         float fundamentalRatio = 0.20f; // ChordScorer fundamental-presence gate
+        // Temporal-persistence floor: a note counts as hit only when the comb
+        // confirms its pitch in at least this FRACTION of the frames scored in
+        // its window — not just one ("ever present"). A correctly-fretted note
+        // rings through ~70-100% of its frames; a wrong-position note only trips
+        // the comb on a handful of stray frames, so a persistence floor rejects
+        // it. 0 keeps the legacy ever-present rule (guitar default, byte-
+        // identical); bass passes ~0.3. Tunable over IPC like harmonicSnr.
+        float presenceRatio = 0.0f;
         double timingTolerance = 0.1; // seconds — half-width of the scoring window
         std::vector<ChartNote> notes;
     };
@@ -122,6 +130,8 @@ private:
         float centsError = 0.0f;
         float snr = 0.0f;
         bool everPresent = false;  // comb confirmed pitch present sometime in-window
+        int presentFrames = 0;     // frames in-window where the comb confirmed the pitch
+        int scoredFrames = 0;      // frames in-window the note was scored against
         float bestSnr = 0.0f;      // strongest SNR among present ticks
         float bestCents = 0.0f;    // cents error at the strongest present tick
     };

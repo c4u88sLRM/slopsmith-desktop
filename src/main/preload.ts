@@ -129,6 +129,7 @@ export interface ChartUpdate {
     pitchCheckCents?: number;
     harmonicSnr?: number;
     fundamentalRatio?: number; // fundamental-presence gate; lower for bass, <=0 disables (default 0.20)
+    presenceRatio?: number;    // temporal-persistence floor (0,1]; bass ~0.3, 0 = legacy ever-present
     timingTolerance?: number;  // seconds — half-width of the scoring window
     notes: ChartNote[];
 }
