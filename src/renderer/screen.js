@@ -2027,7 +2027,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // Don't wipe a hand-built chain when the song has no tone-switching to
         // replace it with — that would silence the guitar (empty chain + monitor mute).
         if (!songShouldRebuildChain()) {
-            console.log('[audio-engine] Song has no rebuildable tone-switching — keeping current chain');
+            const providerChainActive = window._aeHasProviderManagedChain && window._aeHasProviderManagedChain();
+            console.log(providerChainActive
+                ? '[audio-engine] Provider-managed audio-effects chain active — keeping current chain'
+                : '[audio-engine] Song has no rebuildable tone-switching — keeping current chain');
             return false;
         }
         // A rebuild is happening: keep the dry guitar audible through the
@@ -2309,6 +2312,23 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             toneCount: new Set(providerRows.map(row => String(row?.tone_key || row?.toneKey || '').trim()).filter(Boolean)).size,
         };
     }
+
+    function hasProviderManagedAudioEffectsChain() {
+        const api = window.slopsmith?.audioEffects;
+        if (!api || typeof api.inspectRoute !== 'function') return false;
+        let route = null;
+        try {
+            const result = api.inspectRoute({ routeKey: 'desktop-main' });
+            route = result && result.payload && result.payload.route;
+        } catch (_) {
+            route = null;
+        }
+        const providerId = String(route?.providerId || '').trim();
+        const state = String(route?.state || '').trim();
+        return !!providerId && providerId !== 'nam-tone' && ['selected', 'resolved', 'loaded', 'degraded'].includes(state);
+    }
+
+    window._aeHasProviderManagedChain = hasProviderManagedAudioEffectsChain;
 
     function cloneToneMappingBucket(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -3967,7 +3987,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 window._toneSwitcher = null;
                 if (window._aeStopToneMonitor) window._aeStopToneMonitor();
                 _preloadedToneCacheKey = null;
-                console.log('[tone-switcher] Song has no rebuildable tone-switching — keeping current chain, skipping preload');
+                const providerChainActive = window._aeHasProviderManagedChain && window._aeHasProviderManagedChain();
+                console.log(providerChainActive
+                    ? '[tone-switcher] Provider-managed audio-effects chain active — preserving chain, skipping legacy preset preload'
+                    : '[tone-switcher] Song has no rebuildable tone-switching — keeping current chain, skipping preload');
                 return;
             }
             // Track whether the chain has actually been cleared, so the bypass

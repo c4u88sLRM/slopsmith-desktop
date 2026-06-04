@@ -73,6 +73,9 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('rig_builder.effects'), true);
     assert.equal(source.includes('Chain Provider'), true);
     assert.equal(source.includes('ae-open-rig-builder'), true);
+    assert.equal(source.includes('hasProviderManagedAudioEffectsChain'), true);
+    assert.equal(source.includes('window._aeHasProviderManagedChain'), true);
+    assert.equal(source.includes('Provider-managed audio-effects chain active'), true);
     assert.equal(source.includes("const panelMode = providerManaged ? 'provider'"), true);
     assert.equal(source.includes('if (!providerManaged && toneNamesOrdered.length > 0)'), true);
 });
