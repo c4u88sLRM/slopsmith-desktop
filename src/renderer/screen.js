@@ -2373,12 +2373,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     window._aeHasProviderManagedChain = hasProviderManagedAudioEffectsChain;
 
-    function isRigBuilderManagedAudioEffectsRoute() {
+    function shouldShowPlayerChainButton() {
         const inspected = inspectProviderManagedAudioEffectsRoute();
-        return String(inspected?.providerId || '').trim() === 'rig_builder.effects';
+        return String(inspected?.providerId || '').trim() === 'nam-tone';
     }
 
-    window._aeRigBuilderOwnsChain = isRigBuilderManagedAudioEffectsRoute;
+    window._aeShouldShowPlayerChainButton = shouldShowPlayerChainButton;
 
     function cloneToneMappingBucket(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -2768,7 +2768,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     function injectPlayerToneButton() {
         const controls = document.getElementById('player-controls');
-        if (isRigBuilderManagedAudioEffectsRoute()) {
+        if (!shouldShowPlayerChainButton()) {
             removePlayerChainButton();
             return;
         }
@@ -2811,7 +2811,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     window._refreshChainPanel = refreshTonePanelIfOpen;
 
     async function toggleTonePanel() {
-        if (isRigBuilderManagedAudioEffectsRoute()) {
+        if (!shouldShowPlayerChainButton()) {
             removePlayerChainButton();
             return;
         }
@@ -4431,7 +4431,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     // player controls — don't wait for the first song play.
     function tryInjectChainButton() {
         const controls = document.getElementById('player-controls');
-        if (window._aeRigBuilderOwnsChain && window._aeRigBuilderOwnsChain()) {
+        if (!window._aeShouldShowPlayerChainButton || !window._aeShouldShowPlayerChainButton()) {
             const existing = document.getElementById('btn-chain-switch');
             if (existing) existing.remove();
             if (window._closeChainPanel) window._closeChainPanel();
