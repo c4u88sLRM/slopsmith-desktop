@@ -232,6 +232,7 @@ void NoteVerifier::run()
         ctx.pitchCheckCents = chart.pitchCheckCents;
         ctx.harmonicSnr     = chart.harmonicSnr;
         ctx.fundamentalRatio = chart.fundamentalRatio;
+        ctx.presenceRatio   = chart.presenceRatio;
         ctx.timingTolerance = chart.timingTolerance;
 
         // A drill A-B loop wrap (or a manual seek-back) jumps the playhead
@@ -336,7 +337,10 @@ void NoteVerifier::run()
         {
             if (s.index >= state.size()) continue;
             NoteState& st = state[s.index];
-            if (st.finalized || ! s.present) continue;
+            if (st.finalized) continue;
+            ++st.scoredFrames;             // count every frame the note was scored against
+            if (! s.present) continue;
+            ++st.presentFrames;
             st.everPresent = true;
             if (s.snr > st.bestSnr) { st.bestSnr = s.snr; st.bestCents = s.centsError; }
         }
@@ -349,7 +353,19 @@ void NoteVerifier::run()
             const auto& cn = chart.notes[idx];
             st.finalized = true;
 
-            if (st.everPresent)
+            // Persistence decision. With presenceRatio <= 0 this is the legacy
+            // ever-present rule (guitar: byte-identical). With a floor set (bass),
+            // require the comb to have confirmed the pitch in at least that
+            // fraction of the note's scored frames — rejecting wrong-position
+            // notes that only flicker present on a few stray frames while keeping
+            // correctly-fretted notes, which ring through most of their window.
+            const bool hit = (ctx.presenceRatio <= 0.0f)
+                ? st.everPresent
+                : (st.presentFrames > 0
+                   && (double) st.presentFrames
+                          >= std::ceil((double) ctx.presenceRatio * (double) st.scoredFrames));
+
+            if (hit)
             {
                 // The comb confirmed this note's pitch in its window — a hit.
                 // Timing: a picked note claims the nearest unclaimed pick

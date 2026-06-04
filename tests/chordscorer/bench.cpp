@@ -235,6 +235,38 @@ int main(int argc, char** argv)
         return false;
     };
 
+    // Fraction of frames across the note's full span that register present —
+    // diagnostic for how ROBUSTLY a note is detected (1.0 = every frame hits,
+    // ~0 = a single marginal frame). A robust false-accept needs a stronger
+    // per-frame reject; a barely-present one would fall to a frame-fraction gate.
+    auto presentFrac = [&](const ChartNote& cn, double audioTime) -> double
+    {
+        const double span = std::max(cn.sus, 0.0) + 0.10;
+        int tot = 0, present = 0;
+        for (double off = 0.0; off <= span + 1e-9; off += 0.040)
+        {
+            const long long end = (long long) std::llround((audioTime + off) * sampleRate);
+            if (end <= 0 || end > (long long) wav.size()) continue;
+            const long long start = end - kFrame;
+            for (int k = 0; k < kFrame; ++k)
+            {
+                const long long idx = start + k;
+                frame[(size_t) k] = (idx >= 0 && idx < (long long) wav.size()) ? wav[(size_t) idx] : 0.0f;
+            }
+            ChordScorer::Request req;
+            req.numSamples = kFrame; req.arrangement = arrangement;
+            req.stringCount = stringCount; req.tuningOffsets.assign((size_t) stringCount, 0);
+            req.capo = 0; req.pitchCheckCents = pitchCheckCents; req.harmonicVerify = true;
+            req.harmonicSnr = harmonicSnr; req.fundamentalRatio = fundamentalRatio;
+            ChordScorer::Note nt{}; nt.string = cn.string; nt.fret = cn.fret;
+            req.notes.push_back(nt);
+            const auto r = scorer.scoreChord(frame.data(), kFrame, (double) sampleRate, req);
+            ++tot;
+            if (!r.results.empty() && r.results[0].hit) ++present;
+        }
+        return tot ? (double) present / tot : 0.0;
+    };
+
     // --- Align: coarse then fine search for the offset maximising hits -------
     // The full presence scan is FFT-heavy, so the coarse pass samples up to 300
     // evenly-spaced notes; the fine pass and the final report use all notes.
@@ -246,19 +278,50 @@ int main(int argc, char** argv)
         return h;
     };
     const size_t coarseStride = std::max<size_t>(1, chart.size() / 300);
+    // Pitch-INDEPENDENT alignment: how many chart note times land within tol of
+    // a detected onset. Unlike hitCount this does not look at pitch, so it finds
+    // the true count-in offset even on a wrong-position take (same rhythm, same
+    // click) — where the pitch-maximising search would instead slide the chart
+    // until wrong notes coincidentally line up and inflate recall.
+    auto onsetCoverage = [&](double delta) -> int
+    {
+        int c = 0;
+        for (const auto& cn : chart)
+        {
+            const double t = cn.t + delta;
+            for (double ot : onsetTimes)
+                if (std::fabs(ot - t) <= 0.10) { ++c; break; }
+        }
+        return c;
+    };
+    const bool alignOnset = std::getenv("CS_ALIGN_ONSET") != nullptr;
     double bestDelta = 0.0;
     int bestHits = -1;
-    for (double d = -2.0; d <= 5.0; d += 0.100)
+    // CS_OFFSET pins the chart->WAV offset instead of auto-aligning. The auto
+    // search maximises hits, which on a WRONG-position take slides the chart in
+    // time until wrong-pitch notes coincidentally line up — inflating recall.
+    // For the wrong-position precision test, pin every take to the correct
+    // take's count-in offset so wrong pitches are scored at the right *times*.
+    const char* offEnv = std::getenv("CS_OFFSET");
+    if (offEnv)
     {
-        const int h = hitCount(d, coarseStride);
-        if (h > bestHits) { bestHits = h; bestDelta = d; }
+        bestDelta = std::atof(offEnv);
     }
-    for (double d = bestDelta - 0.150; d <= bestDelta + 0.150; d += 0.010)
+    else
     {
-        const int h = hitCount(d, 1);
-        if (h > bestHits) { bestHits = h; bestDelta = d; }
+        for (double d = -2.0; d <= 5.0; d += 0.100)
+        {
+            const int h = alignOnset ? onsetCoverage(d) : hitCount(d, coarseStride);
+            if (h > bestHits) { bestHits = h; bestDelta = d; }
+        }
+        for (double d = bestDelta - 0.150; d <= bestDelta + 0.150; d += 0.010)
+        {
+            const int h = alignOnset ? onsetCoverage(d) : hitCount(d, 1);
+            if (h > bestHits) { bestHits = h; bestDelta = d; }
+        }
     }
-    std::cout << "\n=== alignment ===\nchart->WAV offset: " << bestDelta << " s\n";
+    std::cout << "\n=== alignment ===\nchart->WAV offset: " << bestDelta << " s"
+              << (offEnv ? " (pinned)" : "") << "\n";
 
     // --- Report at the best offset ------------------------------------------
     const double tol = 0.10;  // ±100 ms timing-match window (mlnd_bench parity)
@@ -266,13 +329,24 @@ int main(int argc, char** argv)
     int hits = 0;
     std::vector<double> te;   // timing errors of hits that claimed an onset
     std::vector<const ChartNote*> missed;
+    std::vector<const ChartNote*> hitNotes;
+    // CS_FRAC: require the note present in at least this FRACTION of its frames
+    // (temporal persistence) instead of the default any-frame rule. Correct
+    // notes ring through ~70-100% of frames; wrong-position false-accepts flicker
+    // present in only a handful, so a persistence floor separates them.
+    const char* fracEnv = std::getenv("CS_FRAC");
+    const double fracThresh = fracEnv ? std::atof(fracEnv) : 0.0;
     for (const auto& cn : chart)
     {
         const double audioT = cn.t + bestDelta;
         // Full sounding span for the recall report — a sustained bass note that
         // rings into its window is a legitimate hit.
-        if (!presentAt(cn, audioT, std::max(cn.sus, 0.0) + 0.10)) { missed.push_back(&cn); continue; }
+        const bool present = fracThresh > 0.0
+            ? presentFrac(cn, audioT) >= fracThresh
+            : presentAt(cn, audioT, std::max(cn.sus, 0.0) + 0.10);
+        if (!present) { missed.push_back(&cn); continue; }
         ++hits;
+        hitNotes.push_back(&cn);
         double best = 1e9;
         for (double ot : onsetTimes)
             if (std::fabs(ot - audioT) <= tol && std::fabs(ot - audioT) < std::fabs(best))
@@ -297,19 +371,25 @@ int main(int argc, char** argv)
     std::cout << "onsets/note:      " << (double(onsetTimes.size()) / (double) chart.size())
               << "  (>1 = extra attacks: noise, double-triggers)\n";
 
+    static const char* names[12] =
+        {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+    auto dumpNote = [&](const ChartNote* cn) {
+        const int oct = cn->midi / 12 - 1;
+        std::cout << "  t=" << (cn->t + bestDelta) << "s  midi=" << cn->midi
+                  << " (" << names[cn->midi % 12] << oct << ")"
+                  << "  str=" << cn->string << " fret=" << cn->fret
+                  << "  sus=" << cn->sus << "s"
+                  << "  frac=" << presentFrac(*cn, cn->t + bestDelta) << "\n";
+    };
+    if (verbose && !hitNotes.empty())
+    {
+        std::cout << "\n=== HIT notes (" << hitNotes.size() << ") ===\n";
+        for (const ChartNote* cn : hitNotes) dumpNote(cn);
+    }
     if (verbose && !missed.empty())
     {
-        static const char* names[12] =
-            {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
         std::cout << "\n=== missed notes (" << missed.size() << ") ===\n";
-        for (const ChartNote* cn : missed)
-        {
-            const int oct = cn->midi / 12 - 1;
-            std::cout << "  t=" << (cn->t + bestDelta) << "s  midi=" << cn->midi
-                      << " (" << names[cn->midi % 12] << oct << ")"
-                      << "  str=" << cn->string << " fret=" << cn->fret
-                      << "  sus=" << cn->sus << "s\n";
-        }
+        for (const ChartNote* cn : missed) dumpNote(cn);
     }
     return 0;
 }
