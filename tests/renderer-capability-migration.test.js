@@ -83,6 +83,11 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('Provider-managed audio-effects chain active'), true);
     assert.equal(source.includes("const panelMode = providerManaged ? 'provider'"), true);
     assert.equal(source.includes('if (!providerManaged && toneNamesOrdered.length > 0)'), true);
+    assert.equal(source.includes('if (providerChainActive) {'), true);
+    assert.equal(source.includes('Provider-managed audio-effects chain active — preserving chain, skipping legacy preset preload'), true);
+    assert.equal(source.includes('aeSetMonitorMuteSuppressed(false);'), true);
+    assert.equal(source.includes('let shouldResolveChainRebuildGuard = false;'), true);
+    assert.equal(source.includes('if (shouldResolveChainRebuildGuard) await resolveChainRebuildGuard();'), true);
 });
 
 test('legacy midi_amp tone lookup is guarded by plugin availability', () => {

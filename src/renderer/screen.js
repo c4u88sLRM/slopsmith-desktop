@@ -2024,13 +2024,15 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
      *  preload would treat the preserved chain as already cleared. */
     async function clearChainForNewSong() {
         if (!api?.clearChain) return false;
+        const providerChainActive = window._aeHasProviderManagedChain && window._aeHasProviderManagedChain();
+        if (providerChainActive) {
+            console.log('[audio-engine] Provider-managed audio-effects chain active — keeping current chain');
+            return false;
+        }
         // Don't wipe a hand-built chain when the song has no tone-switching to
         // replace it with — that would silence the guitar (empty chain + monitor mute).
         if (!songShouldRebuildChain()) {
-            const providerChainActive = window._aeHasProviderManagedChain && window._aeHasProviderManagedChain();
-            console.log(providerChainActive
-                ? '[audio-engine] Provider-managed audio-effects chain active — keeping current chain'
-                : '[audio-engine] Song has no rebuildable tone-switching — keeping current chain');
+            console.log('[audio-engine] Song has no rebuildable tone-switching — keeping current chain');
             return false;
         }
         // A rebuild is happening: keep the dry guitar audible through the
@@ -3786,6 +3788,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     async function resolveChainRebuildGuard() {
         const api = window.slopsmithDesktop?.audio;
         if (!api) return;
+        if (window._aeHasProviderManagedChain && window._aeHasProviderManagedChain()) {
+            aeSetMonitorMuteSuppressed(false);
+            return;
+        }
         let slots = [];
         try { slots = await api.getChainState(); } catch (_) { slots = []; }
         if (Array.isArray(slots) && slots.length > 0) {
@@ -3973,9 +3979,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // Start tone monitoring and preload presets after WebSocket delivers tone data
         setTimeout(async () => {
             if (hookState.toneAutoLoadGeneration !== generation) return;
-            // Re-assert monitor-mute suppression: this preload re-clears the
-            // chain, and clearChainForNewSong may have been skipped.
-            if (window._aeBeginChainRebuildGuard) window._aeBeginChainRebuildGuard();
+            let shouldResolveChainRebuildGuard = false;
             try {
             // Only start the 50ms polling interval when at least one switching mode is on;
             // starting it unconditionally wastes cycles on localStorage + highway reads every
@@ -3993,6 +3997,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             const api = window.slopsmithDesktop?.audio;
             const hw = window.highway || window._slopsmithHighway;
             if (!api || !hw) return;
+
+            if (window._aeHasProviderManagedChain && window._aeHasProviderManagedChain()) {
+                window._toneSwitcher = null;
+                if (window._aeStopToneMonitor) window._aeStopToneMonitor();
+                _preloadedToneCacheKey = null;
+                console.log('[tone-switcher] Provider-managed audio-effects chain active — preserving chain, skipping legacy preset preload');
+                return;
+            }
 
             const songKeyPreflight = getCurrentSongKey();
             let midiPreflight = null;
@@ -4039,10 +4051,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 window._toneSwitcher = null;
                 if (window._aeStopToneMonitor) window._aeStopToneMonitor();
                 _preloadedToneCacheKey = null;
-                const providerChainActive = window._aeHasProviderManagedChain && window._aeHasProviderManagedChain();
-                console.log(providerChainActive
-                    ? '[tone-switcher] Provider-managed audio-effects chain active — preserving chain, skipping legacy preset preload'
-                    : '[tone-switcher] Song has no rebuildable tone-switching — keeping current chain, skipping preload');
+                console.log('[tone-switcher] Song has no rebuildable tone-switching — keeping current chain, skipping preload');
                 return;
             }
             // Track whether the chain has actually been cleared, so the bypass
@@ -4056,9 +4065,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             // processors onto the preserved hand-built chain. The genuine
             // skip reasons (already-cleared / clearing-in-flight) only occur
             // with songNeedsRebuild true.
-            let chainClearedForLoad = skipPreflightClear && songNeedsRebuild;
+            const skippedBecauseExistingClear = songNeedsRebuild
+                && (!!window._aeDidClearChainForNewSong || !!window._aeClearingChainForNewSong);
+            shouldResolveChainRebuildGuard = skippedBecauseExistingClear;
+            let chainClearedForLoad = skippedBecauseExistingClear;
             if (!skipPreflightClear) {
                 try {
+                    shouldResolveChainRebuildGuard = true;
+                    if (window._aeBeginChainRebuildGuard) window._aeBeginChainRebuildGuard();
                     await api.clearChain();
                     chainClearedForLoad = true;
                     try {
@@ -4227,6 +4241,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 }
 
                 if (!chainClearedForLoad) {
+                    shouldResolveChainRebuildGuard = true;
+                    if (window._aeBeginChainRebuildGuard) window._aeBeginChainRebuildGuard();
                     await api.clearChain();
                     chainClearedForLoad = true;
                 }
@@ -4329,10 +4345,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             } catch (err) {
                 console.error('[tone-switcher] Preload failed:', err);
             } finally {
-                // Resolve the rebuild guard on every exit path (early returns,
-                // success, or a thrown rebuild) so the monitor-mute state
-                // always matches the chain that actually ended up loaded.
-                await resolveChainRebuildGuard();
+                // Resolve only when this path actually started or inherited a
+                // rebuild guard; skipped provider/no-rebuild paths should not
+                // show an empty-chain monitor warning.
+                if (shouldResolveChainRebuildGuard) await resolveChainRebuildGuard();
             }
         }, 800);
         },
