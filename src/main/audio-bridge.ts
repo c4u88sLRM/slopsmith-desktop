@@ -916,6 +916,11 @@ export function initAudioBridge(): void {
         return await audioEffects.loadChainPlan(request);
     });
 
+    ipcMain.handle('audio-effects:releaseRoute', async (_event, request: unknown) => {
+        vstSlotPaths.clear();
+        return await audioEffects.releaseRoute(request);
+    });
+
     ipcMain.handle('audio-effects:inspectRoute', (_event, routeKey?: string) => {
         return audioEffects.inspectRoute(routeKey);
     });
@@ -930,6 +935,10 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio-effects:setStageParameter', (_event, request: unknown) => {
         return audioEffects.setStageParameter(request);
+    });
+
+    ipcMain.handle('audio-effects:setRouteGain', (_event, request: unknown) => {
+        return audioEffects.setRouteGain(request);
     });
 }
 

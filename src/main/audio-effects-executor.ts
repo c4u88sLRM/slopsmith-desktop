@@ -22,10 +22,15 @@ type Dict = Record<string, unknown>;
 type AudioEffectsNativeAudio = {
     loadPreset?: (presetJson: string) => Promise<unknown> | unknown;
     savePreset?: () => unknown;
+    clearChain?: () => Promise<unknown> | unknown;
     getChainState?: () => unknown;
     setBypass?: (slotId: number, bypassed: boolean) => unknown;
     setMultiBypass?: (changes: Array<{ slotId: number; bypassed: boolean }>) => unknown;
     setParameter?: (slotId: number, paramIndex: number, value: number) => unknown;
+    setGain?: (which: string, value: number) => Promise<unknown> | unknown;
+    setMonitorMute?: (muted: boolean) => Promise<unknown> | unknown;
+    isMonitorMuted?: () => Promise<unknown> | unknown;
+    startAudio?: () => Promise<unknown> | unknown;
 };
 
 type NativeAudioGetter = () => AudioEffectsNativeAudio | null;
@@ -53,6 +58,22 @@ type ValidPlan = {
     providerId: string;
     stages: ValidStage[];
     segments: ValidSegment[];
+};
+
+type RouteGains = {
+    input?: number;
+    chain?: number;
+};
+
+type LoadOptions = {
+    preloadMute: {
+        enabled: boolean;
+        dryDuringLoad: boolean;
+        targetGain: number;
+        holdMs: number;
+    } | null;
+    gains: RouteGains;
+    startAudio: boolean;
 };
 
 type RouteState = {
@@ -111,6 +132,38 @@ function safeId(value: unknown, fallback: string): string {
 function safeNumber(value: unknown, fallback = 0): number {
     const numberValue = Number(value);
     return Number.isFinite(numberValue) ? numberValue : fallback;
+}
+
+function clampGain(value: unknown, fallback = Number.NaN): number {
+    const numberValue = safeNumber(value, fallback);
+    return Number.isFinite(numberValue) ? Math.max(0, Math.min(32, numberValue)) : Number.NaN;
+}
+
+function parseGains(value: unknown): RouteGains {
+    const input = asRecord(value) || {};
+    const gains: RouteGains = {};
+    const inputGain = clampGain(input.input);
+    const chainGain = clampGain(input.chain);
+    if (Number.isFinite(inputGain)) gains.input = inputGain;
+    if (Number.isFinite(chainGain)) gains.chain = chainGain;
+    return gains;
+}
+
+function parseLoadOptions(value: unknown): LoadOptions {
+    const input = asRecord(value) || {};
+    const rawPreload = asRecord(input.preloadMute) || asRecord(input.preLoadMute) || asRecord(input.loadMute) || asRecord(input.preload) || {};
+    const hasPreload = input.preloadMute === true || input.loadMute === true || Object.keys(rawPreload).length > 0;
+    const targetGain = clampGain(rawPreload.targetGain ?? rawPreload.restoreGain ?? rawPreload.chainGain, 1);
+    return {
+        preloadMute: hasPreload ? {
+            enabled: rawPreload.enabled !== false && input.preloadMute !== false && input.loadMute !== false,
+            dryDuringLoad: rawPreload.dryDuringLoad !== false,
+            targetGain: Number.isFinite(targetGain) ? targetGain : 1,
+            holdMs: Math.max(0, Math.min(5000, Math.round(safeNumber(rawPreload.holdMs, 0)))),
+        } : null,
+        gains: parseGains(input.gains ?? input.gain),
+        startAudio: input.startAudio === true,
+    };
 }
 
 function parseStrictNumber(value: unknown): number {
@@ -334,6 +387,50 @@ async function restorePreset(nativeAudio: AudioEffectsNativeAudio, presetJson: u
     }
 }
 
+async function readMonitorMuted(nativeAudio: AudioEffectsNativeAudio): Promise<boolean | null> {
+    if (typeof nativeAudio.isMonitorMuted !== 'function') return null;
+    try {
+        return Boolean(await nativeAudio.isMonitorMuted());
+    } catch (_) {
+        return null;
+    }
+}
+
+async function trySetMonitorMute(nativeAudio: AudioEffectsNativeAudio, muted: boolean): Promise<void> {
+    if (typeof nativeAudio.setMonitorMute !== 'function') return;
+    try { await nativeAudio.setMonitorMute(muted); } catch (_) { /* best effort */ }
+}
+
+async function trySetGain(nativeAudio: AudioEffectsNativeAudio, which: string, value: number): Promise<boolean> {
+    if (typeof nativeAudio.setGain !== 'function' || !Number.isFinite(value)) return false;
+    try {
+        const result = await nativeAudio.setGain(which, value);
+        return !nativeFailure(result);
+    } catch (_) {
+        return false;
+    }
+}
+
+async function applyGains(nativeAudio: AudioEffectsNativeAudio, gains: RouteGains, skipChain = false): Promise<string[]> {
+    const failed: string[] = [];
+    if (gains.input != null && !(await trySetGain(nativeAudio, 'input', gains.input))) failed.push('input');
+    if (!skipChain && gains.chain != null && !(await trySetGain(nativeAudio, 'chain', gains.chain))) failed.push('chain');
+    return failed;
+}
+
+function schedulePreloadRestore(nativeAudio: AudioEffectsNativeAudio, previousMonitorMute: boolean | null, targetGain: number, holdMs: number): void {
+    const restore = async () => {
+        if (previousMonitorMute !== null) await trySetMonitorMute(nativeAudio, previousMonitorMute);
+        const restoreTarget = clampGain(targetGain, 1);
+        const steps = [restoreTarget * 0.25, restoreTarget * 0.5, restoreTarget * 0.8, restoreTarget];
+        for (const value of steps) {
+            await trySetGain(nativeAudio, 'chain', value);
+            await new Promise((resolve) => setTimeout(resolve, 6));
+        }
+    };
+    setTimeout(() => { void restore(); }, Math.max(0, holdMs));
+}
+
 export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
     const routes = new Map<string, RouteState>();
 
@@ -348,6 +445,8 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         if (!nativeAudio || typeof nativeAudio.loadPreset !== 'function') {
             return safeOutcome('unavailable', 'Native audio engine is unavailable');
         }
+        const input = asRecord(request) || {};
+        const options = parseLoadOptions(input.options ?? input.executorOptions ?? input.loadOptions);
         const validation = validatePlan(request);
         if (!validation.ok) {
             return safeOutcome('failed', 'Audio-effects chain plan validation failed', { errors: validation.errors.map((error) => bounded(error)) });
@@ -355,17 +454,25 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
 
         const started = Date.now();
         const rollbackPreset = typeof nativeAudio.savePreset === 'function' ? nativeAudio.savePreset() : null;
+        let previousMonitorMute: boolean | null = null;
+        if (options.preloadMute?.enabled) {
+            previousMonitorMute = await readMonitorMuted(nativeAudio);
+            await trySetGain(nativeAudio, 'chain', 0);
+            await trySetMonitorMute(nativeAudio, options.preloadMute.dryDuringLoad ? false : true);
+        }
         let result: { success: boolean; slotsLoaded: number; error: string };
         try {
             result = normalizeLoadResult(await nativeAudio.loadPreset(validation.presetJson));
         } catch (error) {
             const rollbackApplied = await restorePreset(nativeAudio, rollbackPreset);
+            if (options.preloadMute?.enabled) schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, 0);
             return safeOutcome('failed', 'Native audio-effects plan load threw', { error: bounded(error instanceof Error ? error.message : String(error)), rollbackApplied });
         }
 
         const nativeStages = validation.plan.stages.filter((stage) => stage.native);
         if (!result.success) {
             const rollbackApplied = await restorePreset(nativeAudio, rollbackPreset);
+            if (options.preloadMute?.enabled) schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, 0);
             return safeOutcome('failed', 'Native audio-effects plan load failed', {
                 routeKey: validation.plan.routeKey,
                 providerId: validation.plan.providerId,
@@ -380,6 +487,7 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
 
         if (result.slotsLoaded < nativeStages.length) {
             const rollbackApplied = await restorePreset(nativeAudio, rollbackPreset);
+            if (options.preloadMute?.enabled) schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, 0);
             return safeOutcome('degraded', 'Native audio-effects plan partially loaded and was rolled back', {
                 routeKey: validation.plan.routeKey,
                 providerId: validation.plan.providerId,
@@ -414,11 +522,19 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
             lastOutcome: null,
         };
         routes.set(route.routeKey, route);
+        const gainFailures = await applyGains(nativeAudio, options.gains, options.preloadMute?.enabled === true);
+        if (options.startAudio && typeof nativeAudio.startAudio === 'function') {
+            try { await nativeAudio.startAudio(); } catch (_) { /* load succeeded; start is best-effort */ }
+        }
+        if (options.preloadMute?.enabled) {
+            schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, options.preloadMute.holdMs);
+        }
         return updateOutcome(route, safeOutcome('handled', 'Audio-effects chain plan loaded', {
             route: safeRoute(route),
             stageCount: nativeStages.length,
             slotsLoaded: result.slotsLoaded,
             loadMs: Date.now() - started,
+            gainFailures,
         }));
     }
 
@@ -427,6 +543,37 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         const route = routes.get(routeKey);
         if (!route) return safeOutcome('no-target', 'No audio-effects route has been loaded', { routeKey });
         return safeOutcome('handled', 'Audio-effects route inspected', { route: safeRoute(route) });
+    }
+
+    async function releaseRoute(request: unknown): Promise<SafeOutcome> {
+        const input = asRecord(request) || {};
+        const routeKey = safeId(input.routeKey ?? DEFAULT_ROUTE_KEY, DEFAULT_ROUTE_KEY);
+        const route = routes.get(routeKey);
+        if (!route) return safeOutcome('no-target', 'No audio-effects route has been loaded', { routeKey });
+        const nativeAudio = getAudio();
+        if (!nativeAudio || typeof nativeAudio.clearChain !== 'function') return updateOutcome(route, safeOutcome('unavailable', 'Native route release is unavailable', { routeKey }));
+        try {
+            const result = await nativeAudio.clearChain();
+            if (nativeFailure(result)) return updateOutcome(route, safeOutcome('failed', 'Native route release returned failure', { routeKey }));
+        } catch (error) {
+            return updateOutcome(route, safeOutcome('failed', 'Native route release threw', { routeKey, error: bounded(error instanceof Error ? error.message : String(error)) }));
+        }
+        routes.delete(routeKey);
+        return safeOutcome('handled', 'Audio-effects route released', { routeKey, providerId: route.providerId, planId: route.planId });
+    }
+
+    async function setRouteGain(request: unknown): Promise<SafeOutcome> {
+        const input = asRecord(request) || {};
+        const routeKey = safeId(input.routeKey ?? DEFAULT_ROUTE_KEY, DEFAULT_ROUTE_KEY);
+        const route = routes.get(routeKey);
+        if (!route) return safeOutcome('no-target', 'No audio-effects route has been loaded', { routeKey });
+        const gains = parseGains(input.gains ?? (input.which ? { [String(input.which)]: input.value } : {}));
+        if (gains.input == null && gains.chain == null) return updateOutcome(route, safeOutcome('failed', 'Audio-effects route gain request is invalid', { routeKey }));
+        const nativeAudio = getAudio();
+        if (!nativeAudio || typeof nativeAudio.setGain !== 'function') return updateOutcome(route, safeOutcome('unavailable', 'Native route gain is unavailable', { routeKey }));
+        const failed = await applyGains(nativeAudio, gains);
+        if (failed.length) return updateOutcome(route, safeOutcome('failed', 'Native route gain returned failure', { routeKey, failed }));
+        return updateOutcome(route, safeOutcome('handled', 'Audio-effects route gain applied', { route: safeRoute(route), gains }));
     }
 
     async function setStageBypass(request: unknown): Promise<SafeOutcome> {
@@ -501,10 +648,12 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
 
     return {
         loadChainPlan,
+        releaseRoute,
         inspectRoute,
         activateSegment,
         setStageBypass,
         setStageParameter,
+        setRouteGain,
     };
 }
 

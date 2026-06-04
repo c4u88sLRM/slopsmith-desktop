@@ -356,10 +356,12 @@ const slopsmithDesktopApi = {
     // validates the plan, and physically loads/applies native stages.
     audioEffects: {
         loadChainPlan: (request: unknown) => ipcRenderer.invoke('audio-effects:loadChainPlan', request),
+        releaseRoute: (request: unknown) => ipcRenderer.invoke('audio-effects:releaseRoute', request),
         inspectRoute: (routeKey?: string) => ipcRenderer.invoke('audio-effects:inspectRoute', routeKey),
         activateSegment: (request: unknown) => ipcRenderer.invoke('audio-effects:activateSegment', request),
         setStageBypass: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageBypass', request),
         setStageParameter: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageParameter', request),
+        setRouteGain: (request: unknown) => ipcRenderer.invoke('audio-effects:setRouteGain', request),
     },
 
     // Plugin management

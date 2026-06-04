@@ -92,6 +92,55 @@ test('audio-effects executor validates and loads a trusted chain plan without le
     assert.equal(encoded.includes('asset:pre'), false);
 });
 
+test('audio-effects executor owns load mute, route gain, start, and release', async () => {
+    const { createAudioEffectsExecutor } = loadExecutorModule();
+    const calls = [];
+    const native = {
+        savePreset: () => 'previous',
+        loadPreset: presetJson => { calls.push(['load', JSON.parse(presetJson).chain.length]); return { success: true, slotsLoaded: 2 }; },
+        clearChain: () => { calls.push(['clear']); return true; },
+        getChainState: () => [{ id: 10 }, { id: 11 }],
+        isMonitorMuted: () => { calls.push(['is-muted']); return true; },
+        setMonitorMute: muted => { calls.push(['monitor', muted]); return true; },
+        setGain: (which, value) => { calls.push(['gain', which, value]); return true; },
+        startAudio: () => { calls.push(['start']); return true; },
+    };
+    const executor = createAudioEffectsExecutor(() => native);
+    const namPath = tempAsset('.nam');
+    const irPath = tempAsset('.wav');
+
+    const loaded = await executor.loadChainPlan({
+        authorization: 'playback-session',
+        plan: plan(),
+        assets: {
+            'asset:pre': { kind: 'nam', path: namPath, safeName: 'pre' },
+            'asset:cab': { kind: 'ir', path: irPath, safeName: 'cab' },
+        },
+        options: { preloadMute: { targetGain: 4, holdMs: 0 }, gains: { input: 8, chain: 4 }, startAudio: true },
+    });
+    const gained = await executor.setRouteGain({ routeKey: 'desktop-main', gains: { chain: 2 } });
+    const released = await executor.releaseRoute({ routeKey: 'desktop-main' });
+    const inspected = executor.inspectRoute('desktop-main');
+    await new Promise(resolve => setTimeout(resolve, 40));
+
+    assert.equal(loaded.outcome, 'handled');
+    assert.equal(gained.outcome, 'handled');
+    assert.equal(released.outcome, 'handled');
+    assert.equal(inspected.outcome, 'no-target');
+    assert.deepEqual(calls.slice(0, 7), [
+        ['is-muted'],
+        ['gain', 'chain', 0],
+        ['monitor', false],
+        ['load', 2],
+        ['gain', 'input', 8],
+        ['start'],
+        ['gain', 'chain', 2],
+    ]);
+    assert.equal(calls.some(call => call[0] === 'clear'), true);
+    assert.equal(calls.some(call => call[0] === 'monitor' && call[1] === true), true);
+    assert.equal(calls.some(call => call[0] === 'gain' && call[1] === 'chain' && call[2] === 4), true);
+});
+
 test('audio-effects executor rejects unauthorised, missing, and raw-path-like plans before native load', async () => {
     const { createAudioEffectsExecutor } = loadExecutorModule();
     let loadCount = 0;
@@ -248,15 +297,17 @@ test('preload exposes the trusted audio-effects executor surface', () => {
     const bridge = fs.readFileSync(path.join(ROOT, 'src', 'main', 'audio-bridge.ts'), 'utf8');
 
     assert.equal(preload.includes('audioEffects: {'), true);
-    for (const method of ['loadChainPlan', 'inspectRoute', 'activateSegment', 'setStageBypass', 'setStageParameter']) {
+    for (const method of ['loadChainPlan', 'releaseRoute', 'inspectRoute', 'activateSegment', 'setStageBypass', 'setStageParameter', 'setRouteGain']) {
         assert.equal(preload.includes(`${method}:`), true);
     }
     for (const channel of [
         'audio-effects:loadChainPlan',
+        'audio-effects:releaseRoute',
         'audio-effects:inspectRoute',
         'audio-effects:activateSegment',
         'audio-effects:setStageBypass',
         'audio-effects:setStageParameter',
+        'audio-effects:setRouteGain',
     ]) {
         assert.equal(bridge.includes(channel), true);
     }
