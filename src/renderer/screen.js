@@ -2320,8 +2320,11 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     function inspectProviderManagedAudioEffectsRoute() {
         const api = window.slopsmith?.audioEffects;
         const rigBuilderActive = !!(window.RbMegaChain && typeof window.RbMegaChain.isActive === 'function' && window.RbMegaChain.isActive());
+        const rigBuilderPending = !!(window.RbMegaChain && typeof window.RbMegaChain.isPending === 'function' && window.RbMegaChain.isPending());
+        const rigBuilderManaged = rigBuilderActive || rigBuilderPending;
+        const rigBuilderState = rigBuilderPending ? 'loading' : 'loaded';
         if (!api || typeof api.inspectRoute !== 'function') {
-            return rigBuilderActive ? { route: { state: 'loaded' }, provider: null, providerId: 'rig_builder.effects', state: 'loaded' } : null;
+            return rigBuilderManaged ? { route: { state: rigBuilderState }, provider: null, providerId: 'rig_builder.effects', state: rigBuilderState } : null;
         }
         let route = null;
         let provider = null;
@@ -2335,12 +2338,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }
         const providerId = String(route?.providerId || provider?.providerId || '').trim();
         const state = String(route?.state || '').trim();
-        if ((!providerId || providerId === 'nam-tone') && rigBuilderActive) {
-            return { route: route || { state: 'loaded' }, provider, providerId: 'rig_builder.effects', state: 'loaded' };
+        if ((!providerId || providerId === 'nam-tone') && rigBuilderManaged) {
+            return { route: route || { state: rigBuilderState }, provider, providerId: 'rig_builder.effects', state: rigBuilderState };
         }
-        if (!providerId || providerId === 'nam-tone' || !['selected', 'resolved', 'loaded', 'degraded'].includes(state)) return null;
+        if (!providerId || providerId === 'nam-tone' || !['selected', 'resolved', 'loaded', 'degraded', 'loading'].includes(state)) return null;
         return { route, provider, providerId, state };
     }
+
+    window._aeInspectProviderManagedChain = inspectProviderManagedAudioEffectsRoute;
 
     function summarizeActiveProviderManagedRoute() {
         const inspected = inspectProviderManagedAudioEffectsRoute();
@@ -2348,7 +2353,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         const route = inspected.route || {};
         const planSummary = route.planSummary || {};
         const stageCount = Number(planSummary.stageCount || 0);
-        const label = stageCount > 0 ? `${stageCount} loaded stage${stageCount === 1 ? '' : 's'}` : inspected.state;
+        const label = inspected.state === 'loading'
+            ? 'Loading chain'
+            : (stageCount > 0 ? `${stageCount} loaded stage${stageCount === 1 ? '' : 's'}` : inspected.state);
         return {
             providerId: inspected.providerId,
             providerLabel: String(inspected.provider?.label || '').trim() || audioEffectsProviderLabel(inspected.providerId),
@@ -3788,7 +3795,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     async function resolveChainRebuildGuard() {
         const api = window.slopsmithDesktop?.audio;
         if (!api) return;
-        if (window._aeHasProviderManagedChain && window._aeHasProviderManagedChain()) {
+        const providerRoute = window._aeInspectProviderManagedChain && window._aeInspectProviderManagedChain();
+        if (providerRoute) {
+            if (providerRoute.state === 'loading') return;
             aeSetMonitorMuteSuppressed(false);
             return;
         }
