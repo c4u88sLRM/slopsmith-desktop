@@ -18,3 +18,9 @@ export const IPC_UPDATE_APPLY = 'update:apply' as const;
 // update-manager broadcaster and the preload listeners can't drift.
 export const IPC_UPDATE_EVENT_AVAILABLE = 'update:available' as const;
 export const IPC_UPDATE_EVENT_DOWNLOADED = 'update:downloaded' as const;
+
+// Screen wake lock. The renderer (slopsmith core app.js) asks the main process
+// to keep the display awake while a song plays — embedded Chromium does not
+// honour the renderer's navigator.wakeLock reliably, so we drive Electron's
+// powerSaveBlocker here instead. See slopsmith/slopsmith#686.
+export const IPC_POWER_SET_SCREEN_AWAKE = 'power:setScreenAwake' as const;

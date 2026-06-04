@@ -56,7 +56,7 @@ if (process.platform !== 'linux') {
 }
 // ──────────────────────────────────────────────────────────────────────────
 
-import { app, BrowserWindow, ipcMain, dialog, shell, session, crashReporter } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, session, crashReporter, powerSaveBlocker } from 'electron';
 import * as path from 'path';
 
 // Enable Electron's Crashpad to capture native crashes (incl. VST/JUCE C++
@@ -79,6 +79,7 @@ import {
     IPC_UPDATE_SET_CHANNEL,
     IPC_UPDATE_CHECK_NOW,
     IPC_UPDATE_APPLY,
+    IPC_POWER_SET_SCREEN_AWAKE,
 } from './ipc-channels';
 import { initAudioBridge, shutdownAudio } from './audio-bridge';
 import { initDebugLogging, isDebugEnabled } from './debug-log';
@@ -790,6 +791,13 @@ async function startup(): Promise<void> {
     ipcMain.handle(IPC_UPDATE_CHECK_NOW, () => updateManager.checkNow());
     ipcMain.handle(IPC_UPDATE_APPLY, () => updateManager.applyAndRestart());
 
+    // Keep the display awake while a song plays (slopsmith/slopsmith#686). The
+    // renderer toggles this via window.slopsmithDesktop.power.setScreenAwake on
+    // play/pause; the single OS blocker is refcounted across renderers below.
+    ipcMain.handle(IPC_POWER_SET_SCREEN_AWAKE, (event, keep: unknown) => {
+        setRendererScreenAwake(event.sender, keep === true);
+    });
+
     // Boot the updater after the main window exists so the first
     // update:available / update:downloaded broadcast has a renderer to land
     // in. Renderer will call setChannel() once it reads localStorage.
@@ -825,10 +833,53 @@ app.on('before-quit', () => {
     shutdown();
 });
 
+// Screen wake lock (slopsmith/slopsmith#686). The single OS powerSaveBlocker is
+// held while at least one renderer wants the screen awake (a song is playing in
+// it). Renderers are refcounted in a set so a multi-window setup (the main
+// window plus a same-origin popout) stays correct — one window pausing must not
+// drop the blocker while another is still playing.
+let powerBlockerId: number | null = null;
+const powerAwakeRenderers = new Set<Electron.WebContents>();
+const powerCleanupWired = new WeakSet<Electron.WebContents>();
+
+function syncPowerBlocker(): void {
+    if (powerAwakeRenderers.size > 0) {
+        if (powerBlockerId === null || !powerSaveBlocker.isStarted(powerBlockerId)) {
+            powerBlockerId = powerSaveBlocker.start('prevent-display-sleep');
+        }
+    } else if (powerBlockerId !== null) {
+        if (powerSaveBlocker.isStarted(powerBlockerId)) powerSaveBlocker.stop(powerBlockerId);
+        powerBlockerId = null;
+    }
+}
+
+function setRendererScreenAwake(wc: Electron.WebContents, keep: boolean): void {
+    if (keep) {
+        powerAwakeRenderers.add(wc);
+        // Drop this renderer's hold if it reloads, crashes, or its window closes
+        // before sending setScreenAwake(false), so the blocker can't outlive its
+        // playback. Listeners are persistent (.on) so repeated reloads/crashes on
+        // the same WebContents keep cleaning up; wired once per WebContents so
+        // play/pause cycles don't pile up duplicates.
+        if (!powerCleanupWired.has(wc)) {
+            powerCleanupWired.add(wc);
+            const drop = () => { powerAwakeRenderers.delete(wc); syncPowerBlocker(); };
+            wc.on('did-start-loading', drop); // reload / navigation
+            wc.on('render-process-gone', drop); // renderer crash (may recur)
+            wc.on('destroyed', drop); // window closed
+        }
+    } else {
+        powerAwakeRenderers.delete(wc);
+    }
+    syncPowerBlocker();
+}
+
 function shutdown(): void {
     try {
         console.log('[main] Shutting down...');
     } catch { /* console may already be gone mid-teardown */ }
+    powerAwakeRenderers.clear();
+    syncPowerBlocker();
     updateManager.shutdown();
     shutdownAudio();
     stopPython();

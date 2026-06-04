@@ -14,6 +14,7 @@ import {
     IPC_UPDATE_APPLY,
     IPC_UPDATE_EVENT_AVAILABLE,
     IPC_UPDATE_EVENT_DOWNLOADED,
+    IPC_POWER_SET_SCREEN_AWAKE,
 } from './ipc-channels';
 
 // Auto-update channel + event payloads. Kept here (rather than re-exported
@@ -406,6 +407,13 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
             ipcRenderer.on(IPC_UPDATE_EVENT_DOWNLOADED, listener);
             return () => ipcRenderer.removeListener(IPC_UPDATE_EVENT_DOWNLOADED, listener);
         },
+    },
+    // Keep the OS display/screensaver awake while a song plays. slopsmith core
+    // app.js calls setScreenAwake(true) on play and (false) on pause/stop;
+    // embedded Chromium ignores the renderer's navigator.wakeLock, so the main
+    // process drives powerSaveBlocker instead (slopsmith/slopsmith#686).
+    power: {
+        setScreenAwake: (keep: boolean) => ipcRenderer.invoke(IPC_POWER_SET_SCREEN_AWAKE, keep),
     },
 });
 
