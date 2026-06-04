@@ -78,12 +78,14 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('function shouldShowPlayerChainButton()'), true);
     assert.equal(source.includes("String(inspected?.providerId || '').trim() === 'nam-tone'"), true);
     assert.equal(source.includes('window._aeShouldShowPlayerChainButton'), true);
+    assert.equal(source.includes('window._aeInjectPlayerToneButton = injectPlayerToneButton'), true);
     assert.equal(source.includes('function removePlayerChainButton()'), true);
     assert.equal(source.includes("document.getElementById('btn-chain-switch')"), true);
     assert.equal(source.includes('if (!shouldShowPlayerChainButton())'), true);
+    assert.equal((source.match(/btn\.id = 'btn-chain-switch'/g) || []).length, 1);
     assert.equal(source.includes('refreshChainButtonForRouteOwner'), true);
     assert.equal(source.includes('window.slopsmith.on(\'audio-effects:released\', refreshChainButtonForRouteOwner);'), true);
-    assert.equal(source.includes('if (window._aeShouldShowPlayerChainButton && !window._aeShouldShowPlayerChainButton())'), true);
+    assert.equal(source.includes('if (window._aeInjectPlayerToneButton) window._aeInjectPlayerToneButton();'), true);
     assert.equal(source.includes('inspectProviderManagedAudioEffectsRoute'), true);
     assert.equal(source.includes('window._aeInspectProviderManagedChain'), true);
     assert.equal(source.includes('summarizeActiveProviderManagedRoute'), true);

@@ -2791,6 +2791,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         if (closeBtn) controls.insertBefore(btn, closeBtn);
         else controls.appendChild(btn);
     }
+    window._aeInjectPlayerToneButton = injectPlayerToneButton;
 
     window._toggleChainPanel = toggleTonePanel;
     function closeTonePanel() {
@@ -3989,29 +3990,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // Inject Chain button
         setTimeout(() => {
             if (hookState.toneAutoLoadGeneration !== generation) return;
-            if (window._aeShouldShowPlayerChainButton && !window._aeShouldShowPlayerChainButton()) {
-                const existing = document.getElementById('btn-chain-switch');
-                if (existing) existing.remove();
-                if (window._closeChainPanel) window._closeChainPanel();
-                return;
-            }
-            const controls = document.getElementById('player-controls');
-            if (!controls || document.getElementById('btn-chain-switch')) return;
-            const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
-            if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
-                closeBtn.addEventListener('click', () => {
-                    if (window._closeChainPanel) window._closeChainPanel();
-                    if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('player-exit');
-                }, { capture: true });
-                closeBtn.dataset.chainPanelCloseBound = '1';
-            }
-            const btn = document.createElement('button');
-            btn.id = 'btn-chain-switch';
-            btn.className = 'px-3 py-1.5 bg-orange-900/40 hover:bg-orange-900/60 rounded-lg text-xs text-orange-300 transition';
-            btn.textContent = 'Chain';
-            btn.onclick = () => window._toggleChainPanel && window._toggleChainPanel();
-            if (closeBtn) controls.insertBefore(btn, closeBtn);
-            else controls.appendChild(btn);
+            if (window._aeInjectPlayerToneButton) window._aeInjectPlayerToneButton();
         }, 500);
 
         // Start tone monitoring and preload presets after WebSocket delivers tone data
@@ -4433,32 +4412,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     }
     installToneAutoLifecycle();
 
-    // Inject Chain button immediately at startup so it's always visible in the
-    // player controls — don't wait for the first song play.
+    // Re-run the shared Chain button owner check after startup and route changes.
     function tryInjectChainButton() {
-        const controls = document.getElementById('player-controls');
-        if (!window._aeShouldShowPlayerChainButton || !window._aeShouldShowPlayerChainButton()) {
-            const existing = document.getElementById('btn-chain-switch');
-            if (existing) existing.remove();
-            if (window._closeChainPanel) window._closeChainPanel();
-            return;
-        }
-        if (!controls || document.getElementById('btn-chain-switch')) return;
-        const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
-        if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
-            closeBtn.addEventListener('click', () => {
-                if (window._closeChainPanel) window._closeChainPanel();
-                if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('player-exit');
-            }, { capture: true });
-            closeBtn.dataset.chainPanelCloseBound = '1';
-        }
-        const btn = document.createElement('button');
-        btn.id = 'btn-chain-switch';
-        btn.className = 'px-3 py-1.5 bg-orange-900/40 hover:bg-orange-900/60 rounded-lg text-xs text-orange-300 transition';
-        btn.textContent = 'Chain';
-        btn.onclick = () => window._toggleChainPanel && window._toggleChainPanel();
-        if (closeBtn) controls.insertBefore(btn, closeBtn);
-        else controls.appendChild(btn);
+        if (window._aeInjectPlayerToneButton) window._aeInjectPlayerToneButton();
     }
     function refreshChainButtonForRouteOwner() {
         setTimeout(tryInjectChainButton, 0);

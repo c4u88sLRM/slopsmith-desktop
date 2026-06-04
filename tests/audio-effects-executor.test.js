@@ -102,6 +102,7 @@ test('audio-effects executor owns load mute, route gain, start, and release', as
         getChainState: () => [{ id: 10 }, { id: 11 }],
         isMonitorMuted: () => { calls.push(['is-muted']); return true; },
         setMonitorMute: muted => { calls.push(['monitor', muted]); return true; },
+        setMonitorMuteSuppressed: suppressed => { calls.push(['suppress', suppressed]); return true; },
         setGain: (which, value) => { calls.push(['gain', which, value]); return true; },
         startAudio: () => { calls.push(['start']); return true; },
     };
@@ -138,7 +139,9 @@ test('audio-effects executor owns load mute, route gain, start, and release', as
     ]);
     assert.equal(calls.some(call => call[0] === 'clear'), true);
     assert.equal(calls.some(call => call[0] === 'monitor' && call[1] === true), true);
-    assert.equal(calls.some(call => call[0] === 'gain' && call[1] === 'chain' && call[2] === 4), true);
+    assert.equal(calls.some(call => call[0] === 'suppress' && call[1] === false), true);
+    assert.equal(calls.some(call => call[0] === 'gain' && call[1] === 'chain' && call[2] === 4), false);
+    assert.equal(calls.some(call => call[0] === 'gain' && call[1] === 'chain' && call[2] === 0), true);
 });
 
 test('audio-effects executor rejects unauthorised, missing, and raw-path-like plans before native load', async () => {
