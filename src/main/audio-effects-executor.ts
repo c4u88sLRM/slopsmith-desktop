@@ -44,6 +44,7 @@ type ValidStage = {
 type ValidSegment = {
     segmentId: string;
     stageIds: string[];
+    stageBypass: Record<string, boolean>;
 };
 
 type ValidPlan = {
@@ -284,9 +285,16 @@ function validatePlan(request: unknown): { ok: true; plan: ValidPlan; presetJson
     const nativeStageIds = stages.filter((stage) => stage.native).map((stage) => stage.stageId);
     const segments: ValidSegment[] = asArray(planInput.segments).slice(0, MAX_SEGMENTS).map((segment, index) => {
         const item = asRecord(segment) || {};
+        const rawStageBypass = asRecord(item.stageBypass) || asRecord(item.stageBypasses) || asRecord(item.bypassByStage) || {};
+        const stageBypass: Record<string, boolean> = {};
+        for (const [stageId, bypassed] of Object.entries(rawStageBypass)) {
+            const safeStageId = safeId(stageId, '');
+            if (nativeStageIds.includes(safeStageId)) stageBypass[safeStageId] = safeBool(bypassed, false);
+        }
         return {
             segmentId: safeId(item.segmentId ?? item.toneKey ?? item.id ?? `segment-${index}`, `segment-${index}`),
             stageIds: asArray(item.stageIds ?? item.stages).map((value) => safeId(value, '')).filter((value) => nativeStageIds.includes(value)),
+            stageBypass,
         };
     });
 
@@ -477,7 +485,9 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         const active = new Set(segment.stageIds);
         const changes = Array.from(route.stageSlots.entries()).map(([stageId, slotId]) => ({
             slotId,
-            bypassed: !active.has(stageId),
+            bypassed: active.has(stageId)
+                ? (Object.prototype.hasOwnProperty.call(segment.stageBypass, stageId) ? segment.stageBypass[stageId] : false)
+                : true,
         }));
         try {
             const result = await nativeAudio.setMultiBypass(changes);

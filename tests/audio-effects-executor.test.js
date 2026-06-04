@@ -43,7 +43,7 @@ function plan(overrides = {}) {
             { stageId: 'pre', kind: 'nam', role: 'pre-pedal', assetRef: 'asset:pre' },
             { stageId: 'cab', kind: 'ir', role: 'cab', assetRef: 'asset:cab', bypassed: true },
         ],
-        segments: [{ segmentId: 'lead', stageIds: ['pre'] }],
+        segments: [{ segmentId: 'lead', stageIds: ['pre'], stageBypass: { pre: true } }],
         ...overrides,
     };
 }
@@ -86,7 +86,7 @@ test('audio-effects executor validates and loads a trusted chain plan without le
     assert.equal(bypass.outcome, 'handled');
     assert.equal(param.outcome, 'handled');
     assert.deepEqual(calls[0].map(stage => stage.type), [1, 2]);
-    assert.deepEqual(calls[1], ['multi', [{ slotId: 10, bypassed: false }, { slotId: 11, bypassed: true }]]);
+    assert.deepEqual(calls[1], ['multi', [{ slotId: 10, bypassed: true }, { slotId: 11, bypassed: true }]]);
     assert.equal(encoded.includes(namPath), false);
     assert.equal(encoded.includes(irPath), false);
     assert.equal(encoded.includes('asset:pre'), false);
