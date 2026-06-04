@@ -2124,6 +2124,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     let autoSwitchEnabled = localStorage.getItem('slopsmith-tone-auto-switch') === 'true';
     const originalToneNamesCache = new Map();
     let midiAmpSongTonesUnavailable = false;
+    const midiAmpSongTonesPending = new Map();
 
     class ToneSwitcher {
         constructor() {
@@ -2316,7 +2317,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     function inspectProviderManagedAudioEffectsRoute() {
         const api = window.slopsmith?.audioEffects;
-        if (!api || typeof api.inspectRoute !== 'function') return null;
+        const rigBuilderActive = !!(window.RbMegaChain && typeof window.RbMegaChain.isActive === 'function' && window.RbMegaChain.isActive());
+        if (!api || typeof api.inspectRoute !== 'function') {
+            return rigBuilderActive ? { route: { state: 'loaded' }, provider: null, providerId: 'rig_builder.effects', state: 'loaded' } : null;
+        }
         let route = null;
         let provider = null;
         try {
@@ -2329,6 +2333,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         }
         const providerId = String(route?.providerId || provider?.providerId || '').trim();
         const state = String(route?.state || '').trim();
+        if ((!providerId || providerId === 'nam-tone') && rigBuilderActive) {
+            return { route: route || { state: 'loaded' }, provider, providerId: 'rig_builder.effects', state: 'loaded' };
+        }
         if (!providerId || providerId === 'nam-tone' || !['selected', 'resolved', 'loaded', 'degraded'].includes(state)) return null;
         return { route, provider, providerId, state };
     }
@@ -2487,6 +2494,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     async function fetchMidiAmpSongTones(key) {
         if (!key || !hasMidiAmpSongTonesEndpoint()) return [];
+        if (midiAmpSongTonesPending.has(key)) return midiAmpSongTonesPending.get(key);
+        const pending = (async () => {
         try {
             const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
             if (resp.status === 404) {
@@ -2498,6 +2507,13 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             return Array.isArray(data?.tones) ? data.tones : [];
         } catch (_) {
             return [];
+        }
+        })();
+        midiAmpSongTonesPending.set(key, pending);
+        try {
+            return await pending;
+        } finally {
+            midiAmpSongTonesPending.delete(key);
         }
     }
 

@@ -78,6 +78,8 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('inspectProviderManagedAudioEffectsRoute'), true);
     assert.equal(source.includes('summarizeActiveProviderManagedRoute'), true);
     assert.equal(source.includes('summarizeProviderManagedMappings(await fetchAudioEffectMappingsForSong(songKey)) || summarizeActiveProviderManagedRoute()'), true);
+    assert.equal(source.includes('window.RbMegaChain'), true);
+    assert.equal(source.includes("providerId: 'rig_builder.effects'"), true);
     assert.equal(source.includes('Provider-managed audio-effects chain active'), true);
     assert.equal(source.includes("const panelMode = providerManaged ? 'provider'"), true);
     assert.equal(source.includes('if (!providerManaged && toneNamesOrdered.length > 0)'), true);
@@ -88,6 +90,7 @@ test('legacy midi_amp tone lookup is guarded by plugin availability', () => {
 
     assert.equal(source.includes('hasMidiAmpSongTonesEndpoint'), true);
     assert.equal(source.includes('midiAmpSongTonesUnavailable'), true);
+    assert.equal(source.includes('midiAmpSongTonesPending'), true);
     assert.equal(source.includes('document.querySelector(\'[data-plugin-id="midi_amp"]\')'), true);
     assert.equal(source.includes('resp.status === 404'), true);
     assert.equal(source.includes('fetchMidiAmpSongTones(key)'), true);
