@@ -2257,6 +2257,59 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         const songMappings = songKey ? (all.songs[songKey] || {}) : {};
         return { ...all.global, ...songMappings };
     }
+
+    const AUDIO_EFFECTS_PROVIDER_LABELS = {
+        'rig_builder.effects': 'Rig Builder',
+        'rig-builder': 'Rig Builder',
+        'nam-tone': 'NAM Tone',
+    };
+
+    function audioEffectsProviderId(row) {
+        return String(row?.provider_id || row?.providerId || '').trim();
+    }
+
+    function audioEffectsProviderLabel(providerId) {
+        const id = String(providerId || '').trim();
+        if (!id) return 'Audio Effects Provider';
+        return AUDIO_EFFECTS_PROVIDER_LABELS[id] || id.replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    async function fetchAudioEffectMappingsForSong(songKey) {
+        const key = normalizeSongKey(songKey);
+        const filename = normalizeSongKey(window._currentSongFile || window.__rbPlaybackSettingsFilename);
+        if (!key && !filename) return [];
+        const params = new URLSearchParams();
+        if (key) params.set('song_key', key);
+        if (filename && filename !== key) params.set('filename', filename);
+        try {
+            const resp = await fetch(`/api/audio-effects/mappings?${params.toString()}`);
+            if (!resp.ok) return [];
+            const data = await resp.json().catch(() => ({}));
+            return Array.isArray(data?.mappings) ? data.mappings : [];
+        } catch (e) {
+            console.warn('[audio-engine] audio-effects mappings read failed:', e);
+            return [];
+        }
+    }
+
+    function activeProviderManagedMappings(rows) {
+        return (Array.isArray(rows) ? rows : [])
+            .filter(row => row && row.active && audioEffectsProviderId(row));
+    }
+
+    function summarizeProviderManagedMappings(rows) {
+        const active = activeProviderManagedMappings(rows);
+        if (active.length === 0) return null;
+        const providerId = audioEffectsProviderId(active.find(row => audioEffectsProviderId(row) === 'rig_builder.effects') || active[0]);
+        const providerRows = active.filter(row => audioEffectsProviderId(row) === providerId);
+        return {
+            providerId,
+            providerLabel: audioEffectsProviderLabel(providerId),
+            rows: providerRows,
+            toneCount: new Set(providerRows.map(row => String(row?.tone_key || row?.toneKey || '').trim()).filter(Boolean)).size,
+        };
+    }
+
     function cloneToneMappingBucket(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
         return JSON.parse(JSON.stringify(value));
@@ -2682,6 +2735,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         let presetNames = [];
         let songKey = '';
         let mappings = {};
+        let providerManaged = null;
         let midiConfig = null;
         let isMidiMode = false;
         const toneNamesOrdered = [];
@@ -2719,6 +2773,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 console.warn('[audio-engine] tone mappings JSON invalid:', e);
                 mappings = {};
             }
+            providerManaged = summarizeProviderManagedMappings(await fetchAudioEffectMappingsForSong(songKey));
             try {
                 midiConfig = getMidiPCConfig(songKey);
             } catch (e) {
@@ -2766,8 +2821,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // thread synchronously (timers then never run).
         const midiMappings = midiConfig?.mappings || {};
         const taCfg = readTaStore();
-        /** Which switching UI is active: automation wins over MIDI when enabled in settings. */
-        const panelMode = taCfg.enabled ? 'automation' : (isMidiMode ? 'midi' : 'bypass');
+        /** Which switching UI is active: provider-managed chains win over legacy local mappings. */
+        const panelMode = providerManaged ? 'provider' : (taCfg.enabled ? 'automation' : (isMidiMode ? 'midi' : 'bypass'));
 
         let html = `<div class="flex items-center justify-between mb-3">
             <span class="text-sm font-semibold text-slate-200">Tone Switching</span>
@@ -2780,17 +2835,37 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             for (const n of originalNames) addToneUnique(n);
         }
 
-        // Mode selector — Preset Switch | MIDI PC | Tone Automation (keyword routing from settings)
-        html += `<div class="flex items-center gap-2 mb-3">
-            <label class="text-xs text-slate-400">Mode:</label>
-            <select id="ae-tone-mode" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
-                <option value="bypass" ${panelMode === 'bypass' ? 'selected' : ''}>Preset Switch</option>
-                <option value="midi" ${panelMode === 'midi' ? 'selected' : ''}>MIDI Program Change</option>
-                <option value="automation" ${panelMode === 'automation' ? 'selected' : ''}>Tone Automation</option>
-            </select>
-        </div>`;
+        if (providerManaged) {
+            html += `<div id="ae-provider-mode" class="mb-3">
+                <div class="border-l-2 border-emerald-400 pl-3 mb-3">
+                    <div class="text-[10px] uppercase tracking-wider text-slate-500 font-semibold mb-1">Chain Provider</div>
+                    <div class="text-sm font-semibold text-slate-200">${escHtml(providerManaged.providerLabel)}</div>
+                    <div class="text-[11px] text-slate-500">${providerManaged.toneCount || providerManaged.rows.length} mapped tone${(providerManaged.toneCount || providerManaged.rows.length) === 1 ? '' : 's'} for this song</div>
+                </div>
+                <div class="space-y-1 mb-3">${providerManaged.rows.map(row => {
+                    const tone = String(row?.tone_key || row?.toneKey || '').trim() || 'Song default';
+                    const rawLabel = String(row?.label || '').trim();
+                    const label = providerManaged.providerId === 'rig_builder.effects' ? 'Full chain' : (rawLabel || providerManaged.providerLabel);
+                    return `<div class="flex items-center gap-2 text-xs">
+                        <span class="text-slate-400 w-24 truncate" title="${escHtml(tone)}">${escHtml(tone)}</span>
+                        <span class="flex-1 text-emerald-300 truncate" title="${escHtml(label)}">${escHtml(label)}</span>
+                    </div>`;
+                }).join('')}</div>
+                ${providerManaged.providerId === 'rig_builder.effects' ? '<button type="button" id="ae-open-rig-builder" class="px-3 py-1.5 rounded bg-emerald-600/50 hover:bg-emerald-500 text-xs text-slate-200">Open Rig Builder</button>' : ''}
+            </div>`;
+        } else {
+            // Mode selector — Preset Switch | MIDI PC | Tone Automation (keyword routing from settings)
+            html += `<div class="flex items-center gap-2 mb-3">
+                <label class="text-xs text-slate-400">Mode:</label>
+                <select id="ae-tone-mode" class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+                    <option value="bypass" ${panelMode === 'bypass' ? 'selected' : ''}>Preset Switch</option>
+                    <option value="midi" ${panelMode === 'midi' ? 'selected' : ''}>MIDI Program Change</option>
+                    <option value="automation" ${panelMode === 'automation' ? 'selected' : ''}>Tone Automation</option>
+                </select>
+            </div>`;
+        }
 
-        if (toneNamesOrdered.length > 0) {
+        if (!providerManaged && toneNamesOrdered.length > 0) {
 
             // Bypass mode — manual preset mapping per tone name
             html += `<div id="ae-bypass-mode" class="${panelMode === 'bypass' ? '' : 'hidden'}">`;
@@ -2856,7 +2931,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             html += '</div>';
             html += `<button id="ae-midi-save" class="px-3 py-1.5 rounded bg-emerald-600/50 hover:bg-emerald-500 text-xs text-slate-200">Save MIDI Mapping</button>`;
             html += '</div>';
-        } else {
+        } else if (!providerManaged) {
             // Keep mode-section ids so the Mode dropdown can show/hide bodies even
             // when this arrangement exposes no tone rows yet.
             html += `<div id="ae-bypass-mode" class="${panelMode === 'bypass' ? '' : 'hidden'}"><p class="text-xs text-slate-500 italic">No tone information found for this song.</p></div>`;
@@ -2864,10 +2939,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             html += `<div id="ae-midi-mode" class="${panelMode === 'midi' ? '' : 'hidden'}"><p class="text-xs text-slate-500 italic">No tones to assign MIDI program numbers.</p></div>`;
         }
 
-        html += `<label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer mb-2 mt-2">
-            <input type="checkbox" class="accent-blue-500" id="ae-float-auto-switch" ${autoSwitchEnabled ? 'checked' : ''}>
-            Auto-switch during playback
-        </label>`;
+        if (!providerManaged) {
+            html += `<label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer mb-2 mt-2">
+                <input type="checkbox" class="accent-blue-500" id="ae-float-auto-switch" ${autoSwitchEnabled ? 'checked' : ''}>
+                Auto-switch during playback
+            </label>`;
+        }
         html += `<div class="mt-3 pt-2 border-t border-slate-700/60">
             <div class="text-[10px] uppercase tracking-wider text-slate-500 font-semibold mb-1">Active Indicator</div>
             <div class="text-xs text-slate-300 font-medium min-h-[1rem]" id="ae-active-tone">Active: —</div>
@@ -2931,6 +3008,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         };
         updateActiveToneLabel();
         panel._aeActiveToneInterval = setInterval(updateActiveToneLabel, 200);
+
+        const openRigBuilder = panel.querySelector('#ae-open-rig-builder');
+        if (openRigBuilder) {
+            openRigBuilder.addEventListener('click', () => {
+                window._closeChainPanel && window._closeChainPanel();
+                if (typeof window.showScreen === 'function') window.showScreen('plugin-rig_builder');
+            });
+        }
 
         // Wire up select changes
         panel.querySelectorAll('select[data-tone]').forEach(sel => {

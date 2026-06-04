@@ -63,3 +63,16 @@ test('renderer registers native audio-mix fader participants', () => {
     assert.equal(source.includes("'fader.get-value'"), true);
     assert.equal(source.includes("'fader.set-value'"), true);
 });
+
+test('chain panel summarizes provider-managed audio effects mappings', () => {
+    const source = readText('src/renderer/screen.js');
+
+    assert.equal(source.includes('fetchAudioEffectMappingsForSong'), true);
+    assert.equal(source.includes('/api/audio-effects/mappings?'), true);
+    assert.equal(source.includes('summarizeProviderManagedMappings'), true);
+    assert.equal(source.includes('rig_builder.effects'), true);
+    assert.equal(source.includes('Chain Provider'), true);
+    assert.equal(source.includes('ae-open-rig-builder'), true);
+    assert.equal(source.includes("const panelMode = providerManaged ? 'provider'"), true);
+    assert.equal(source.includes('if (!providerManaged && toneNamesOrdered.length > 0)'), true);
+});
