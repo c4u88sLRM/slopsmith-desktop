@@ -75,6 +75,12 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('ae-open-rig-builder'), true);
     assert.equal(source.includes('hasProviderManagedAudioEffectsChain'), true);
     assert.equal(source.includes('window._aeHasProviderManagedChain'), true);
+    assert.equal(source.includes('function isRigBuilderManagedAudioEffectsRoute()'), true);
+    assert.equal(source.includes('window._aeRigBuilderOwnsChain'), true);
+    assert.equal(source.includes('function removePlayerChainButton()'), true);
+    assert.equal(source.includes("document.getElementById('btn-chain-switch')"), true);
+    assert.equal(source.includes('if (isRigBuilderManagedAudioEffectsRoute())'), true);
+    assert.equal(source.includes('refreshChainButtonForRouteOwner'), true);
     assert.equal(source.includes('inspectProviderManagedAudioEffectsRoute'), true);
     assert.equal(source.includes('window._aeInspectProviderManagedChain'), true);
     assert.equal(source.includes('summarizeActiveProviderManagedRoute'), true);

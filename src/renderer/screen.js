@@ -2373,6 +2373,13 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     window._aeHasProviderManagedChain = hasProviderManagedAudioEffectsChain;
 
+    function isRigBuilderManagedAudioEffectsRoute() {
+        const inspected = inspectProviderManagedAudioEffectsRoute();
+        return String(inspected?.providerId || '').trim() === 'rig_builder.effects';
+    }
+
+    window._aeRigBuilderOwnsChain = isRigBuilderManagedAudioEffectsRoute;
+
     function cloneToneMappingBucket(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
         return JSON.parse(JSON.stringify(value));
@@ -2753,8 +2760,18 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     }
 
     // ── Floating Tone Panel in Player ──────────────────────────────────────────
+    function removePlayerChainButton() {
+        const existing = document.getElementById('btn-chain-switch');
+        if (existing) existing.remove();
+        closeTonePanel();
+    }
+
     function injectPlayerToneButton() {
         const controls = document.getElementById('player-controls');
+        if (isRigBuilderManagedAudioEffectsRoute()) {
+            removePlayerChainButton();
+            return;
+        }
         if (!controls || document.getElementById('btn-chain-switch')) return;
 
         // Add button before the close button
@@ -2794,6 +2811,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     window._refreshChainPanel = refreshTonePanelIfOpen;
 
     async function toggleTonePanel() {
+        if (isRigBuilderManagedAudioEffectsRoute()) {
+            removePlayerChainButton();
+            return;
+        }
         let panel = document.getElementById('ae-tone-panel-float');
         if (panel) { closeTonePanel(); return; }
 
@@ -4410,6 +4431,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     // player controls — don't wait for the first song play.
     function tryInjectChainButton() {
         const controls = document.getElementById('player-controls');
+        if (window._aeRigBuilderOwnsChain && window._aeRigBuilderOwnsChain()) {
+            const existing = document.getElementById('btn-chain-switch');
+            if (existing) existing.remove();
+            if (window._closeChainPanel) window._closeChainPanel();
+            return;
+        }
         if (!controls || document.getElementById('btn-chain-switch')) return;
         const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
         if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
@@ -4426,6 +4453,15 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         btn.onclick = () => window._toggleChainPanel && window._toggleChainPanel();
         if (closeBtn) controls.insertBefore(btn, closeBtn);
         else controls.appendChild(btn);
+    }
+    function refreshChainButtonForRouteOwner() {
+        setTimeout(tryInjectChainButton, 0);
+    }
+    window.addEventListener('rig-builder:tones-state', refreshChainButtonForRouteOwner);
+    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+        window.slopsmith.on('audio-effects:route-selected', refreshChainButtonForRouteOwner);
+        window.slopsmith.on('audio-effects:changed', refreshChainButtonForRouteOwner);
+        window.slopsmith.on('audio-effects:fallback', refreshChainButtonForRouteOwner);
     }
     // Allow app.js to finish initialising before querying the DOM.
     setTimeout(tryInjectChainButton, 0);
