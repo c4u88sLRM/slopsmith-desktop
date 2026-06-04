@@ -3989,6 +3989,12 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // Inject Chain button
         setTimeout(() => {
             if (hookState.toneAutoLoadGeneration !== generation) return;
+            if (window._aeShouldShowPlayerChainButton && !window._aeShouldShowPlayerChainButton()) {
+                const existing = document.getElementById('btn-chain-switch');
+                if (existing) existing.remove();
+                if (window._closeChainPanel) window._closeChainPanel();
+                return;
+            }
             const controls = document.getElementById('player-controls');
             if (!controls || document.getElementById('btn-chain-switch')) return;
             const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
@@ -4461,6 +4467,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     if (window.slopsmith && typeof window.slopsmith.on === 'function') {
         window.slopsmith.on('audio-effects:route-selected', refreshChainButtonForRouteOwner);
         window.slopsmith.on('audio-effects:changed', refreshChainButtonForRouteOwner);
+        window.slopsmith.on('audio-effects:released', refreshChainButtonForRouteOwner);
         window.slopsmith.on('audio-effects:fallback', refreshChainButtonForRouteOwner);
     }
     // Allow app.js to finish initialising before querying the DOM.

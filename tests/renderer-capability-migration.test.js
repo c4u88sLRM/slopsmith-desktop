@@ -82,6 +82,8 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes("document.getElementById('btn-chain-switch')"), true);
     assert.equal(source.includes('if (!shouldShowPlayerChainButton())'), true);
     assert.equal(source.includes('refreshChainButtonForRouteOwner'), true);
+    assert.equal(source.includes('window.slopsmith.on(\'audio-effects:released\', refreshChainButtonForRouteOwner);'), true);
+    assert.equal(source.includes('if (window._aeShouldShowPlayerChainButton && !window._aeShouldShowPlayerChainButton())'), true);
     assert.equal(source.includes('inspectProviderManagedAudioEffectsRoute'), true);
     assert.equal(source.includes('window._aeInspectProviderManagedChain'), true);
     assert.equal(source.includes('summarizeActiveProviderManagedRoute'), true);
