@@ -2341,7 +2341,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         if ((!providerId || providerId === 'nam-tone') && rigBuilderManaged) {
             return { route: route || { state: rigBuilderState }, provider, providerId: 'rig_builder.effects', state: rigBuilderState };
         }
-        if (!providerId || providerId === 'nam-tone' || !['selected', 'resolved', 'loaded', 'degraded', 'loading'].includes(state)) return null;
+        if (!providerId || providerId === 'nam-tone' || !['selected', 'resolving', 'resolved', 'loaded', 'degraded', 'loading', 'fallback'].includes(state)) return null;
         return { route, provider, providerId, state };
     }
 
@@ -2353,9 +2353,11 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         const route = inspected.route || {};
         const planSummary = route.planSummary || {};
         const stageCount = Number(planSummary.stageCount || 0);
-        const label = ['selected', 'resolving', 'loading'].includes(inspected.state)
-            ? 'Loading chain'
-            : (stageCount > 0 ? `${stageCount} loaded stage${stageCount === 1 ? '' : 's'}` : inspected.state);
+        let label = inspected.state;
+        if (inspected.state === 'fallback') label = 'Chain failed';
+        else if (inspected.state === 'degraded') label = 'Chain degraded';
+        else if (['selected', 'resolving', 'loading'].includes(inspected.state)) label = 'Loading chain';
+        else if (stageCount > 0) label = `${stageCount} loaded stage${stageCount === 1 ? '' : 's'}`;
         return {
             providerId: inspected.providerId,
             providerLabel: String(inspected.provider?.label || '').trim() || audioEffectsProviderLabel(inspected.providerId),
@@ -3797,7 +3799,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         if (!api) return;
         const providerRoute = window._aeInspectProviderManagedChain && window._aeInspectProviderManagedChain();
         if (providerRoute) {
-            if (providerRoute.state === 'loading') return;
+            if (['selected', 'resolving', 'loading', 'fallback'].includes(providerRoute.state)) return;
             aeSetMonitorMuteSuppressed(false);
             return;
         }

@@ -83,6 +83,9 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('RbMegaChain.isPending'), true);
     assert.equal(source.includes("providerId: 'rig_builder.effects'"), true);
     assert.equal(source.includes("const rigBuilderState = rigBuilderPending ? 'selected' : 'loaded'"), true);
+    assert.equal(source.includes("['selected', 'resolving', 'resolved', 'loaded', 'degraded', 'loading', 'fallback'].includes(state)"), true);
+    assert.equal(source.includes("if (inspected.state === 'fallback') label = 'Chain failed'"), true);
+    assert.equal(source.includes("else if (inspected.state === 'degraded') label = 'Chain degraded'"), true);
     assert.equal(source.includes("['selected', 'resolving', 'loading'].includes(inspected.state)"), true);
     assert.equal(source.includes("'loading'") && source.includes('Loading chain'), true);
     assert.equal(source.includes('Provider-managed audio-effects chain active'), true);
@@ -91,7 +94,7 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes('if (providerChainActive) {'), true);
     assert.equal(source.includes('Provider-managed audio-effects chain active — preserving chain, skipping legacy preset preload'), true);
     assert.equal(source.includes('aeSetMonitorMuteSuppressed(false);'), true);
-    assert.equal(source.includes("if (providerRoute.state === 'loading') return;"), true);
+    assert.equal(source.includes("['selected', 'resolving', 'loading', 'fallback'].includes(providerRoute.state)"), true);
     assert.equal(source.includes('let shouldResolveChainRebuildGuard = false;'), true);
     assert.equal(source.includes('if (shouldResolveChainRebuildGuard) await resolveChainRebuildGuard();'), true);
 });
