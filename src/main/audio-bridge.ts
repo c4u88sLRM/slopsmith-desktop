@@ -471,6 +471,23 @@ export function initAudioBridge(): void {
         }
     });
 
+    // Post-noise-gate raw mono audio frame (Float32Array of the most-recent N
+    // samples) so the tuner can run its own tuning-optimised pitch pipeline
+    // instead of the shared YIN detector behind getRawPitch. numSamples is
+    // optional (defaults to 4096; the engine clamps to its ring capacity).
+    // typeof-guarded + try/catch so a downlevel addon (no getRawAudioFrame)
+    // fails soft to an empty array instead of throwing.
+    ipcMain.handle('audio:getRawAudioFrame', (_event, numSamples?: number) => {
+        if (!audio || typeof audio.getRawAudioFrame !== 'function')
+            return new Float32Array(0);
+        try {
+            const n = Number(numSamples);
+            return audio.getRawAudioFrame(Number.isFinite(n) && n > 0 ? n : 4096);
+        } catch {
+            return new Float32Array(0);
+        }
+    });
+
     // Whether the polyphonic ML note detector (Basic Pitch) is active. When
     // false the engine is on the YIN PitchDetector / ChordScorer fallback.
     // typeof-guarded so a downlevel addon simply reports false.

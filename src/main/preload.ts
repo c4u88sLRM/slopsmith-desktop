@@ -227,6 +227,15 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
         // signal, so it goes silent (frequency -1) when the gate is closed.
         getRawPitch: () => ipcRenderer.invoke('audio:getRawPitch'),
 
+        // Post-noise-gate raw mono audio frame (Float32Array of the most-recent
+        // `numSamples` samples, default 4096, left-zero-padded on cold start) so
+        // a tuner can run its own tuning-optimised pitch pipeline instead of the
+        // shared YIN behind getRawPitch. Resolves an empty Float32Array on a
+        // downlevel addon, so the caller feature-detects (length 0) and falls
+        // back to getRawPitch.
+        getRawAudioFrame: (numSamples?: number): Promise<Float32Array> =>
+            ipcRenderer.invoke('audio:getRawAudioFrame', numSamples),
+
         // Whether the ML note detector (Basic Pitch) is active vs. the YIN
         // fallback. Resolves false on a downlevel addon.
         isMlNoteDetection: (): Promise<boolean> => ipcRenderer.invoke('audio:isMlNoteDetection'),

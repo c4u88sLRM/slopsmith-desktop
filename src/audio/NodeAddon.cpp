@@ -835,6 +835,30 @@ static Napi::Value GetRawPitchDetection(const Napi::CallbackInfo& info)
     return obj;
 }
 
+static Napi::Value GetRawAudioFrame(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+
+    // Optional sample count; defaults to AudioEngine::getRawAudioFrame's 4096.
+    // The engine clamps anything above its ring capacity.
+    int numSamples = 4096;
+    if (info.Length() > 0 && info[0].IsNumber())
+        numSamples = info[0].As<Napi::Number>().Int32Value();
+
+    if (!liveEngine || numSamples <= 0)
+        return Napi::Float32Array::New(env, 0);
+
+    // Post-gate mono snapshot for the tuner's own pitch pipeline. Returns a
+    // Float32Array of the most-recent N samples (left-zero-padded on cold start).
+    auto frame = liveEngine->getRawAudioFrame(numSamples);
+    auto out = Napi::Float32Array::New(env, frame.size());
+    float* dst = out.Data();
+    for (size_t i = 0; i < frame.size(); ++i)
+        dst[i] = frame[i];
+    return out;
+}
+
 // Score a polyphonic chord against the engine's most recent input
 // samples. Renderer (notedetect plugin's matchNotes chord branch)
 // supplies the chord context — chart notes plus tuning/arrangement
@@ -2668,6 +2692,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     // Pitch detection
     exports.Set("getPitchDetection", Napi::Function::New(env, GetPitchDetection));
     exports.Set("getRawPitchDetection", Napi::Function::New(env, GetRawPitchDetection));
+    exports.Set("getRawAudioFrame", Napi::Function::New(env, GetRawAudioFrame));
     exports.Set("scoreChord", Napi::Function::New(env, ScoreChord));
     exports.Set("setChart", Napi::Function::New(env, SetChart));
     exports.Set("getNoteVerdicts", Napi::Function::New(env, GetNoteVerdicts));

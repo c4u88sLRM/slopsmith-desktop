@@ -74,6 +74,23 @@ if (audio) {
                 assert.ok(k in d, `detection has ${k}`);
         });
 
+        await t.test('getRawAudioFrame returns a sized Float32Array', () => {
+            assert.equal(typeof audio.getRawAudioFrame, 'function',
+                'addon exposes getRawAudioFrame');
+            // No device running, so the post-gate ring is empty: cold-start
+            // returns a zero-filled frame of exactly the requested length.
+            const frame = audio.getRawAudioFrame(2048);
+            assert.ok(frame instanceof Float32Array, 'returns a Float32Array');
+            assert.equal(frame.length, 2048, 'honours the requested sample count');
+            // Default (no arg) matches the 4096 default.
+            assert.equal(audio.getRawAudioFrame().length, 4096, 'defaults to 4096 samples');
+            // Over-large requests clamp to the ring capacity (16384), never throw.
+            assert.equal(audio.getRawAudioFrame(1 << 20).length, 16384,
+                'clamps to the ring capacity');
+            // Non-positive requests yield an empty frame.
+            assert.equal(audio.getRawAudioFrame(0).length, 0, 'zero samples → empty');
+        });
+
         await t.test('scoreChord keeps its shape (no device running)', () => {
             const res = audio.scoreChord({
                 arrangement: 'guitar',

@@ -1442,6 +1442,11 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     for (auto& slot : inputFrameRing)
         slot.store(0.0f, std::memory_order_relaxed);
 
+    // Same clean cold-start for the post-gate tuner ring.
+    rawAudioRingWriteIndex.store(0, std::memory_order_relaxed);
+    for (auto& slot : rawAudioRing)
+        slot.store(0.0f, std::memory_order_relaxed);
+
     // Pre-size the zero-output capture scratch to this device's block
     // size so the audio thread doesn't allocate when we hit that path.
     // For the common output > 0 case this storage stays unused.
@@ -1494,6 +1499,7 @@ void AudioEngine::audioDeviceStopped()
     mlNoteDetector.stop();
     noteVerifier.stop();
     inputFrameRingWriteIndex.store(0, std::memory_order_relaxed);
+    rawAudioRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingReadIndex.store(0, std::memory_order_relaxed);
     audioRunning.store(false, std::memory_order_relaxed);
@@ -1749,6 +1755,8 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         {
             // monoSource aliases buffer ch0, which the gate just processed in place.
             pitchDetector.pushSamples(monoSource, numSamples);
+            // Same post-gate samples feed the tuner's raw-audio ring.
+            pushRawAudioFrame(monoSource, numSamples);
         }
         else
         {
@@ -1762,6 +1770,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             juce::AudioBuffer<float> scratchGate(&scratchPtr, 1, numSamples);
             noiseGate.processBlock(scratchGate);
             pitchDetector.pushSamples(scratchPtr, numSamples);
+            pushRawAudioFrame(scratchPtr, numSamples);
         }
     }
 
@@ -2077,6 +2086,49 @@ uint64_t AudioEngine::getInputSince(uint64_t fromIndex, std::vector<float>& out)
     for (size_t i = 0; i < n; ++i)
         out[i] = inputFrameRing[(start + (uint64_t) i) & kMask].load(std::memory_order_relaxed);
     return w;
+}
+
+void AudioEngine::pushRawAudioFrame(const float* data, int numSamples) noexcept
+{
+    // Audio thread only. Relaxed per-slot stores (a concurrent reader that laps
+    // mid-snapshot would otherwise be a data race); the release store on the
+    // write index publishes the samples to getRawAudioFrame()'s acquire load.
+    const uint64_t w = rawAudioRingWriteIndex.load(std::memory_order_relaxed);
+    constexpr uint64_t kMask = (uint64_t) kRawAudioRingCapacity - 1;
+    for (int i = 0; i < numSamples; ++i)
+        rawAudioRing[(w + (uint64_t) i) & kMask].store(data[i], std::memory_order_relaxed);
+    rawAudioRingWriteIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
+}
+
+std::vector<float> AudioEngine::getRawAudioFrame(int numSamples) const
+{
+    if (numSamples <= 0) return {};
+    if (numSamples > kRawAudioRingCapacity)
+        numSamples = kRawAudioRingCapacity;
+
+    // Acquire pairs with the audio thread's release store of the write index:
+    // every sample written into the ring before that index is visible here.
+    const uint64_t w = rawAudioRingWriteIndex.load(std::memory_order_acquire);
+    std::vector<float> out((size_t) numSamples, 0.0f);
+
+    // Cold-start: audio thread hasn't filled `numSamples` yet. Return what we
+    // have, zero-padded on the left so the most-recent samples land at the end
+    // (a tuner's pitch algorithm expects time-aligned data).
+    if (w < (uint64_t) numSamples)
+    {
+        const size_t available = (size_t) w;
+        for (size_t i = 0; i < available; ++i)
+            out[(size_t) numSamples - available + i]
+                = rawAudioRing[i].load(std::memory_order_relaxed);
+        return out;
+    }
+
+    constexpr uint64_t kMask = (uint64_t) kRawAudioRingCapacity - 1;
+    const uint64_t start = w - (uint64_t) numSamples;
+    for (int i = 0; i < numSamples; ++i)
+        out[(size_t) i]
+            = rawAudioRing[(start + (uint64_t) i) & kMask].load(std::memory_order_relaxed);
+    return out;
 }
 
 // ── ML note detection ─────────────────────────────────────────────────────────

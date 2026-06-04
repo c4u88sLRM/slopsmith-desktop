@@ -231,6 +231,19 @@ public:
     // consume each sample exactly once.
     uint64_t getInputSince(uint64_t fromIndex, std::vector<float>& out) const;
 
+    // Post-noise-gate raw mono audio snapshot for the external tuner plugin.
+    // Distinct from getInputFrame() above: that ring is fed pre-gate because
+    // note-detection scoring wants the dry signal, whereas a tuner wants the
+    // gated signal so room noise below the gate threshold reads as silence
+    // instead of a jittery pitch. The audio callback appends the same post-gate
+    // mono samples the YIN detector sees into a separate lock-free ring; the
+    // tuner copies out the most-recent N samples and runs its own
+    // tuning-optimised pitch pipeline. The ring (see kRawAudioRingCapacity) is
+    // sized so a multi-period window for the lowest supported instrument note
+    // (drop-A 6-string bass, ~27.5 Hz) fits even at 96 kHz. Caller can request
+    // fewer than the default; anything larger than the ring is clamped.
+    std::vector<float> getRawAudioFrame(int numSamples = 4096) const;
+
     // Score a chord against the latest input-ring samples. The chord
     // context (notes, arrangement, thresholds) comes from the renderer
     // over IPC; audio data stays inside the engine so no buffers cross
@@ -421,6 +434,24 @@ private:
     // that sensitivity.
     std::array<std::atomic<float>, kInputFrameRingCapacity> inputFrameRing{};
     std::atomic<uint64_t> inputFrameRingWriteIndex{0};
+
+    // Lock-free SPSC ring for the POST-gate raw mono signal, backing
+    // getRawAudioFrame() for the tuner plugin. Same single-producer (audio
+    // thread) / single-consumer (main thread) and relaxed-store discipline as
+    // inputFrameRing above, and reset on the same start/stop hooks. Kept
+    // separate because inputFrameRing is pre-gate. Capacity is larger so a
+    // multi-period YIN window for a ~27.5 Hz low note (drop-A 6-string bass)
+    // fits: at 96 kHz one period ≈ 3491 samples, so 16384 holds ~4.7 periods;
+    // at 48 kHz it holds ~9 periods of that note with room to spare.
+    static constexpr int kRawAudioRingCapacity = 16384;
+    static_assert((kRawAudioRingCapacity & (kRawAudioRingCapacity - 1)) == 0,
+                  "kRawAudioRingCapacity must be a power of two");
+    std::array<std::atomic<float>, kRawAudioRingCapacity> rawAudioRing{};
+    std::atomic<uint64_t> rawAudioRingWriteIndex{0};
+
+    // Append post-gate mono samples to rawAudioRing. Audio-thread only,
+    // RT-safe (no allocation/locking); mirrors the inline inputFrameRing write.
+    void pushRawAudioFrame(const float* data, int numSamples) noexcept;
 
     // Audio-thread scratch buffer used only on zero-output device
     // configurations (input-only ASIO, certain JACK setups). In the
