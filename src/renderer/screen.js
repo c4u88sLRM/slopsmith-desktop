@@ -2123,6 +2123,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     let toneSwitcher = null;
     let autoSwitchEnabled = localStorage.getItem('slopsmith-tone-auto-switch') === 'true';
     const originalToneNamesCache = new Map();
+    let midiAmpSongTonesUnavailable = false;
 
     class ToneSwitcher {
         constructor() {
@@ -2479,22 +2480,36 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     window._aeGetCurrentSongKey = getCurrentSongKey;
     window._aeGetToneChangeTime = getToneChangeTime;
 
+    function hasMidiAmpSongTonesEndpoint() {
+        if (midiAmpSongTonesUnavailable) return false;
+        return !!document.querySelector('[data-plugin-id="midi_amp"]');
+    }
+
+    async function fetchMidiAmpSongTones(key) {
+        if (!key || !hasMidiAmpSongTonesEndpoint()) return [];
+        try {
+            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
+            if (resp.status === 404) {
+                midiAmpSongTonesUnavailable = true;
+                return [];
+            }
+            if (!resp.ok) return [];
+            const data = await resp.json();
+            return Array.isArray(data?.tones) ? data.tones : [];
+        } catch (_) {
+            return [];
+        }
+    }
+
     async function getOriginalToneNamesForCurrentArrangement(songKey) {
         const key = normalizeSongKey(songKey);
         if (!key) return [];
-        try {
-            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
-            if (!resp.ok) return [];
-            const data = await resp.json();
-            const tones = Array.isArray(data?.tones) ? data.tones : [];
-            const arr = String(window.slopsmith?.currentSong?.arrangement || '').trim().toLowerCase();
-            const filtered = arr
-                ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
-                : tones;
-            return Array.from(new Set(filtered.map(t => (t?.name || t?.key || '').trim()).filter(Boolean)));
-        } catch (e) {
-            return [];
-        }
+        const tones = await fetchMidiAmpSongTones(key);
+        const arr = String(window.slopsmith?.currentSong?.arrangement || '').trim().toLowerCase();
+        const filtered = arr
+            ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
+            : tones;
+        return Array.from(new Set(filtered.map(t => (t?.name || t?.key || '').trim()).filter(Boolean)));
     }
 
     function getCurrentArrangementName() {
@@ -2508,10 +2523,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         const cacheKey = `${key}::${arr}::v2`;
         if (originalToneNamesCache.has(cacheKey)) return originalToneNamesCache.get(cacheKey);
         try {
-            const resp = await fetch(`/api/plugins/midi_amp/song-tones/${encodeURIComponent(key)}`);
-            if (!resp.ok) return [];
-            const data = await resp.json();
-            const tones = Array.isArray(data?.tones) ? data.tones : [];
+            const tones = await fetchMidiAmpSongTones(key);
             const filtered = arr
                 ? tones.filter(t => String(t?.arrangement || '').trim().toLowerCase() === arr)
                 : tones;

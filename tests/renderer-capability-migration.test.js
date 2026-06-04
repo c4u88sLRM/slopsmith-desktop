@@ -82,3 +82,13 @@ test('chain panel summarizes provider-managed audio effects mappings', () => {
     assert.equal(source.includes("const panelMode = providerManaged ? 'provider'"), true);
     assert.equal(source.includes('if (!providerManaged && toneNamesOrdered.length > 0)'), true);
 });
+
+test('legacy midi_amp tone lookup is guarded by plugin availability', () => {
+    const source = readText('src/renderer/screen.js');
+
+    assert.equal(source.includes('hasMidiAmpSongTonesEndpoint'), true);
+    assert.equal(source.includes('midiAmpSongTonesUnavailable'), true);
+    assert.equal(source.includes('document.querySelector(\'[data-plugin-id="midi_amp"]\')'), true);
+    assert.equal(source.includes('resp.status === 404'), true);
+    assert.equal(source.includes('fetchMidiAmpSongTones(key)'), true);
+});
