@@ -2319,10 +2319,13 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
     function inspectProviderManagedAudioEffectsRoute() {
         const api = window.slopsmith?.audioEffects;
+        const rbOwner = window.__rbToneOwnership || null;
+        const rbOwnerPending = !!(rbOwner && rbOwner.providerId === 'rig_builder.effects' && rbOwner.pending);
+        const rbOwnerActive = !!(rbOwner && rbOwner.providerId === 'rig_builder.effects' && rbOwner.active);
         const rigBuilderActive = !!(window.RbMegaChain && typeof window.RbMegaChain.isActive === 'function' && window.RbMegaChain.isActive());
         const rigBuilderPending = !!(window.RbMegaChain && typeof window.RbMegaChain.isPending === 'function' && window.RbMegaChain.isPending());
-        const rigBuilderManaged = rigBuilderActive || rigBuilderPending;
-        const rigBuilderState = rigBuilderPending ? 'loading' : 'loaded';
+        const rigBuilderManaged = rigBuilderActive || rigBuilderPending || rbOwnerActive || rbOwnerPending;
+        const rigBuilderState = (rigBuilderPending || rbOwnerPending) ? 'loading' : 'loaded';
         if (!api || typeof api.inspectRoute !== 'function') {
             return rigBuilderManaged ? { route: { state: rigBuilderState }, provider: null, providerId: 'rig_builder.effects', state: rigBuilderState } : null;
         }
