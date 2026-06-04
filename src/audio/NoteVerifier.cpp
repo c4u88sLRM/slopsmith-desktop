@@ -232,6 +232,7 @@ void NoteVerifier::run()
         ctx.pitchCheckCents = chart.pitchCheckCents;
         ctx.harmonicSnr     = chart.harmonicSnr;
         ctx.fundamentalRatio = chart.fundamentalRatio;
+        ctx.presenceRatio   = chart.presenceRatio;
         ctx.timingTolerance = chart.timingTolerance;
 
         // A drill A-B loop wrap (or a manual seek-back) jumps the playhead

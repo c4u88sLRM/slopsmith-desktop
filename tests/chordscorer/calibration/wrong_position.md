@@ -29,7 +29,7 @@ Notes:
 
 The detector is tuned to chase the result of `cs_bench` on all three:
 
-```
+```bash
 ./build/cs_bench bass_correct.wav calibration/chart.txt bass   # want HIGH recall
 ./build/cs_bench bass_2up.wav      calibration/chart.txt bass   # want ~0% (reject)
 ./build/cs_bench bass_2down.wav    calibration/chart.txt bass   # want ~0% (reject)
