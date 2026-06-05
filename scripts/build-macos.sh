@@ -255,6 +255,60 @@ bundle_binaries_impl() {
         exit 1
     fi
 
+    # Apple Silicon only: the native arm64 ffmpeg static builds (osxexperts,
+    # martin-riedl) omit --enable-librubberband, so Retune's pitch-shift step
+    # has no `rubberband` filter and fails with "Filter not found". Bundle the
+    # Intel evermeet ffmpeg (which HAS rubberband) as `ffmpeg-rubberband`;
+    # lib/retune.py prefers it for that one step and it runs under Rosetta 2.
+    # Everything else keeps using the native arm64 ffmpeg (no Rosetta needed).
+    if [[ "$arch" == "arm64" || "$arch" == "aarch64" ]]; then
+        local rb_url rb_sha rb_zip rb_extract rb_found rb_actual
+        rb_url=$(python3 "$SCRIPT_DIR/parse-build-config.py" "$CONFIG" ".external.ffmpeg_macos_rubberband.url")
+        rb_sha=$(python3 "$SCRIPT_DIR/parse-build-config.py" "$CONFIG" ".external.ffmpeg_macos_rubberband.sha256")
+        rb_zip="/tmp/ffmpeg-rubberband-macos.zip"
+        if [[ ! -f "$rb_zip" ]] || ! shasum -a 256 "$rb_zip" | awk '{print $1}' | grep -qx "$rb_sha"; then
+            echo "  Downloading ffmpeg-rubberband (Intel) from $rb_url"
+            curl -sL --fail --retry 5 --retry-delay 5 --retry-all-errors "$rb_url" -o "$rb_zip"
+        fi
+        rb_actual=$(shasum -a 256 "$rb_zip" | awk '{print $1}')
+        if [[ "$rb_actual" != "$rb_sha" ]]; then
+            echo "Error: ffmpeg-rubberband zip SHA256 mismatch — upstream rebuilt under the same URL" >&2
+            echo "  expected: $rb_sha" >&2
+            echo "  got:      $rb_actual" >&2
+            echo "  url:      $rb_url" >&2
+            echo "Update .external.ffmpeg_macos_rubberband.sha256 in .build-config.json after verifying the new binary." >&2
+            exit 1
+        fi
+        rb_extract="/tmp/ffmpeg-rubberband-extract-$$"
+        rm -rf "$rb_extract"; mkdir -p "$rb_extract"
+        unzip -q -o "$rb_zip" -d "$rb_extract"
+        rb_found=$(find "$rb_extract" -type f -name ffmpeg -not -path '*/__MACOSX/*' | head -1)
+        if [[ -z "$rb_found" ]]; then
+            echo "Error: 'ffmpeg' binary not found after unzipping $rb_zip — upstream layout may have changed." >&2
+            exit 1
+        fi
+        cp "$rb_found" "$bin_dir/ffmpeg-rubberband"
+        chmod +x "$bin_dir/ffmpeg-rubberband"
+        xattr -d com.apple.quarantine "$bin_dir/ffmpeg-rubberband" 2>/dev/null || true
+        rm -rf "$rb_extract"
+        # Verify librubberband via the embedded `configuration:` string with
+        # `grep -a`, NOT by running the binary: the build host may be Apple
+        # Silicon without Rosetta 2, so executing this Intel binary could fail
+        # even though it's correct. The config string is arch-independent.
+        if ! grep -a -q 'enable-librubberband' "$bin_dir/ffmpeg-rubberband"; then
+            echo "Error: bundled ffmpeg-rubberband lacks --enable-librubberband — Retune pitch-shift would still fail on Apple Silicon." >&2
+            echo "Pick an Intel ffmpeg build with librubberband and update .external.ffmpeg_macos_rubberband in .build-config.json." >&2
+            exit 1
+        fi
+        # Retune re-encodes the shifted audio as OGG (vorbis); require libvorbis
+        # here too so its output isn't downgraded to the built-in encoder.
+        if ! grep -a -q 'enable-libvorbis' "$bin_dir/ffmpeg-rubberband"; then
+            echo "Error: bundled ffmpeg-rubberband lacks --enable-libvorbis — Retune output OGG would use the lower-quality built-in vorbis encoder." >&2
+            exit 1
+        fi
+        echo "  ffmpeg-rubberband (Intel, for Retune via Rosetta 2) bundled and verified."
+    fi
+
     local fluidsynth_bin
     fluidsynth_bin="$(command -v fluidsynth || true)"
     if [[ -z "$fluidsynth_bin" ]]; then

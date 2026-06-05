@@ -47,6 +47,11 @@
     "ffprobe_macos_x64": {
       "url": "https://evermeet.cx/ffmpeg/ffprobe-8.1.1.zip",
       "sha256": "aeade29dee3c3844e9bcc974f4ae4b29cc4f87994177d77003a8589fa531009e"
+    },
+    "ffmpeg_macos_rubberband": {
+      "_comment": "Intel ffmpeg with --enable-librubberband, bundled as resources/bin/ffmpeg-rubberband on Apple Silicon ONLY (runs via Rosetta 2). The native arm64 static builds (osxexperts/martin-riedl) omit librubberband, so Retune's pitch-shift step has no rubberband filter there. Used solely by lib/retune.py; all other ffmpeg use stays on the native arm64 binary. Same evermeet build as ffmpeg_macos_x64.",
+      "url": "https://evermeet.cx/ffmpeg/ffmpeg-8.1.1.zip",
+      "sha256": "4610988e2f54c243c50da73a09e4e2c36d9bb77546f9aa6c84cb328dcb1a98c1"
     }
   }
 }
