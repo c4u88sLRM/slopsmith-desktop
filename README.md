@@ -33,6 +33,50 @@ There is currently no Homebrew, winget, Chocolatey, Scoop, Flatpak, or
 Snap distribution — download directly from Releases. The app does not
 yet ship an auto-updater; check Releases periodically for new versions.
 
+## Troubleshooting
+
+### macOS: no sound and the app never asks for microphone permission
+
+Slopsmith captures your guitar through a **microphone-class audio input**, so
+macOS gates it behind a Privacy & Security permission. If the app opens but you
+hear nothing and the input gauge never moves — and you were never asked to
+allow the microphone — macOS denied the input silently. Because the audio
+engine opens the input and output device together, a denied input also takes
+the **output** down, so there's no sound at all.
+
+Try these in order:
+
+1. **Check the permission.** System Settings → Privacy & Security →
+   **Microphone**, and turn on **Slopsmith**. If Slopsmith isn't listed, go to
+   step 2.
+2. **Reset microphone permissions** so macOS re-prompts on next launch. In
+   Terminal:
+   ```bash
+   tccutil reset Microphone
+   ```
+   Then reopen Slopsmith.
+3. **Force the prompt by launching from Terminal.** This makes macOS attribute
+   the request and pop the permission dialogs:
+   ```bash
+   /Applications/Slopsmith.app/Contents/MacOS/Slopsmith
+   ```
+   Allow microphone access when prompted — you should now hear audio and see
+   the input gauge move.
+
+> Step 3 isn't permanent on older builds: you'd have to launch this way each
+> time, and it registers **Terminal** (not Slopsmith) under Privacy & Security
+> → Microphone. To make it a normal double-click app, wrap the command with
+> Automator (*New → Application → Run Shell Script*, paste
+> `/Applications/Slopsmith.app/Contents/MacOS/Slopsmith &>/dev/null &`, and save
+> it as an app).
+>
+> A fix that requests microphone access from Slopsmith itself on first launch —
+> so a normal double-click prompts correctly and registers *Slopsmith* in the
+> Microphone list — is on the way; once you're on a build that includes it,
+> none of the above is needed.
+
+Thanks to the community members who diagnosed the workarounds above.
+
 ## Architecture
 
 ```
