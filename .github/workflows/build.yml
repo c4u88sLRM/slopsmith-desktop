@@ -191,15 +191,41 @@ jobs:
       #   v1.2.3-beta.<n>        → beta
       #   v1.2.3-rc.<n>          → rc
       #   anything else          → job fails
-      - name: Derive Velopack channel from tag
+      - name: Derive Velopack channel
         id: velopack_channel
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.platform != 'linux'
+        # Tag builds: derive the release channel for win + mac (linux is
+        # electron-builder AppImage/deb, no Velopack). Manual dispatch: also
+        # pack a Velopack package for WINDOWS only, on a throwaway `dev`
+        # channel. Without this, dispatch (the documented tester-build path)
+        # produced no usable Windows artifact — win-unpacked/ isn't uploaded
+        # and Velopack only ran on tags, so testers got just .pdb symbols.
+        # macOS dispatch stays Velopack-free (it already uploads a tester .zip
+        # from the "Zip macOS app" step), so we don't add an unsigned-update
+        # mac pack here.
+        if: >-
+          (startsWith(github.ref, 'refs/tags/v') && matrix.platform != 'linux')
+          || (github.event_name == 'workflow_dispatch' && matrix.platform == 'win')
         shell: bash
         run: |
           set -euo pipefail
-          # Read the tag from the runtime env var rather than interpolating a
-          # GitHub Actions workflow expression into the script text — a tag
-          # containing shell syntax could otherwise execute (template injection).
+          # Read tag / event / run number from runtime env vars rather than
+          # interpolating GitHub Actions workflow expressions into the script
+          # text — a tag containing shell syntax could otherwise execute
+          # (template injection).
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            # Strip any prerelease suffix from the app version (0.2.9-beta.1 ->
+            # 0.2.9), then tag a unique dev build so successive dispatch builds
+            # produce distinct Velopack versions. The `dev` channel keeps these
+            # out of the alpha/beta/rc/stable auto-update feeds.
+            base="$(node -p "require('./package.json').version")"
+            base="${base%%-*}"
+            channel=dev
+            version="${base}-dev.${GITHUB_RUN_NUMBER}"
+            echo "channel=$channel" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch -> channel=$channel version=$version"
+            exit 0
+          fi
           tag="${GITHUB_REF_NAME}"
           if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-alpha\.[0-9]+$ ]]; then
             channel=alpha
