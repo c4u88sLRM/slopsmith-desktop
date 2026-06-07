@@ -58,6 +58,8 @@ if (process.platform !== 'linux') {
 
 import { app, BrowserWindow, ipcMain, dialog, shell, session, crashReporter, powerSaveBlocker } from 'electron';
 import * as path from 'path';
+import * as fs from 'fs';
+import { execFileSync } from 'child_process';
 
 // Enable Electron's Crashpad to capture native crashes (incl. VST/JUCE C++
 // access violations) into <userData>/Crashpad/reports/ as .dmp files. Must
@@ -101,6 +103,41 @@ import type { UpdateChannel } from './update-manager';
 // since been routed through the JUCE bridge in
 // slopsmith-plugin-notedetect#27, but third-party plugins may still hit the
 // Web-Audio path on their own).
+// Whether unprivileged user namespaces are usable — the sandbox path Chromium
+// falls back to when the SUID helper is unavailable (as it always is from an
+// AppImage). We don't guess purely from kernel knobs: AppArmor restriction
+// (Ubuntu 24.04+) and other policy aren't fully reflected by sysctls. Instead we
+// actually attempt to create a userns in a short-lived child — exactly what
+// Chromium's sandbox does — and fall back to the knobs only when we can't probe.
+function linuxUnprivilegedUsernsAvailable(): boolean {
+    const readsZero = (p: string): boolean => {
+        try { return fs.readFileSync(p, 'utf8').trim() === '0'; } catch { return false; }
+    };
+    // Cheap definite negatives — skip the probe when the kernel says no outright.
+    if (readsZero('/proc/sys/kernel/unprivileged_userns_clone')) return false;
+    if (readsZero('/proc/sys/user/max_user_namespaces')) return false;
+
+    // Authoritative probe: try to create an unprivileged user namespace in a
+    // short-lived child via util-linux `unshare`. Success → userns works for our
+    // children, so Chromium can sandbox. A non-zero exit (EPERM, incl. AppArmor
+    // denial) → unavailable. We never call unshare in-process, so the main
+    // process is never moved into a namespace.
+    try {
+        execFileSync('unshare', ['--user', 'true'], { timeout: 2000, stdio: 'ignore' });
+        return true;
+    } catch (e) {
+        // `unshare` binary not present → can't probe; fall back to the AppArmor
+        // knob ('1' = restricted → treat as unavailable), else assume available.
+        if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') {
+            try {
+                return fs.readFileSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', 'utf8').trim() !== '1';
+            } catch { return true; }
+        }
+        // unshare ran but the namespace was denied (or timed out) → unavailable.
+        return false;
+    }
+}
+
 if (process.platform === 'linux') {
     // Merge with any existing `--enable-features=` value (set by Electron
     // defaults, parent env, or future code) instead of overwriting — a bare
@@ -114,6 +151,28 @@ if (process.platform === 'linux') {
     );
     features.add('WebRTCPipeWireCapturer');
     app.commandLine.appendSwitch('enable-features', Array.from(features).join(','));
+
+    // chrome-sandbox SUID abort fix (issue #438). From an AppImage the bundled
+    // chrome-sandbox is inert — the squashfs is mounted nosuid so its SUID bit
+    // can't take effect — and Chromium falls back to the unprivileged-userns
+    // sandbox. On kernels where userns is disabled (Debian/Arch hardening) or
+    // AppArmor-restricted (Ubuntu 24.04+), BOTH sandbox paths fail and Electron
+    // ABORTS before any app code runs. We can't enable userns or make a nosuid
+    // mount honor SUID, so on exactly that combination — running as an AppImage
+    // AND no usable userns — fall back to --no-sandbox so the app launches at
+    // all. The sandbox stays ON for .deb installs, dev runs, and every
+    // userns-capable system; this only triggers where Electron would otherwise
+    // die. Set before app.whenReady() so it's read during Chromium init.
+    if (process.env.APPIMAGE && !linuxUnprivilegedUsernsAvailable()) {
+        console.warn(
+            '[startup] AppImage on a kernel without usable unprivileged user '
+            + 'namespaces — launching with --no-sandbox so the app can start '
+            + '(the Chromium process sandbox is disabled). To keep the sandbox, '
+            + 'install the .deb, enable kernel.unprivileged_userns_clone=1, or '
+            + 'run the AppImage on a userns-capable kernel. (issue #438)',
+        );
+        app.commandLine.appendSwitch('no-sandbox');
+    }
 }
 
 // Prevent error dialogs from showing when the Python subprocess has issues.
