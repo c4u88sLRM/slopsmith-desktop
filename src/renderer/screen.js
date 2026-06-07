@@ -3424,7 +3424,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         if (!toast) {
             toast = document.createElement('div');
             toast.id = 'monitor-mute-hint';
-            toast.style.cssText = 'position:fixed;top:60px;right:20px;z-index:9999;max-width:320px;padding:10px 16px;border-radius:8px;background:rgba(180,83,9,0.95);color:white;font-size:12px;font-weight:600;transition:opacity 0.5s;';
+            toast.style.cssText = 'position:fixed;top:60px;right:20px;z-index:9999;max-width:320px;padding:10px 16px;border-radius:8px;background:rgba(180,83,9,0.95);color:white;font-size:12px;font-weight:600;transition:opacity 0.5s;pointer-events:auto;';
 
             const msg = document.createElement('div');
             msg.textContent = 'Monitor mute is on and no tone is loaded — add an amp/VST or load a preset to hear a processed tone.';
@@ -3449,8 +3449,14 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             document.body.appendChild(toast);
         }
         toast.style.opacity = '1';
+        toast.style.pointerEvents = 'auto';
         clearTimeout(toast._timer);
-        toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 6000);
+        toast._timer = setTimeout(() => {
+            toast.style.opacity = '0';
+            // Drop pointer-events with the fade so the invisible container can't
+            // swallow clicks in the top-right corner of the app afterwards.
+            toast.style.pointerEvents = 'none';
+        }, 6000);
     }
 
     // Run once the rebuild has settled: if a real chain exists, restore normal
