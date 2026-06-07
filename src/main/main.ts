@@ -1015,7 +1015,33 @@ async function startup(): Promise<void> {
     }, SPLASH_RENDERER_DEADLINE_MS);
 }
 
-app.whenReady().then(startup);
+// ── Single-instance lock ──────────────────────────────────────────────────
+// Without this, each launch spins up its own Python backend (fighting for the
+// same fixed port) and its own GPU context; stacking instances starves the GPU
+// and was observed to stutter the 3D highway. Hold a process-wide lock: if
+// another instance already owns it, surface that window (via 'second-instance'
+// on the primary) and quit THIS one before startup() boots a competing backend
+// or window. `SLOPSMITH_ALLOW_MULTIPLE=1` opts out so two builds can run
+// side-by-side (e.g. A/B testing different versions).
+const allowMultipleInstances = process.env.SLOPSMITH_ALLOW_MULTIPLE === '1';
+if (!allowMultipleInstances && !app.requestSingleInstanceLock()) {
+    app.quit();
+} else {
+    if (!allowMultipleInstances) {
+        app.on('second-instance', () => {
+            // A second launch was attempted — focus the existing window
+            // instead of opening another. mainWindow may not exist yet if
+            // we're still on the splash, so fall back to it.
+            const win = mainWindow ?? splashWindow;
+            if (win && !win.isDestroyed()) {
+                if (win.isMinimized()) win.restore();
+                win.show();
+                win.focus();
+            }
+        });
+    }
+    app.whenReady().then(startup);
+}
 
 app.on('window-all-closed', () => {
     shutdown();
