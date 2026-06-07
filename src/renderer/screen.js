@@ -3435,6 +3435,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;';
             const mkBtn = (label, onClick) => {
                 const b = document.createElement('button');
+                // Explicit type='button' — HTML defaults to 'submit', which
+                // would trigger form submission if this toast ever lands
+                // inside a form ancestor.
+                b.type = 'button';
                 b.textContent = label;
                 b.style.cssText = 'background:rgba(255,255,255,0.15);border:0;color:white;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;';
                 b.addEventListener('click', onClick);
