@@ -301,6 +301,42 @@ const slopsmithDesktopApi = {
         detectNotes: (): Promise<NoteDetection | null> =>
             ipcRenderer.invoke('audio:detectNotes'),
 
+        // ── Multi-input sources ──────────────────────────────────────────────
+        // Each source is an independent input chain (own arrangement chart, note
+        // detection, scoring, tone, monitor). sources[0] always exists and is
+        // what the legacy un-suffixed methods above target. A renderer that wants
+        // more than one player adds a source per extra input and drives its
+        // scoring via the *Source* methods. All resolve to safe defaults on a
+        // downlevel addon so the caller feature-detects.
+
+        // Activate a pooled input chain bound to `inputChannel` (-1 = mono mix of
+        // the first pair). Resolves the new sourceId, or -1 if the pool is full /
+        // unsupported.
+        addSource: (inputChannel?: number): Promise<number> =>
+            ipcRenderer.invoke('audio:addSource', inputChannel),
+        removeSource: (id: number): Promise<boolean> =>
+            ipcRenderer.invoke('audio:removeSource', id),
+        listSources: (): Promise<Array<{ id: number; inputChannel: number; active: boolean }> | null> =>
+            ipcRenderer.invoke('audio:listSources'),
+        setSourceInputChannel: (id: number, channel: number): Promise<void> =>
+            ipcRenderer.invoke('audio:setSourceInputChannel', id, channel),
+        setSourceMonitorMute: (id: number, mute: boolean): Promise<void> =>
+            ipcRenderer.invoke('audio:setSourceMonitorMute', id, mute),
+
+        // Per-source twins of setChart / scoreChord / getNoteVerdicts /
+        // getRawAudioFrame / getPitchDetection — same shapes, the leading id
+        // selects the source.
+        setSourceChart: (id: number, chart: ChartUpdate): Promise<boolean | null> =>
+            ipcRenderer.invoke('audio:setSourceChart', id, chart),
+        scoreSourceChord: (id: number, ctx: ChordScoreRequest): Promise<ChordScoreResult | null> =>
+            ipcRenderer.invoke('audio:scoreSourceChord', id, ctx),
+        getSourceNoteVerdicts: (id: number, songTime?: number, playing?: boolean): Promise<NoteVerdict[] | null> =>
+            ipcRenderer.invoke('audio:getSourceNoteVerdicts', id, songTime, playing),
+        getSourceRawAudioFrame: (id: number, numSamples?: number): Promise<Float32Array> =>
+            ipcRenderer.invoke('audio:getSourceRawAudioFrame', id, numSamples),
+        getSourcePitchDetection: (id: number) =>
+            ipcRenderer.invoke('audio:getSourcePitchDetection', id),
+
         // VST plugins
         scanPlugins: (dirs?: string[]) => ipcRenderer.invoke('audio:scanPlugins', dirs),
         getKnownPlugins: () => ipcRenderer.invoke('audio:getKnownPlugins'),
