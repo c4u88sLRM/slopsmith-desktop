@@ -2,7 +2,9 @@
 #include "AudioSanitize.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <thread>
 
 // Hard ceiling on backing playback speed. This drives input buffer sizing and runtime clamp.
 static constexpr double kMaxBackingSpeed = 4.0;
@@ -18,11 +20,15 @@ AudioEngine::AudioEngine()
 {
     formatManager.registerBasicFormats();
 
-    // The default input chain. sources[0] reads the engine's audioRunning /
-    // currentSampleRate atomics by reference (both already constructed as members
-    // before this constructor body runs). Created before any device callback is
-    // added (startAudio), so the audio thread always sees a live sources[0].
-    sources.push_back(std::make_unique<SourceChain>(audioRunning, currentSampleRate));
+    // Construct the full source pool up front so addSource/removeSource never
+    // reassign a pointer the audio thread reads — they only flip `active`. Each
+    // chain reads the engine's audioRunning / currentSampleRate atomics by
+    // reference (both already constructed as members before this body runs).
+    // sources[0] is the permanent default input, active from the start; the rest
+    // are inactive (no threads — NoteVerifier's worker only starts in prepare()).
+    for (int i = 0; i < kMaxSources; ++i)
+        sources[(size_t) i] = std::make_unique<SourceChain>(i, audioRunning, currentSampleRate);
+    sources[0]->setActive(true);
 
     auto result = inputDeviceManager.initialiseWithDefaultDevices(2, 2);
     if (result.isNotEmpty())
@@ -1299,6 +1305,94 @@ void AudioEngine::resetPeaks()
     outputPeak.store(0.0f);
 }
 
+// ── Multi-input source management (control thread) ───────────────────────────
+
+int AudioEngine::addSource(int inputChannel)
+{
+    std::lock_guard<std::mutex> lock(sourcesMutex);
+
+    // Find a free pooled slot (slot 0 is the permanent default).
+    int slot = -1;
+    for (int i = 1; i < kMaxSources; ++i)
+        if (! sources[(size_t) i]->isActive()) { slot = i; break; }
+    if (slot < 0)
+        return -1;  // pool full
+
+    SourceChain& src = *sources[(size_t) slot];
+    src.setInputChannel(inputChannel);
+
+    // Prepare fully BEFORE making it visible to the audio thread, so the first
+    // callback that observes active==true sees a ready chain + rings. When audio
+    // isn't running yet, audioDeviceAboutToStart prepares it later.
+    if (audioRunning.load(std::memory_order_relaxed))
+    {
+        const double sr = currentSampleRate.load(std::memory_order_relaxed);
+        const int bs = inputBlockSize.load(std::memory_order_relaxed);
+        if (sr > 0.0 && bs > 0)
+            src.prepare(sr, bs);
+    }
+    src.setActive(true);  // release-store: now picked up by the audio callback
+    return slot;
+}
+
+bool AudioEngine::removeSource(int id)
+{
+    if (id <= 0 || id >= kMaxSources)
+        return false;  // 0 is permanent; out-of-range rejected
+
+    std::lock_guard<std::mutex> lock(sourcesMutex);
+    SourceChain& src = *sources[(size_t) id];
+    if (! src.isActive())
+        return false;
+
+    // Hide it from the audio callback first; subsequent blocks skip it.
+    src.setActive(false);
+
+    // Wait for any in-flight callback that might still be processing this source
+    // to finish: two generation ticks guarantee a full callback ran after the
+    // setActive(false) became visible. Bounded so a stalled device can't hang the
+    // control thread; if audio isn't running, no callback touches it, release now.
+    if (audioRunning.load(std::memory_order_relaxed))
+    {
+        const uint64_t g = callbackGeneration.load(std::memory_order_acquire);
+        for (int spins = 0; spins < 200; ++spins)  // ~200 ms cap
+        {
+            if (callbackGeneration.load(std::memory_order_acquire) >= g + 2)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // Now safe to stop its threads + release its chain. The pooled object is kept
+    // for reuse by a later addSource (which re-prepares it).
+    src.releaseResources();
+    return true;
+}
+
+SourceChain* AudioEngine::getSource(int id)
+{
+    if (id < 0 || id >= kMaxSources)
+        return nullptr;
+    SourceChain& src = *sources[(size_t) id];
+    return (id == 0 || src.isActive()) ? &src : nullptr;
+}
+
+std::vector<AudioEngine::SourceInfo> AudioEngine::listSources() const
+{
+    std::vector<SourceInfo> out;
+    for (int i = 0; i < kMaxSources; ++i)
+    {
+        const SourceChain& src = *sources[(size_t) i];
+        if (! src.isActive()) continue;
+        SourceInfo info;
+        info.id = src.getId();
+        info.inputChannel = src.getInputChannel();
+        info.active = true;
+        out.push_back(info);
+    }
+    return out;
+}
+
 int AudioEngine::renderBackingBlockLocked(int numSamples)
 {
     // Adopt any speed change requested since the last block (set lock-free by
@@ -1438,11 +1532,16 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
         outputBackingBuffer.setSize(2, bs, false, false, true);
     }
 
-    // Prepare every input source's DSP and reset its rings + zero-output scratch
-    // for a clean cold start. Phase 0 has exactly sources[0]; this loop is ready
-    // for sources[1..N].
+    // Pre-size the multi-source mix scratch (2ch) so the audio thread never
+    // allocates when summing active sources.
+    if (sourceMonitorScratch.getNumSamples() < bs)
+        sourceMonitorScratch.setSize(2, bs, false, false, true);
+
+    // Prepare each ACTIVE source's DSP and reset its rings + zero-output scratch
+    // for a clean cold start. Inactive pooled chains stay unprepared (no threads).
     for (auto& src : sources)
-        src->prepare(sr, bs);
+        if (src->isActive())
+            src->prepare(sr, bs);
 
     // Split mode preps the backing stretcher in audioOutputAboutToStart
     // instead — that callback owns the device the backing audio actually
@@ -1469,9 +1568,11 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
 
 void AudioEngine::audioDeviceStopped()
 {
-    // Release each source's chain + detectors + verifier and zero its rings.
+    // Release each ACTIVE source's chain + detectors + verifier and zero its
+    // rings. Inactive pooled chains were never prepared.
     for (auto& src : sources)
-        src->releaseResources();
+        if (src->isActive())
+            src->releaseResources();
     outputRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingReadIndex.store(0, std::memory_order_relaxed);
     audioRunning.store(false, std::memory_order_relaxed);
@@ -1561,6 +1662,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     float* const* outputData, int numOutputChannels,
     int numSamples, const juce::AudioIODeviceCallbackContext&)
 {
+    // Publish that a callback is in progress so removeSource() can wait for any
+    // in-flight use of a source to drain before releasing it.
+    callbackGeneration.fetch_add(1, std::memory_order_acq_rel);
+
     const bool duplex = duplexMode.load(std::memory_order_relaxed);
 
     // Duplex writes outputData directly. Split runs DSP into a private 2-channel
@@ -1587,14 +1692,41 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
     const int effectiveOutputChannels = duplex ? numOutputChannels : 2;
 
-    // Per-source capture + detect + monitor. Phase 0 processes exactly sources[0]
-    // in place on `buffer`, byte-identical to the old single-pipeline path:
-    // channel select / mono mix + input gain, input metering, ML + input-ring
-    // feed, noise gate, YIN + raw-ring feed, the tone chain (VST/NAM/IR) + NaN
-    // scrub, monitor mute, chain output gain, and tone polish. Multi-source
-    // fan-out (each source into its own monitor buffer, then summed into the mix)
-    // lands in a later phase.
-    source0().processBlock(inputData, numInputChannels, buffer, effectiveOutputChannels, numSamples);
+    // Per-source capture + detect + monitor.
+    //
+    // Fast path — exactly one active source: process it in place on `buffer`,
+    // byte-identical to the single-pipeline engine (channel select / mono mix +
+    // input gain, input metering, ML + input-ring feed, noise gate, YIN + raw-ring
+    // feed, tone chain + NaN scrub, monitor mute, chain gain, tone polish).
+    //
+    // Multi-source path: each active source renders its own 2-channel monitor into
+    // sourceMonitorScratch (each builds its mono from its bound input channel +
+    // feeds its own rings/detectors/verifier), and the monitors are summed into the
+    // output. Each source scores its OWN arrangement independently.
+    int firstActive = -1, activeCount = 0;
+    for (int i = 0; i < kMaxSources; ++i)
+        if (sources[(size_t) i]->isActive()) { ++activeCount; if (firstActive < 0) firstActive = i; }
+
+    if (activeCount <= 1)
+    {
+        sources[(size_t) (firstActive < 0 ? 0 : firstActive)]
+            ->processBlock(inputData, numInputChannels, buffer, effectiveOutputChannels, numSamples);
+    }
+    else
+    {
+        for (int ch = 0; ch < effectiveOutputChannels; ++ch)
+            buffer.clear(ch, 0, numSamples);
+        const int mixCh = juce::jmin(effectiveOutputChannels, 2);
+        for (int i = 0; i < kMaxSources; ++i)
+        {
+            if (! sources[(size_t) i]->isActive()) continue;
+            // Render this source's monitor into the 2-channel scratch, then sum.
+            sources[(size_t) i]->processBlock(inputData, numInputChannels,
+                                              sourceMonitorScratch, 2, numSamples);
+            for (int ch = 0; ch < mixCh; ++ch)
+                buffer.addFrom(ch, 0, sourceMonitorScratch, ch, 0, numSamples);
+        }
+    }
 
     // Duplex mixes backing + applies output gain + meters here.
     // Split defers all three to OutputCallback (output device's clock).

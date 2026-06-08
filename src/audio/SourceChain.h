@@ -35,10 +35,21 @@
 class SourceChain : public InputRingReader
 {
 public:
-    SourceChain(const std::atomic<bool>& engineAudioRunning,
+    SourceChain(int id,
+                const std::atomic<bool>& engineAudioRunning,
                 const std::atomic<double>& engineSampleRate)
-        : audioRunning(engineAudioRunning), sampleRate(engineSampleRate),
+        : sourceId(id), audioRunning(engineAudioRunning), sampleRate(engineSampleRate),
           noteVerifier(*this) {}
+
+    // Stable id (== pool slot index); handed to JS as the source handle.
+    int getId() const { return sourceId; }
+
+    // Whether this chain is a live player. The audio callback skips inactive
+    // chains; the engine flips this on addSource/removeSource. Released chains
+    // keep their object (pooled) so there is no pointer-reassignment race with
+    // the audio thread. sources[0] is active from construction.
+    bool isActive() const { return active.load(std::memory_order_acquire); }
+    void setActive(bool a) { active.store(a, std::memory_order_release); }
 
     // ── Lifecycle (audio/device-management thread) ────────────────────────────
     // Reset rings to a clean cold start, size the zero-output scratch, and prepare
@@ -124,6 +135,9 @@ private:
     ChordScorer::Result scoreChordWithMl(const ChordScorer::Request& req) const;
     // Append post-gate mono samples to rawAudioRing (audio-thread only, RT-safe).
     void pushRawAudioFrame(const float* data, int numSamples) noexcept;
+
+    const int sourceId;
+    std::atomic<bool> active{false};
 
     // Engine-owned shared state (read-only here): the run-state guard and the
     // device sample rate, exactly as the original AudioEngine methods consulted.

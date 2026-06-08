@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 class AudioEngine : private juce::AudioIODeviceCallback
@@ -241,9 +242,34 @@ public:
     // HTML5-routed (sloppak) songs. Pushed each detect tick via getNoteVerdicts.
     void setPlayhead(double songTime, bool playing) { source0().setPlayhead(songTime, playing); }
 
+    // ── Multi-input source management ─────────────────────────────────────────
+    // A "source" is one independent input chain (its own arrangement chart, note
+    // detection, scoring, tone, and monitor). sources[0] always exists. Adding a
+    // source binds it to an input channel of the current device (multi-channel
+    // interface); separate-device binding lands in a later phase.
+    struct SourceInfo
+    {
+        int id = -1;
+        int inputChannel = -1;   // -1 = mono mix of first pair
+        bool active = false;
+    };
+
+    // Activate a pooled chain bound to `inputChannel` and return its id, or -1 if
+    // the pool is full. Prepares the chain immediately when audio is running so it
+    // starts scoring without a device restart. Control-thread only.
+    int addSource(int inputChannel);
+    // Deactivate + release a source (id != 0; sources[0] is permanent). Stops its
+    // verifier/ML threads; the pooled object is reused by a later addSource.
+    bool removeSource(int id);
+    // Snapshot of every active source. Control-thread only.
+    std::vector<SourceInfo> listSources() const;
+
+    // Per-source accessors for the NodeAddon source-indexed API. Return nullptr
+    // for an out-of-range or inactive id (sources[0] always valid).
+    SourceChain* getSource(int id);
+
 private:
-    // sources[0] is the legacy default input chain; always present (created in
-    // the constructor). Multi-source fan-out adds sources[1..N] later.
+    // sources[0] is the legacy default input chain; always present + active.
     SourceChain& source0() { return *sources[0]; }
     const SourceChain& source0() const { return *sources[0]; }
     // Input-device callback. In duplex it writes outputData directly; in split
@@ -310,14 +336,28 @@ private:
     juce::AudioDeviceManager outputDeviceManager;
     std::atomic<bool> duplexMode{true};
 
-    // Per-input capture+detect+monitor chains. sources[0] is the legacy default,
-    // created in the constructor and bound to the primary input device; each
-    // SourceChain owns its own gate, detectors, tone chain, rings, and verifier.
-    // The audio callback fans device channels out to each source (Phase 0 wires
-    // exactly sources[0]) and fans their monitor signals into the output mix.
-    // SourceChain reads the engine's audioRunning / currentSampleRate atomics
-    // through references bound at construction.
-    std::vector<std::unique_ptr<SourceChain>> sources;
+    // Per-input capture+detect+monitor chains. A FIXED pool, all constructed up
+    // front, so adding/removing a source never reassigns a pointer the audio
+    // thread is reading — addSource/removeSource only flip an atomic `active`
+    // flag (and prepare/release the chain). sources[0] is the legacy default,
+    // active from construction and bound to the primary input device. The audio
+    // callback fans device channels out to each active source and fans their
+    // monitor signals into the output mix. SourceChain reads the engine's
+    // audioRunning / currentSampleRate atomics through references bound at
+    // construction.
+    static constexpr int kMaxSources = 8;
+    std::array<std::unique_ptr<SourceChain>, kMaxSources> sources;
+    // Serialises addSource/removeSource (control threads only — never the audio
+    // thread, which just reads each slot's atomic `active`).
+    std::mutex sourcesMutex;
+    // Audio-thread scratch for the multi-source mix: each active source renders
+    // its 2-channel monitor here in turn, then it is summed into the output.
+    // Pre-sized in audioDeviceAboutToStart so the hot loop never allocates.
+    juce::AudioBuffer<float> sourceMonitorScratch;
+    // Bumped once at the top of every input callback. removeSource() flips a
+    // source inactive, then waits for this to advance two full callbacks before
+    // releasing it — guaranteeing no in-flight callback is still processing it.
+    std::atomic<uint64_t> callbackGeneration{0};
 
     juce::AudioFormatManager formatManager;
 
