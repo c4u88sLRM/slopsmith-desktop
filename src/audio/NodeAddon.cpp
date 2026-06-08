@@ -898,11 +898,11 @@ static Napi::Value GetRawAudioFrame(const Napi::CallbackInfo& info)
 //                                   //  f0 peak < ratio*strongest partial; lower
 //                                   //  for bass, <=0 disables (default 0.20)
 // }
-static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
+// Shared core: parse `reqObj` into a ChordScorer::Request and score it against
+// `target`'s input ring. `target` is sources[0] for the legacy scoreChord and
+// getSource(id) for the source-indexed scoreSourceChord.
+static Napi::Value scoreChordCore(Napi::Env env, Napi::Object reqObj, SourceChain* target)
 {
-    auto env = info.Env();
-    auto liveEngine = snapshotEngine();
-
     // Hard caps on caller-controlled array lengths. The scorer's
     // (arrangement, stringCount) validation only accepts up to 8
     // strings; chord-notes have a natural ceiling at the same value
@@ -927,11 +927,6 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
         failure.Set("results", Napi::Array::New(env, 0));
         return failure;
     };
-
-    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
-        return noRequestFailure();
-
-    auto reqObj = info[0].As<Napi::Object>();
 
     // Capture the notes array up front so every downstream failure
     // path can build a per-note all-miss result aligned 1:1 with the
@@ -1073,7 +1068,7 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
         req.notes.push_back(n);
     }
 
-    auto result = liveEngine->scoreChord(req);
+    auto result = target->scoreChord(req);
 
     auto out = Napi::Object::New(env);
     out.Set("score", result.score);
@@ -1109,6 +1104,199 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
     return out;
 }
 
+// Legacy: scoreChord(req) — targets sources[0]. Backward-compatible.
+static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    auto noRequestFailure = [&env]() {
+        auto failure = Napi::Object::New(env);
+        failure.Set("score", 0.0);
+        failure.Set("hitStrings", 0);
+        failure.Set("totalStrings", 0);
+        failure.Set("isHit", false);
+        failure.Set("results", Napi::Array::New(env, 0));
+        return failure;
+    };
+    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
+        return noRequestFailure();
+    return scoreChordCore(env, info[0].As<Napi::Object>(), liveEngine->getSource(0));
+}
+
+// Source-indexed: scoreSourceChord(sourceId, req). Bad id / payload -> the
+// same "no chord requested" failure shape (totalStrings=0).
+static Napi::Value ScoreSourceChord(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    auto noRequestFailure = [&env]() {
+        auto failure = Napi::Object::New(env);
+        failure.Set("score", 0.0);
+        failure.Set("hitStrings", 0);
+        failure.Set("totalStrings", 0);
+        failure.Set("isHit", false);
+        failure.Set("results", Napi::Array::New(env, 0));
+        return failure;
+    };
+    if (!liveEngine || info.Length() < 2 || !info[0].IsNumber() || !info[1].IsObject())
+        return noRequestFailure();
+    SourceChain* target = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    if (!target) return noRequestFailure();
+    return scoreChordCore(env, info[1].As<Napi::Object>(), target);
+}
+
+// ── Multi-input source management bridge ─────────────────────────────────────
+// A source is one independent input chain (own arrangement chart, detection,
+// scoring, tone, monitor). sources[0] always exists. The renderer adds a source
+// per extra player, binds it to an input channel, and drives its scoring via the
+// *Source* methods below; the legacy un-suffixed methods keep targeting source 0.
+
+// addSource(inputChannel?) -> sourceId (number), or -1 if the pool is full.
+static Napi::Value AddSource(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return Napi::Number::New(env, -1);
+    int channel = -1;  // default: mono mix of the first pair
+    if (info.Length() > 0 && info[0].IsNumber())
+        channel = info[0].As<Napi::Number>().Int32Value();
+    return Napi::Number::New(env, liveEngine->addSource(channel));
+}
+
+// removeSource(sourceId) -> boolean. sources[0] cannot be removed.
+static Napi::Value RemoveSource(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsNumber())
+        return Napi::Boolean::New(env, false);
+    return Napi::Boolean::New(env, liveEngine->removeSource(info[0].As<Napi::Number>().Int32Value()));
+}
+
+// listSources() -> [{ id, inputChannel, active }]. Null on a missing engine.
+static Napi::Value ListSources(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return env.Null();
+    const auto sources = liveEngine->listSources();
+    auto arr = Napi::Array::New(env, sources.size());
+    for (size_t i = 0; i < sources.size(); ++i)
+    {
+        auto entry = Napi::Object::New(env);
+        entry.Set("id", sources[i].id);
+        entry.Set("inputChannel", sources[i].inputChannel);
+        entry.Set("active", sources[i].active);
+        arr.Set((uint32_t) i, entry);
+    }
+    return arr;
+}
+
+// setSourceInputChannel(sourceId, channel)
+static Napi::Value SetSourceInputChannel(const Napi::CallbackInfo& info)
+{
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsNumber())
+        if (SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()))
+            s->setInputChannel(info[1].As<Napi::Number>().Int32Value());
+    return info.Env().Undefined();
+}
+
+// setSourceMonitorMute(sourceId, mute)
+static Napi::Value SetSourceMonitorMute(const Napi::CallbackInfo& info)
+{
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsBoolean())
+        if (SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()))
+            s->setMonitorMute(info[1].As<Napi::Boolean>().Value());
+    return info.Env().Undefined();
+}
+
+// getSourceRawAudioFrame(sourceId, numSamples?) -> Float32Array
+static Napi::Value GetSourceRawAudioFrame(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsNumber())
+        return Napi::Float32Array::New(env, 0);
+    SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    int numSamples = 4096;
+    if (info.Length() > 1 && info[1].IsNumber())
+        numSamples = info[1].As<Napi::Number>().Int32Value();
+    if (!s || numSamples <= 0)
+        return Napi::Float32Array::New(env, 0);
+    auto frame = s->getRawAudioFrame(numSamples);
+    auto out = Napi::Float32Array::New(env, frame.size());
+    float* dst = out.Data();
+    for (size_t i = 0; i < frame.size(); ++i)
+        dst[i] = frame[i];
+    return out;
+}
+
+// getSourcePitchDetection(sourceId) -> { frequency, confidence, midiNote, cents,
+// noteName }. The no-detection shape when the id is bad/inactive.
+static Napi::Value GetSourcePitchDetection(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto obj = Napi::Object::New(env);
+    auto liveEngine = snapshotEngine();
+    SourceChain* s = (liveEngine && info.Length() >= 1 && info[0].IsNumber())
+        ? liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()) : nullptr;
+    if (s)
+    {
+        auto det = s->getActiveDetection();
+        obj.Set("frequency", det.frequency);
+        obj.Set("confidence", det.confidence);
+        obj.Set("midiNote", det.midiNote);
+        obj.Set("cents", det.cents);
+        obj.Set("noteName", det.noteName.toStdString());
+    }
+    else
+    {
+        obj.Set("frequency", -1.0);
+        obj.Set("confidence", 0.0);
+        obj.Set("midiNote", -1);
+        obj.Set("cents", 0.0);
+        obj.Set("noteName", "");
+    }
+    return obj;
+}
+
+// getSourceNoteVerdicts(sourceId, songTime?, playing?) -> verdict array, or null
+// on a missing engine / bad id. Folds in the per-source playhead push like the
+// legacy getNoteVerdicts.
+static Napi::Value GetSourceNoteVerdicts(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsNumber())
+        return env.Null();
+    SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    if (!s) return env.Null();
+
+    if (info.Length() >= 3 && info[1].IsNumber() && info[2].IsBoolean())
+    {
+        const double songTime = info[1].As<Napi::Number>().DoubleValue();
+        if (std::isfinite(songTime))
+            s->setPlayhead(songTime, info[2].As<Napi::Boolean>().Value());
+    }
+
+    const auto verdicts = s->getNoteVerdicts();
+    auto arr = Napi::Array::New(env, verdicts.size());
+    for (size_t i = 0; i < verdicts.size(); ++i)
+    {
+        const auto& v = verdicts[i];
+        auto entry = Napi::Object::New(env);
+        entry.Set("id", v.id);
+        entry.Set("detected", v.detected);
+        entry.Set("detectedSongTime", v.detectedSongTime);
+        entry.Set("centsError", v.centsError);
+        entry.Set("snr", v.snr);
+        arr.Set((uint32_t) i, entry);
+    }
+    return arr;
+}
+
 // Push the song's note chart into the engine for continuous, background
 // verification. The notedetect plugin calls this once per arrangement load;
 // the engine's NoteVerifier thread then scores each note's timing window
@@ -1131,11 +1319,12 @@ static Napi::Value ScoreChord(const Napi::CallbackInfo& info)
 // }
 // Returns true when the chart was accepted, false on a malformed payload or
 // when no engine exists.
-static Napi::Value SetChart(const Napi::CallbackInfo& info)
+// Shared core: parse `reqObj` into a ChartUpdate and push it to `target`'s
+// verifier. `target` is sources[0] for the legacy setChart and getSource(id) for
+// the source-indexed setSourceChart. A malformed payload clears the target's
+// chart (so a failed reload can't leave a stale chart scoring) and returns false.
+static Napi::Value setChartCore(Napi::Env env, Napi::Object reqObj, SourceChain* target)
 {
-    auto env = info.Env();
-    auto liveEngine = snapshotEngine();
-
     // Generous cap on the chart length — a full song's note list is well
     // under this, but it bounds the worst-case allocation a malformed payload
     // (claiming a gigantic JS array length) could force over IPC.
@@ -1145,14 +1334,9 @@ static Napi::Value SetChart(const Napi::CallbackInfo& info)
     // currently holds — otherwise a failed (re)load leaves the previous
     // song's chart active and getNoteVerdicts() keeps emitting stale verdicts.
     auto reject = [&]() -> Napi::Value {
-        if (liveEngine) liveEngine->clearChart();
-        return Napi::Boolean::New(info.Env(), false);
+        if (target) target->clearChart();
+        return Napi::Boolean::New(env, false);
     };
-
-    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
-        return reject();
-
-    auto reqObj = info[0].As<Napi::Object>();
 
     NoteVerifier::ChartUpdate chart;
     if (reqObj.Has("arrangement") && reqObj.Get("arrangement").IsString())
@@ -1246,8 +1430,33 @@ static Napi::Value SetChart(const Napi::CallbackInfo& info)
         chart.notes.push_back(std::move(n));
     }
 
-    liveEngine->setChart(chart);
+    target->setChart(chart);
     return Napi::Boolean::New(env, true);
+}
+
+// Legacy: setChart(chart) — targets sources[0]. Backward-compatible.
+static Napi::Value SetChart(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsObject())
+    {
+        if (liveEngine) liveEngine->clearChart();
+        return Napi::Boolean::New(env, false);
+    }
+    return setChartCore(env, info[0].As<Napi::Object>(), liveEngine->getSource(0));
+}
+
+// Source-indexed: setSourceChart(sourceId, chart). Bad id / payload -> false.
+static Napi::Value SetSourceChart(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 2 || !info[0].IsNumber() || !info[1].IsObject())
+        return Napi::Boolean::New(env, false);
+    SourceChain* target = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    if (!target) return Napi::Boolean::New(env, false);
+    return setChartCore(env, info[1].As<Napi::Object>(), target);
 }
 
 // Drain the verdicts the NoteVerifier thread has finalized since the last
@@ -2705,6 +2914,19 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     exports.Set("scoreChord", Napi::Function::New(env, ScoreChord));
     exports.Set("setChart", Napi::Function::New(env, SetChart));
     exports.Set("getNoteVerdicts", Napi::Function::New(env, GetNoteVerdicts));
+
+    // Multi-input source-indexed API. The un-suffixed methods above keep
+    // targeting source 0 for backward compatibility.
+    exports.Set("addSource", Napi::Function::New(env, AddSource));
+    exports.Set("removeSource", Napi::Function::New(env, RemoveSource));
+    exports.Set("listSources", Napi::Function::New(env, ListSources));
+    exports.Set("setSourceInputChannel", Napi::Function::New(env, SetSourceInputChannel));
+    exports.Set("setSourceMonitorMute", Napi::Function::New(env, SetSourceMonitorMute));
+    exports.Set("setSourceChart", Napi::Function::New(env, SetSourceChart));
+    exports.Set("scoreSourceChord", Napi::Function::New(env, ScoreSourceChord));
+    exports.Set("getSourceNoteVerdicts", Napi::Function::New(env, GetSourceNoteVerdicts));
+    exports.Set("getSourceRawAudioFrame", Napi::Function::New(env, GetSourceRawAudioFrame));
+    exports.Set("getSourcePitchDetection", Napi::Function::New(env, GetSourcePitchDetection));
     exports.Set("getSampleRate", Napi::Function::New(env, GetSampleRate));
     exports.Set("loadNoteModel", Napi::Function::New(env, LoadNoteModel));
     exports.Set("isMlNoteDetection", Napi::Function::New(env, IsMlNoteDetection));
