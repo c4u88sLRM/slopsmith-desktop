@@ -591,15 +591,22 @@ export function initAudioBridge(): void {
     // un-suffixed methods above target it. All of these feature-detect so a
     // downlevel addon (pre-multi-source) is a clean no-op, not a thrown IPC error.
 
+    // A sourceId must be a non-negative integer. typeof===number alone is unsafe:
+    // NaN/Infinity/0.5 pass it, and the native Int32Value() coerces NaN/Inf to 0,
+    // which would silently retarget the LEGACY source 0 (the main player) — e.g.
+    // setSourceChart(NaN, ...) overwriting source 0's chart. Reject non-integers.
+    const validSourceId = (id: unknown): id is number =>
+        typeof id === 'number' && Number.isInteger(id) && id >= 0;
+    const validChannel = (ch: unknown): ch is number =>
+        typeof ch === 'number' && Number.isInteger(ch);
+
     // addSource(inputChannel?) -> sourceId (number), or -1 if the pool is full /
     // unsupported. -1 lets the renderer detect "no more sources" the same as a
     // missing method.
     ipcMain.handle('audio:addSource', (_event, inputChannel: unknown) => {
         if (!audio || typeof audio.addSource !== 'function') return -1;
         try {
-            const ch = typeof inputChannel === 'number' && Number.isFinite(inputChannel)
-                ? inputChannel : -1;
-            return audio.addSource(ch);
+            return audio.addSource(validChannel(inputChannel) ? inputChannel : -1);
         } catch (e: unknown) {
             console.warn(`[audio] addSource failed: ${e instanceof Error ? e.message : String(e)}`);
             return -1;
@@ -608,7 +615,7 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:removeSource', (_event, id: unknown) => {
         if (!audio || typeof audio.removeSource !== 'function') return false;
-        if (typeof id !== 'number') return false;
+        if (!validSourceId(id)) return false;
         try {
             return audio.removeSource(id);
         } catch (e: unknown) {
@@ -628,25 +635,34 @@ export function initAudioBridge(): void {
     });
 
     ipcMain.handle('audio:setSourceInputChannel', (_event, id: unknown, channel: unknown) => {
-        if (audio && typeof audio.setSourceInputChannel === 'function'
-            && typeof id === 'number' && typeof channel === 'number') {
+        if (!audio || typeof audio.setSourceInputChannel !== 'function') return;
+        if (!validSourceId(id) || !validChannel(channel)) return;
+        try {
             audio.setSourceInputChannel(id, channel);
+        } catch (e: unknown) {
+            console.warn(`[audio] setSourceInputChannel failed: ${e instanceof Error ? e.message : String(e)}`);
         }
     });
 
     ipcMain.handle('audio:setSourceMonitorMute', (_event, id: unknown, mute: unknown) => {
-        if (audio && typeof audio.setSourceMonitorMute === 'function'
-            && typeof id === 'number') {
-            audio.setSourceMonitorMute(id, Boolean(mute));
+        if (!audio || typeof audio.setSourceMonitorMute !== 'function') return;
+        // Require a real boolean — don't truthiness-coerce a bad arg (e.g. the
+        // string "false") into a real mute.
+        if (!validSourceId(id) || typeof mute !== 'boolean') return;
+        try {
+            audio.setSourceMonitorMute(id, mute);
+        } catch (e: unknown) {
+            console.warn(`[audio] setSourceMonitorMute failed: ${e instanceof Error ? e.message : String(e)}`);
         }
     });
 
     // Per-source twins of setChart / scoreChord / getNoteVerdicts / getRawAudio-
     // Frame / getPitchDetection. Same shapes as the legacy methods; the leading
-    // id selects the source. Null / -1 / safe defaults on a downlevel addon.
+    // id selects the source. Null / -1 / safe defaults on a downlevel addon or
+    // an invalid id (so a bad id can never fall through to source 0).
     ipcMain.handle('audio:setSourceChart', (_event, id: unknown, chart: unknown) => {
         if (!audio || typeof audio.setSourceChart !== 'function') return null;
-        if (typeof id !== 'number') return false;
+        if (!validSourceId(id)) return false;
         try {
             return audio.setSourceChart(id, chart);
         } catch (e: unknown) {
@@ -657,7 +673,7 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:scoreSourceChord', (_event, id: unknown, ctx: unknown) => {
         if (!audio || typeof audio.scoreSourceChord !== 'function') return null;
-        if (typeof id !== 'number') return null;
+        if (!validSourceId(id)) return null;
         try {
             return audio.scoreSourceChord(id, ctx);
         } catch (e: unknown) {
@@ -668,7 +684,7 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:getSourceNoteVerdicts', (_event, id: unknown, songTime: unknown, playing: unknown) => {
         if (!audio || typeof audio.getSourceNoteVerdicts !== 'function') return null;
-        if (typeof id !== 'number') return null;
+        if (!validSourceId(id)) return null;
         try {
             if (typeof songTime === 'number' && Number.isFinite(songTime)
                 && typeof playing === 'boolean') {
@@ -683,7 +699,7 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:getSourceRawAudioFrame', (_event, id: unknown, numSamples?: unknown) => {
         if (!audio || typeof audio.getSourceRawAudioFrame !== 'function'
-            || typeof id !== 'number') {
+            || !validSourceId(id)) {
             return new Float32Array(0);
         }
         try {
@@ -697,7 +713,7 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:getSourcePitchDetection', (_event, id: unknown) => {
         if (!audio || typeof audio.getSourcePitchDetection !== 'function'
-            || typeof id !== 'number') {
+            || !validSourceId(id)) {
             return { frequency: -1, confidence: 0, midiNote: -1, cents: 0, noteName: '' };
         }
         try {
