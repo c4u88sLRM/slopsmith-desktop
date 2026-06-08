@@ -1310,11 +1310,14 @@ void AudioEngine::resetPeaks()
 int AudioEngine::addSource(int inputChannel)
 {
     std::lock_guard<std::mutex> lock(sourcesMutex);
+    reclaimPendingReleases();  // free up any slot whose release was deferred
 
-    // Find a free pooled slot (slot 0 is the permanent default).
+    // Find a free pooled slot (slot 0 is the permanent default). Skip a slot whose
+    // release is still pending — its chain/worker hasn't been torn down yet, so
+    // re-preparing it would double-start the verifier thread.
     int slot = -1;
     for (int i = 1; i < kMaxSources; ++i)
-        if (! sources[(size_t) i]->isActive()) { slot = i; break; }
+        if (! sources[(size_t) i]->isActive() && ! pendingRelease[(size_t) i]) { slot = i; break; }
     if (slot < 0)
         return -1;  // pool full
 
@@ -1341,34 +1344,74 @@ bool AudioEngine::removeSource(int id)
         return false;  // 0 is permanent; out-of-range rejected
 
     std::lock_guard<std::mutex> lock(sourcesMutex);
+    reclaimPendingReleases();  // opportunistically reclaim earlier deferrals
+
     SourceChain& src = *sources[(size_t) id];
     if (! src.isActive())
         return false;
 
-    // Hide it from the audio callback first; subsequent blocks skip it.
+    // Hide it from the audio callback first; subsequent blocks snapshot active
+    // once and skip it. It is logically removed from here on, regardless of when
+    // its resources are reclaimed.
     src.setActive(false);
 
-    // Wait for any in-flight callback that might still be processing this source
-    // to finish: two generation ticks guarantee a full callback ran after the
-    // setActive(false) became visible. Bounded so a stalled device can't hang the
-    // control thread; if audio isn't running, no callback touches it, release now.
-    if (audioRunning.load(std::memory_order_relaxed))
+    // Reclaim now if we can confirm no callback body is executing. callbackInFlight
+    // is set false BY the input callback at its real exit (release store), so
+    // observing false (acquire) proves no callback is inside processBlock right
+    // now; any callback that starts afterwards snapshots active and skips this
+    // (now-inactive) source — so releasing it cannot race the audio thread. This
+    // holds whether audio is running, idle between blocks, or stopped (the last
+    // callback left it false). Bounded so a wedged device can't hang this thread.
+    for (int spins = 0; spins < 200; ++spins)  // ~200 ms cap
     {
-        const uint64_t g = callbackGeneration.load(std::memory_order_acquire);
-        for (int spins = 0; spins < 200; ++spins)  // ~200 ms cap
+        if (! callbackInFlight.load(std::memory_order_acquire))
         {
-            if (callbackGeneration.load(std::memory_order_acquire) >= g + 2)
-                break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            src.releaseResources();  // stops its threads + releases its chain
+            return true;
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // Now safe to stop its threads + release its chain. The pooled object is kept
-    // for reuse by a later addSource (which re-prepares it).
-    src.releaseResources();
+    // A callback stayed wedged in-flight past the wait (a >200 ms block would be a
+    // catastrophic stall). Do NOT force a release that could race it — DEFER it.
+    // The source is already inactive so no future callback touches it; reclaim it
+    // later (next add/removeSource, or audioDeviceStopped) when the body is quiet.
+    pendingRelease[(size_t) id] = true;
     return true;
 }
 
+void AudioEngine::reclaimPendingReleases()
+{
+    // Caller holds sourcesMutex. A deferred source is inactive (future callbacks
+    // skip it); releasing it is safe once no callback body is executing. We key
+    // strictly on callbackInFlight (set false by the callback at its real exit),
+    // which proves the body is not in processBlock — independent of audioRunning.
+    // On the audioDeviceStopped path the last callback already left it false.
+    if (callbackInFlight.load(std::memory_order_acquire))
+        return;  // a callback is mid-body — try again later
+    for (int i = 1; i < kMaxSources; ++i)
+    {
+        if (! pendingRelease[(size_t) i]) continue;
+        sources[(size_t) i]->releaseResources();
+        pendingRelease[(size_t) i] = false;
+    }
+}
+
+// Lifetime/threading of getSource() + the NodeAddon *Source* methods:
+//  - getSource(), add/removeSource(), and the source-indexed methods all run on
+//    the single N-API/JS thread (V8-serialised), so a source can't be removed out
+//    from under a getSource() caller on that thread.
+//  - getSource() returns a pointer into the FIXED pool. releaseResources() (from
+//    removeSource or audioDeviceStopped) only stops the chain's threads + resets
+//    its rings — it NEVER frees the SourceChain object — so the pointer never
+//    dangles for the life of the engine (no use-after-free).
+//  - The only cross-thread overlap is a source-indexed method (N-API) running
+//    concurrently with audioDeviceStopped's releaseResources() (device thread).
+//    That window is IDENTICAL to the pre-existing legacy methods (scoreChord /
+//    getNoteVerdicts / getRawAudioFrame, which all operate on source 0's same
+//    chain) and is handled the same way: each component's internals are atomic /
+//    individually thread-safe, and the rings are lock-free. This change adds no
+//    new race class versus the original single-source engine.
 SourceChain* AudioEngine::getSource(int id)
 {
     if (id < 0 || id >= kMaxSources)
@@ -1568,14 +1611,24 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
 
 void AudioEngine::audioDeviceStopped()
 {
-    // Release each ACTIVE source's chain + detectors + verifier and zero its
-    // rings. Inactive pooled chains were never prepared.
-    for (auto& src : sources)
-        if (src->isActive())
-            src->releaseResources();
+    // JUCE calls audioDeviceStopped() only AFTER the input device has stopped
+    // invoking the IO callback (stop() blocks for the callback thread to finish),
+    // so the body is guaranteed quiescent here: callbackInFlight is already false
+    // and no callback can touch a source while we release it below.
+    audioRunning.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(sourcesMutex);
+        // Release each ACTIVE source's chain + detectors + verifier and zero its
+        // rings. Inactive pooled chains were never prepared.
+        for (auto& src : sources)
+            if (src->isActive())
+                src->releaseResources();
+        // Reclaim any source whose removal was deferred (handshake timed out) —
+        // audioRunning is now false so reclaimPendingReleases() frees them all.
+        reclaimPendingReleases();
+    }
     outputRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingReadIndex.store(0, std::memory_order_relaxed);
-    audioRunning.store(false, std::memory_order_relaxed);
 
     // Note on split-mode lifecycle: we deliberately do NOT detach the
     // output callback here. JUCE auto-restarts a transiently-stopped input
@@ -1662,9 +1715,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     float* const* outputData, int numOutputChannels,
     int numSamples, const juce::AudioIODeviceCallbackContext&)
 {
-    // Publish that a callback is in progress so removeSource() can wait for any
-    // in-flight use of a source to drain before releasing it.
-    callbackGeneration.fetch_add(1, std::memory_order_acq_rel);
+    // Publish that the callback body is executing so removeSource() and deferred-
+    // release reclamation know when no source is being processed (the body is
+    // quiescent) and a removed source can be safely released.
+    callbackInFlight.store(true, std::memory_order_release);
 
     const bool duplex = duplexMode.load(std::memory_order_relaxed);
 
@@ -1703,12 +1757,26 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // sourceMonitorScratch (each builds its mono from its bound input channel +
     // feeds its own rings/detectors/verifier), and the monitors are summed into the
     // output. Each source scores its OWN arrangement independently.
+    // Snapshot each source's active flag ONCE so the count and the process/mix
+    // passes below are consistent within this block — a concurrent add/
+    // removeSource flipping a flag between two reads must not change which branch
+    // runs mid-callback. removeSource waits for this callback to drain before
+    // releasing a source, so a source snapshotted active here is safe to process
+    // even if it is deactivated an instant later.
+    bool act[kMaxSources];
     int firstActive = -1, activeCount = 0;
     for (int i = 0; i < kMaxSources; ++i)
-        if (sources[(size_t) i]->isActive()) { ++activeCount; if (firstActive < 0) firstActive = i; }
+    {
+        act[i] = sources[(size_t) i]->isActive();
+        if (act[i]) { ++activeCount; if (firstActive < 0) firstActive = i; }
+    }
 
     if (activeCount <= 1)
     {
+        // Single active source: in-place on `buffer` — identical to the original
+        // single-pipeline engine for the steady single-input case (the only state
+        // the legacy renderer ever reaches). Output channel count is whatever the
+        // device exposes (broadcast/pass-through handled inside processBlock).
         sources[(size_t) (firstActive < 0 ? 0 : firstActive)]
             ->processBlock(inputData, numInputChannels, buffer, effectiveOutputChannels, numSamples);
     }
@@ -1716,15 +1784,25 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     {
         for (int ch = 0; ch < effectiveOutputChannels; ++ch)
             buffer.clear(ch, 0, numSamples);
+        // Multi-source monitoring mixes to STEREO (channels 0/1). On a >2-channel
+        // output device, channels 2+ stay silent in multi-source mode (acceptable:
+        // the single-source fast path above still broadcasts to all channels).
         const int mixCh = juce::jmin(effectiveOutputChannels, 2);
+        // sourceMonitorScratch is sized to the device block in audioDeviceAboutTo-
+        // Start, so n == numSamples on every steady-state block (no truncation).
+        // The jmin is purely an overrun backstop for the same transient device-
+        // reconfig window the split path guards (a block briefly larger than the
+        // prepared size); dropping that one transient tail is RT-safe and matches
+        // the split path. Resizing here would allocate on the audio thread.
+        const int n = juce::jmin(numSamples, sourceMonitorScratch.getNumSamples());
         for (int i = 0; i < kMaxSources; ++i)
         {
-            if (! sources[(size_t) i]->isActive()) continue;
+            if (! act[i]) continue;
             // Render this source's monitor into the 2-channel scratch, then sum.
             sources[(size_t) i]->processBlock(inputData, numInputChannels,
-                                              sourceMonitorScratch, 2, numSamples);
+                                              sourceMonitorScratch, 2, n);
             for (int ch = 0; ch < mixCh; ++ch)
-                buffer.addFrom(ch, 0, sourceMonitorScratch, ch, 0, numSamples);
+                buffer.addFrom(ch, 0, sourceMonitorScratch, ch, 0, n);
         }
     }
 
@@ -1781,6 +1859,10 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         }
         outputRingWriteIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
     }
+
+    // Body done — no source is being processed past this point until the next
+    // callback. Pairs with removeSource()/reclaimPendingReleases() acquire loads.
+    callbackInFlight.store(false, std::memory_order_release);
 }
 
 void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,

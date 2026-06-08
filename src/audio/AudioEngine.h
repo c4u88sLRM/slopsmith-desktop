@@ -354,10 +354,21 @@ private:
     // its 2-channel monitor here in turn, then it is summed into the output.
     // Pre-sized in audioDeviceAboutToStart so the hot loop never allocates.
     juce::AudioBuffer<float> sourceMonitorScratch;
-    // Bumped once at the top of every input callback. removeSource() flips a
-    // source inactive, then waits for this to advance two full callbacks before
-    // releasing it — guaranteeing no in-flight callback is still processing it.
-    std::atomic<uint64_t> callbackGeneration{0};
+    // True while the audio callback body is executing. removeSource() flips a
+    // source inactive (future callbacks snapshot active once and skip it), then
+    // waits to observe callbackInFlight==false — at that instant no callback is
+    // inside processBlock, so the now-inactive source is safe to release. If a
+    // callback stays wedged in-flight past the bounded wait, the release is
+    // DEFERRED via pendingRelease[] and reclaimed later when the body is quiescent
+    // — never force-released while a callback might still touch the source.
+    std::atomic<bool> callbackInFlight{false};
+    // Sources whose release was deferred (handshake timed out). Reclaimed under
+    // sourcesMutex by reclaimPendingReleases() at the next add/removeSource and on
+    // device stop, once it is safe (audio stopped or no callback in flight).
+    std::array<bool, kMaxSources> pendingRelease{};
+    // Release any deferred sources that are now safe to reclaim. Caller holds
+    // sourcesMutex (or is the device-stop path, where the callback is gone).
+    void reclaimPendingReleases();
 
     juce::AudioFormatManager formatManager;
 
