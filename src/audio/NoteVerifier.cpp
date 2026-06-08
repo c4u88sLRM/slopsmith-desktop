@@ -1,5 +1,5 @@
 #include "NoteVerifier.h"
-#include "AudioEngine.h"
+#include "InputRingReader.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,8 +44,8 @@ struct NoteVerifier::Worker : public juce::Thread
 };
 
 // ── NoteVerifier ─────────────────────────────────────────────────────────────
-NoteVerifier::NoteVerifier(AudioEngine& ownerEngine)
-    : engine(ownerEngine) {}
+NoteVerifier::NoteVerifier(InputRingReader& ringReader)
+    : engine(ringReader) {}
 
 NoteVerifier::~NoteVerifier() { stop(); }
 

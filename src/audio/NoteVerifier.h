@@ -39,12 +39,12 @@
 #include <string>
 #include <vector>
 
-class AudioEngine;  // resolved in NoteVerifier.cpp — avoids a circular include
+class InputRingReader;  // resolved in NoteVerifier.cpp — avoids a circular include
 
 class NoteVerifier
 {
 public:
-    explicit NoteVerifier(AudioEngine& ownerEngine);
+    explicit NoteVerifier(InputRingReader& ringReader);
     ~NoteVerifier();
 
     // One chart note plus the technique flags ChordScorer consumes.
@@ -136,7 +136,10 @@ private:
         float bestCents = 0.0f;    // cents error at the strongest present tick
     };
 
-    AudioEngine& engine;
+    // The capture chain whose input ring this verifier scores against (the owning
+    // SourceChain). Bound at construction; reads getInputFrame/getInputSince/
+    // getCurrentSampleRate only — see InputRingReader.
+    InputRingReader& engine;
     ChordScorer chordScorer;
 
     // Background worker. Defined in the .cpp so this header stays free of the
