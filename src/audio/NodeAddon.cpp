@@ -1262,6 +1262,35 @@ static Napi::Value GetSourcePitchDetection(const Napi::CallbackInfo& info)
     return obj;
 }
 
+// getSourceRawPitchDetection(sourceId) -> raw YIN detection (bypasses ML), same
+// shape as getSourcePitchDetection. Backs the per-source sustain glow / mono path.
+static Napi::Value GetSourceRawPitchDetection(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto obj = Napi::Object::New(env);
+    auto liveEngine = snapshotEngine();
+    SourceChain* s = (liveEngine && info.Length() >= 1 && info[0].IsNumber())
+        ? liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()) : nullptr;
+    if (s)
+    {
+        auto det = s->getRawPitchDetection();
+        obj.Set("frequency", det.frequency);
+        obj.Set("confidence", det.confidence);
+        obj.Set("midiNote", det.midiNote);
+        obj.Set("cents", det.cents);
+        obj.Set("noteName", det.noteName.toStdString());
+    }
+    else
+    {
+        obj.Set("frequency", -1.0);
+        obj.Set("confidence", 0.0);
+        obj.Set("midiNote", -1);
+        obj.Set("cents", 0.0);
+        obj.Set("noteName", "");
+    }
+    return obj;
+}
+
 // getSourceNoteVerdicts(sourceId, songTime?, playing?) -> verdict array, or null
 // on a missing engine / bad id. Folds in the per-source playhead push like the
 // legacy getNoteVerdicts.
@@ -2927,6 +2956,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     exports.Set("getSourceNoteVerdicts", Napi::Function::New(env, GetSourceNoteVerdicts));
     exports.Set("getSourceRawAudioFrame", Napi::Function::New(env, GetSourceRawAudioFrame));
     exports.Set("getSourcePitchDetection", Napi::Function::New(env, GetSourcePitchDetection));
+    exports.Set("getSourceRawPitchDetection", Napi::Function::New(env, GetSourceRawPitchDetection));
     exports.Set("getSampleRate", Napi::Function::New(env, GetSampleRate));
     exports.Set("loadNoteModel", Napi::Function::New(env, LoadNoteModel));
     exports.Set("isMlNoteDetection", Napi::Function::New(env, IsMlNoteDetection));

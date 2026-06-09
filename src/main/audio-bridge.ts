@@ -724,6 +724,21 @@ export function initAudioBridge(): void {
         }
     });
 
+    // Per-source raw YIN detection (bypasses ML) — backs the sustain glow / mono
+    // path. Same shape as getSourcePitchDetection.
+    ipcMain.handle('audio:getSourceRawPitch', (_event, id: unknown) => {
+        if (!audio || typeof audio.getSourceRawPitchDetection !== 'function'
+            || !validSourceId(id)) {
+            return { frequency: -1, confidence: 0, midiNote: -1, cents: 0, noteName: '' };
+        }
+        try {
+            return audio.getSourceRawPitchDetection(id);
+        } catch (e: unknown) {
+            console.warn(`[audio] getSourceRawPitch failed: ${e instanceof Error ? e.message : String(e)}`);
+            return { frequency: -1, confidence: 0, midiNote: -1, cents: 0, noteName: '' };
+        }
+    });
+
     // Raw polyphonic transcription — the ML detector's full active-pitch set.
     // Returns null when the ML detector isn't active (downlevel addon, no ONNX
     // support, or no model loaded) so the renderer feature-detects and falls

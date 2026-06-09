@@ -336,6 +336,8 @@ const slopsmithDesktopApi = {
             ipcRenderer.invoke('audio:getSourceRawAudioFrame', id, numSamples),
         getSourcePitchDetection: (id: number) =>
             ipcRenderer.invoke('audio:getSourcePitchDetection', id),
+        getSourceRawPitch: (id: number) =>
+            ipcRenderer.invoke('audio:getSourceRawPitch', id),
 
         // VST plugins
         scanPlugins: (dirs?: string[]) => ipcRenderer.invoke('audio:scanPlugins', dirs),

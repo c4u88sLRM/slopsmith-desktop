@@ -83,10 +83,12 @@ if (audio) {
             assert.ok(frame instanceof Float32Array && frame.length === 2048, 'raw frame sized');
             assert.equal(audio.getSourceRawAudioFrame(999).length, 0, 'bad id -> empty');
 
-            const det = audio.getSourcePitchDetection(sid);
-            for (const k of ['frequency', 'confidence', 'midiNote', 'cents', 'noteName'])
-                assert.ok(k in det, `detection has ${k}`);
-            assert.equal(audio.getSourcePitchDetection(999).frequency, -1, 'bad id -> no-detection shape');
+            for (const fn of ['getSourcePitchDetection', 'getSourceRawPitchDetection']) {
+                const det = audio[fn](sid);
+                for (const k of ['frequency', 'confidence', 'midiNote', 'cents', 'noteName'])
+                    assert.ok(k in det, `${fn} detection has ${k}`);
+                assert.equal(audio[fn](999).frequency, -1, `${fn} bad id -> no-detection shape`);
+            }
         });
 
         await t.test('the pool is bounded and the 0 source is permanent', () => {
