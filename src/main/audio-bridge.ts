@@ -446,6 +446,18 @@ export function initAudioBridge(): void {
         return audio?.getLevels() ?? { inputLevel: 0, outputLevel: 0, inputPeak: 0, outputPeak: 0 };
     });
 
+    // Per-source input level (for a bound detector's silence gate on an extra device).
+    ipcMain.handle('audio:getSourceLevels', (_event, id: unknown) => {
+        const zero = { inputLevel: 0, outputLevel: 0, inputPeak: 0, outputPeak: 0 };
+        if (!audio || typeof audio.getSourceLevels !== 'function' || !validSourceId(id)) return zero;
+        try {
+            return audio.getSourceLevels(id);
+        } catch (e: unknown) {
+            console.warn(`[audio] getSourceLevels failed: ${e instanceof Error ? e.message : String(e)}`);
+            return zero;
+        }
+    });
+
     ipcMain.handle('audio:resetPeaks', () => {
         audio?.resetPeaks();
     });
@@ -599,17 +611,61 @@ export function initAudioBridge(): void {
         typeof id === 'number' && Number.isInteger(id) && id >= 0;
     const validChannel = (ch: unknown): ch is number =>
         typeof ch === 'number' && Number.isInteger(ch);
+    // deviceKey 0 = primary device; 1..N = an additional bound input device.
+    const validDeviceKey = (k: unknown): k is number =>
+        typeof k === 'number' && Number.isInteger(k) && k >= 0;
 
-    // addSource(inputChannel?) -> sourceId (number), or -1 if the pool is full /
-    // unsupported. -1 lets the renderer detect "no more sources" the same as a
-    // missing method.
-    ipcMain.handle('audio:addSource', (_event, inputChannel: unknown) => {
+    // addSource(inputChannel?, deviceKey?) -> sourceId (number), or -1 if the pool
+    // is full / unsupported. -1 lets the renderer detect "no more sources" the same
+    // as a missing method. deviceKey routes the source to an additional device.
+    ipcMain.handle('audio:addSource', (_event, inputChannel: unknown, deviceKey: unknown) => {
         if (!audio || typeof audio.addSource !== 'function') return -1;
         try {
-            return audio.addSource(validChannel(inputChannel) ? inputChannel : -1);
+            return audio.addSource(
+                validChannel(inputChannel) ? inputChannel : -1,
+                validDeviceKey(deviceKey) ? deviceKey : 0,
+            );
         } catch (e: unknown) {
             console.warn(`[audio] addSource failed: ${e instanceof Error ? e.message : String(e)}`);
             return -1;
+        }
+    });
+
+    // listInputDevices() -> [{ typeName, name }] | null. Capture devices available
+    // to bind as additional engine inputs.
+    ipcMain.handle('audio:listInputDevices', () => {
+        if (!audio || typeof audio.listInputDevices !== 'function') return null;
+        try {
+            return audio.listInputDevices();
+        } catch (e: unknown) {
+            console.warn(`[audio] listInputDevices failed: ${e instanceof Error ? e.message : String(e)}`);
+            return null;
+        }
+    });
+
+    // bindInputDevice(deviceKey, deviceName) -> "" on success or an error string
+    // (or a non-empty sentinel when unsupported).
+    ipcMain.handle('audio:bindInputDevice', (_event, deviceKey: unknown, deviceName: unknown) => {
+        if (!audio || typeof audio.bindInputDevice !== 'function') return 'unsupported';
+        if (!validDeviceKey(deviceKey) || deviceKey < 1) return 'invalid deviceKey';
+        if (typeof deviceName !== 'string' || deviceName.length === 0) return 'invalid deviceName';
+        try {
+            return audio.bindInputDevice(deviceKey, deviceName);
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.warn(`[audio] bindInputDevice failed: ${msg}`);
+            return msg;
+        }
+    });
+
+    ipcMain.handle('audio:unbindInputDevice', (_event, deviceKey: unknown) => {
+        if (!audio || typeof audio.unbindInputDevice !== 'function') return false;
+        if (!validDeviceKey(deviceKey) || deviceKey < 1) return false;
+        try {
+            return audio.unbindInputDevice(deviceKey);
+        } catch (e: unknown) {
+            console.warn(`[audio] unbindInputDevice failed: ${e instanceof Error ? e.message : String(e)}`);
+            return false;
         }
     });
 
@@ -641,6 +697,16 @@ export function initAudioBridge(): void {
             audio.setSourceInputChannel(id, channel);
         } catch (e: unknown) {
             console.warn(`[audio] setSourceInputChannel failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    });
+
+    ipcMain.handle('audio:setSourceVerifierOffset', (_event, id: unknown, seconds: unknown) => {
+        if (!audio || typeof audio.setSourceVerifierOffset !== 'function') return;
+        if (!validSourceId(id) || typeof seconds !== 'number' || !Number.isFinite(seconds)) return;
+        try {
+            audio.setSourceVerifierOffset(id, seconds);
+        } catch (e: unknown) {
+            console.warn(`[audio] setSourceVerifierOffset failed: ${e instanceof Error ? e.message : String(e)}`);
         }
     });
 

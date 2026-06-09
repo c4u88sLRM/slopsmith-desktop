@@ -101,6 +101,15 @@ public:
     };
 
     juce::Array<DeviceTypeInfo> getDeviceTypes();
+
+    // Phase 2: input devices the user can bind as an ADDITIONAL engine input —
+    // restricted to the PRIMARY input's device type (so a JACK pick can't collide
+    // with an ALSA primary), minus the device already open as the primary (that's
+    // "Main") and minus monitor/loopback pseudo-inputs. Keeps the per-panel device
+    // picker to a compatible, sensible set instead of every capture node.
+    struct BindableInput { juce::String typeName; juce::String name; };
+    std::vector<BindableInput> getBindableInputDevices();
+
     juce::Array<double> getSampleRates();
     juce::Array<int> getBufferSizes();
     DeviceOptions probeDeviceOptions(const juce::String& typeName,
@@ -251,18 +260,29 @@ public:
     {
         int id = -1;
         int inputChannel = -1;   // -1 = mono mix of first pair
+        int deviceKey = 0;       // 0 = primary input device
         bool active = false;
     };
 
-    // Activate a pooled chain bound to `inputChannel` and return its id, or -1 if
-    // the pool is full. Prepares the chain immediately when audio is running so it
-    // starts scoring without a device restart. Control-thread only.
-    int addSource(int inputChannel);
+    // Activate a pooled chain bound to `inputChannel` of input device `deviceKey`
+    // (0 = primary device) and return its id, or -1 if the pool is full. Prepares
+    // the chain immediately when audio is running so it starts scoring without a
+    // device restart. Control-thread only.
+    int addSource(int inputChannel, int deviceKey = 0);
     // Deactivate + release a source (id != 0; sources[0] is permanent). Stops its
     // verifier/ML threads; the pooled object is reused by a later addSource.
     bool removeSource(int id);
     // Snapshot of every active source. Control-thread only.
     std::vector<SourceInfo> listSources() const;
+
+    // Phase 2 (multi-device): open `deviceName` as an ADDITIONAL physical input
+    // device bound to `deviceKey` (1..kMaxExtraInputDevices) so sources created
+    // with addSource(channel, deviceKey) capture from it at its OWN clock. Forces
+    // split mode. Returns "" on success or an error string. unbind stops+releases
+    // it. activeExtraInputCount = # bound+running extras. Control-thread only.
+    juce::String bindInputDevice(int deviceKey, const juce::String& deviceName);
+    bool unbindInputDevice(int deviceKey);
+    int activeExtraInputCount() const;
 
     // Per-source accessors for the NodeAddon source-indexed API. Return nullptr
     // for an out-of-range or inactive id (sources[0] always valid).
@@ -346,6 +366,10 @@ private:
     // audioRunning / currentSampleRate atomics through references bound at
     // construction.
     static constexpr int kMaxSources = 8;
+    // Max ADDITIONAL input devices (beyond the primary). Declared here — ahead of the
+    // members that size arrays by it (e.g. callbacksInFlight) — though the extra-input
+    // slot registry that uses it lives further below.
+    static constexpr int kMaxExtraInputDevices = 3;
     std::array<std::unique_ptr<SourceChain>, kMaxSources> sources;
     // Serialises addSource/removeSource (control threads only — never the audio
     // thread, which just reads each slot's atomic `active`).
@@ -354,14 +378,18 @@ private:
     // its 2-channel monitor here in turn, then it is summed into the output.
     // Pre-sized in audioDeviceAboutToStart so the hot loop never allocates.
     juce::AudioBuffer<float> sourceMonitorScratch;
-    // True while the audio callback body is executing. removeSource() flips a
-    // source inactive (future callbacks snapshot active once and skip it), then
-    // waits to observe callbackInFlight==false — at that instant no callback is
-    // inside processBlock, so the now-inactive source is safe to release. If a
-    // callback stays wedged in-flight past the bounded wait, the release is
-    // DEFERRED via pendingRelease[] and reclaimed later when the body is quiescent
-    // — never force-released while a callback might still touch the source.
-    std::atomic<bool> callbackInFlight{false};
+    // Count of device callback bodies currently executing, PER deviceKey (index 0 =
+    // primary input, 1..kMaxExtraInputDevices = each extra-input slot). Each device
+    // callback increments its own key on entry and decrements at its real exit.
+    // removeSource() flips a source inactive (future callbacks snapshot active once
+    // and skip it), then waits to observe THIS SOURCE's deviceKey count == 0 — at
+    // that instant no callback that could touch this source is inside processBlock,
+    // so it is safe to release. Keying per-deviceKey (not a single global counter) is
+    // essential: with the primary + extra inputs on independent clocks they are
+    // rarely ALL idle at once, so a global check would strand removals during steady
+    // multi-device playback. A wedged callback past the bounded wait DEFERS the
+    // release via pendingRelease[], reclaimed later when that key's body is quiescent.
+    std::array<std::atomic<int>, kMaxExtraInputDevices + 1> callbacksInFlight{};
     // Sources whose release was deferred (handshake timed out). Reclaimed under
     // sourcesMutex by reclaimPendingReleases() at the next add/removeSource and on
     // device stop, once it is safe (audio stopped or no callback in flight).
@@ -473,6 +501,90 @@ private:
     std::vector<float> outputPullScratchR;
     juce::AudioBuffer<float> outputBackingBuffer;
     bool outputCallbackRegistered = false;
+
+    // ── Phase 2: additional input devices ────────────────────────────────────
+    // Each ADDITIONAL physical input device (a 2nd/3rd USB interface, e.g. two
+    // separate cables) gets its own AudioDeviceManager + callback running on its
+    // OWN hardware clock, packing its sources' mixed monitor into its own SPSC
+    // ring. audioOutputCallback drains+sums every active ring (drop-oldest wrap
+    // absorbs each device's drift independently — no cross-device resampling, the
+    // failure mode that corrupts a software combine). deviceKey 0 = the primary
+    // inputDeviceManager above; deviceKeys 1..kMaxExtraInputDevices map to
+    // extraInputs[deviceKey-1]. When any extra device is active the engine runs
+    // split (the primary also uses its ring) so the output sum is uniform.
+    // (kMaxExtraInputDevices is declared up top, near kMaxSources.)
+
+    // Forwards a JUCE device callback to the engine, tagged with the slot index.
+    struct InputSlotCallback : juce::AudioIODeviceCallback
+    {
+        AudioEngine* engine = nullptr;
+        int slot = -1;  // index into extraInputs (deviceKey - 1)
+        void audioDeviceIOCallbackWithContext(const float* const* inputData, int numInputChannels,
+                                              float* const* outputData, int numOutputChannels,
+                                              int numSamples,
+                                              const juce::AudioIODeviceCallbackContext&) override
+        {
+            juce::ignoreUnused(outputData, numOutputChannels);
+            if (engine) engine->extraInputCallback(slot, inputData, numInputChannels, numSamples);
+        }
+        void audioDeviceAboutToStart(juce::AudioIODevice* d) override { if (engine) engine->extraInputAboutToStart(slot, d); }
+        void audioDeviceStopped() override { if (engine) engine->extraInputStopped(slot); }
+    };
+
+    struct InputDeviceSlot
+    {
+        juce::AudioDeviceManager manager;
+        InputSlotCallback callback;
+        std::array<std::atomic<uint64_t>, kOutputRingFrames> ring{};
+        std::atomic<uint64_t> writeIndex{0};
+        std::atomic<uint64_t> readIndex{0};
+        std::atomic<uint64_t> overflowCount{0};
+        std::atomic<bool> active{false};      // a device is bound + running
+        std::atomic<double> sampleRate{48000.0};
+        std::atomic<int> blockSize{256};
+        // (extra input latency − primary input latency) in seconds — applied to
+        // this device's sources' verifiers so their capture aligns with the
+        // primary-corrected playhead. Computed when the device starts.
+        std::atomic<double> latencyDeltaSec{0.0};
+        // Audio-thread scratch — one set per slot since each slot's callback runs
+        // on its own thread (can't share the primary's sourceMonitorScratch).
+        juce::AudioBuffer<float> fanScratch;       // the 2ch mix target
+        juce::AudioBuffer<float> monitorScratch;   // per-source render in the N>1 path
+        int deviceKey = 0;                         // deviceKey this slot serves (slot+1)
+        // The device the user WANTS bound here — persistent INTENT, distinct from
+        // the transient `active` (currently open). Set by bindInputDevice, cleared
+        // only by a user unbind. stopAudio()/reconfigure close the device but keep
+        // this so startAudio() re-opens it; this is what survives a device change.
+        // Mutated + read on the control thread only.
+        juce::String desiredDeviceName;
+        // Whether the NEXT extraInputStopped() for this slot is a PERMANENT unbind
+        // (deactivate its sources) vs a transient close (keep them to resume). An
+        // atomic the control thread sets and the device thread reads, so the
+        // permanent-vs-transient decision never races on the juce::String above.
+        std::atomic<bool> permanentUnbind { false };
+    };
+    std::array<InputDeviceSlot, kMaxExtraInputDevices> extraInputs;
+
+    // Per-slot callback hooks (audio + device-management threads).
+    void extraInputCallback(int slot, const float* const* inputData, int numInputChannels, int numSamples);
+    void extraInputAboutToStart(int slot, juce::AudioIODevice* device);
+    void extraInputStopped(int slot);
+    // Close an extra device but KEEP its desiredDeviceName (transient close for
+    // stop/reconfigure); reopenDesiredExtraInputs() restores them after a (re)start.
+    bool closeExtraInputDevice(int slot);
+    void reopenDesiredExtraInputs();
+
+    // Shared fan-out used by both the primary and each extra device's callback:
+    // mix every active source bound to `deviceKey` into `mixBuf` (using the
+    // caller-owned `monitorScratch` for the N>1 render so concurrent device
+    // threads never share scratch). Returns the active source count for that key.
+    int mixSourcesForDevice(int deviceKey, const float* const* inputData, int numInputChannels,
+                            juce::AudioBuffer<float>& mixBuf, juce::AudioBuffer<float>& monitorScratch,
+                            int effectiveOutputChannels, int numSamples);
+    // Pack a stereo block into a packed-uint64 SPSC ring (producer side).
+    void packStereoIntoRing(const juce::AudioBuffer<float>& buf, int numSamples,
+                            std::array<std::atomic<uint64_t>, kOutputRingFrames>& ring,
+                            std::atomic<uint64_t>& writeIndex);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioEngine)
 };

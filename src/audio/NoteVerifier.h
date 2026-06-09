@@ -106,6 +106,15 @@ public:
     // published under `lock` so the worker reads a coherent snapshot.
     void setPlayhead(double songTime, bool playing);
 
+    // Extra per-source playhead correction (seconds), subtracted from every pushed
+    // playhead. The renderer's avOffset correction aligns the PRIMARY device; a
+    // source on an ADDITIONAL input device has a different capture latency, so its
+    // audio sits at a different song-time than the unified playhead assumes. The
+    // engine sets this to (extraInputLatency - primaryInputLatency) so the worker
+    // matches that device's just-captured audio against the right chart notes. 0
+    // for the primary device (the single-device path is unchanged).
+    void setPlayheadOffset(double seconds) { playheadOffsetSec.store(seconds, std::memory_order_relaxed); }
+
     // Start / stop the background thread — matches MlNoteDetector's lifecycle.
     void prepare(double sampleRate, int blockSize);
     void stop();
@@ -179,6 +188,9 @@ private:
     // (N-API thread) and read by currentPlayhead() (worker thread) — both
     // under `lock`, as one coherent snapshot, so a fresh songTime can never
     // be paired with a stale receiptMs/playing from an earlier push.
+    // Per-source capture-latency correction subtracted from each pushed playhead
+    // (0 on the primary device). See setPlayheadOffset.
+    std::atomic<double> playheadOffsetSec { 0.0 };
     double pushedSongTime = 0.0;
     double pushedReceiptMs = 0.0;  // getMillisecondCounterHiRes() at push
     bool   pushedPlaying = false;

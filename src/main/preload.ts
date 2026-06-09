@@ -234,6 +234,7 @@ const slopsmithDesktopApi = {
 
         // Metering (polled at 60fps from renderer)
         getLevels: () => ipcRenderer.invoke('audio:getLevels'),
+        getSourceLevels: (id: number) => ipcRenderer.invoke('audio:getSourceLevels', id),
         resetPeaks: () => ipcRenderer.invoke('audio:resetPeaks'),
 
         // Pitch detection (polled). Backed by the polyphonic ML detector
@@ -312,14 +313,26 @@ const slopsmithDesktopApi = {
         // Activate a pooled input chain bound to `inputChannel` (-1 = mono mix of
         // the first pair). Resolves the new sourceId, or -1 if the pool is full /
         // unsupported.
-        addSource: (inputChannel?: number): Promise<number> =>
-            ipcRenderer.invoke('audio:addSource', inputChannel),
+        // deviceKey routes the source to an additional bound input device (0 =
+        // primary). Resolves the new sourceId, or -1 if the pool is full / unsupported.
+        addSource: (inputChannel?: number, deviceKey?: number): Promise<number> =>
+            ipcRenderer.invoke('audio:addSource', inputChannel, deviceKey),
         removeSource: (id: number): Promise<boolean> =>
             ipcRenderer.invoke('audio:removeSource', id),
-        listSources: (): Promise<Array<{ id: number; inputChannel: number; active: boolean }> | null> =>
+        listSources: (): Promise<Array<{ id: number; inputChannel: number; deviceKey: number; active: boolean }> | null> =>
             ipcRenderer.invoke('audio:listSources'),
+        // Phase 2 multi-device: list capture devices + bind/unbind an additional
+        // input device (deviceKey 1..N) so a source can capture from it directly.
+        listInputDevices: (): Promise<Array<{ typeName: string; name: string }> | null> =>
+            ipcRenderer.invoke('audio:listInputDevices'),
+        bindInputDevice: (deviceKey: number, deviceName: string): Promise<string> =>
+            ipcRenderer.invoke('audio:bindInputDevice', deviceKey, deviceName),
+        unbindInputDevice: (deviceKey: number): Promise<boolean> =>
+            ipcRenderer.invoke('audio:unbindInputDevice', deviceKey),
         setSourceInputChannel: (id: number, channel: number): Promise<void> =>
             ipcRenderer.invoke('audio:setSourceInputChannel', id, channel),
+        setSourceVerifierOffset: (id: number, seconds: number): Promise<void> =>
+            ipcRenderer.invoke('audio:setSourceVerifierOffset', id, seconds),
         setSourceMonitorMute: (id: number, mute: boolean): Promise<void> =>
             ipcRenderer.invoke('audio:setSourceMonitorMute', id, mute),
 

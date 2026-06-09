@@ -102,6 +102,22 @@ public:
     void clearChart() { noteVerifier.clearChart(); }
     std::vector<NoteVerifier::Verdict> getNoteVerdicts() { return noteVerifier.drainVerdicts(); }
     void setPlayhead(double songTime, bool playing) { noteVerifier.setPlayhead(songTime, playing); }
+    // Per-source capture-latency correction (seconds), applied to the verifier
+    // playhead. Two INDEPENDENT components that SUM: the AUTO part is the engine's
+    // measured (extra-primary) device input-latency delta; the USER part is the
+    // renderer's manual fine-tune. Keeping them separate means a user nudge refines
+    // — rather than discards — the hardware compensation on platforms that report
+    // latency. 0 on the primary device.
+    void setVerifierAutoOffset(double seconds)
+    {
+        verifierAutoOffset.store(seconds, std::memory_order_relaxed);
+        noteVerifier.setPlayheadOffset(seconds + verifierUserOffset.load(std::memory_order_relaxed));
+    }
+    void setVerifierUserOffset(double seconds)
+    {
+        verifierUserOffset.store(seconds, std::memory_order_relaxed);
+        noteVerifier.setPlayheadOffset(verifierAutoOffset.load(std::memory_order_relaxed) + seconds);
+    }
 
     void setNoiseGate(bool enabled, float thresholdDb, float releaseMs, float depthDb)
     {
@@ -115,6 +131,14 @@ public:
     float getChainOutputGain() const { return chainOutputGain.load(); }
     void setInputChannel(int channel) { selectedInputChannel.store(channel); }
     int getInputChannel() const { return selectedInputChannel.load(); }
+    // Which physical input device this source captures from. 0 = the primary
+    // input device (the legacy single-device path; every source today). Phase 2
+    // lets a source bind an ADDITIONAL device's slot so two separate interfaces
+    // (e.g. two USB cables) each feed their own sources at their own clock —
+    // only that device's callback processes this source. selectedInputChannel is
+    // then a channel index WITHIN the bound device.
+    void setDeviceKey(int key) { deviceKey.store(key, std::memory_order_release); }
+    int getDeviceKey() const { return deviceKey.load(std::memory_order_acquire); }
     void setMonitorMute(bool mute) { monitorMuted.store(mute); }
     bool isMonitorMuted() const { return monitorMuted.load(); }
     void setMonitorMuteSuppressed(bool s) { monitorMuteSuppressed.store(s); }
@@ -123,6 +147,10 @@ public:
     float getInputLevel() const { return currentInputLevel.load(); }
     float getInputPeak() const { return inputPeak.load(); }
     void resetInputPeak() { inputPeak.store(0.0f); }
+    // Clear instantaneous level + latched peak — used when a pooled chain is reused
+    // for a new source so it doesn't report the previous player's meters until fresh
+    // audio arrives (getSourceLevels() exposes these per source).
+    void resetInputMeters() { currentInputLevel.store(0.0f); inputPeak.store(0.0f); }
     uint32_t getNonFiniteChainBlocks() const { return nonFiniteChainBlocks.load(std::memory_order_relaxed); }
 
     // ── InputRingReader ───────────────────────────────────────────────────────
@@ -159,6 +187,9 @@ private:
     std::atomic<float> currentInputLevel{0.0f};
     std::atomic<float> inputPeak{0.0f};
     std::atomic<int> selectedInputChannel{-1}; // -1 = mono mix
+    std::atomic<int> deviceKey{0};             // 0 = primary input device
+    std::atomic<double> verifierAutoOffset{0.0}; // engine: device-latency delta
+    std::atomic<double> verifierUserOffset{0.0}; // renderer: manual fine-tune
     std::atomic<bool> monitorMuted{true};
     std::atomic<bool> monitorMuteSuppressed{false};
     std::atomic<uint32_t> nonFiniteChainBlocks{0};

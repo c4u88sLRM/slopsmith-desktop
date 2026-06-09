@@ -687,6 +687,25 @@ static Napi::Value GetLevels(const Napi::CallbackInfo& info)
     return obj;
 }
 
+// getSourceLevels(sourceId) -> { inputLevel, inputPeak, outputLevel, outputPeak }.
+// Per-source INPUT level so a bound detector's silence gate reads ITS OWN device's
+// signal (not the global/primary level — which would force-fail every hit on an
+// extra device the user is actually playing). Output fields mirror the master and
+// are 0 (monitoring is post-mix / engine-global). Bad id -> all zeros.
+static Napi::Value GetSourceLevels(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto obj = Napi::Object::New(env);
+    auto liveEngine = snapshotEngine();
+    SourceChain* s = (liveEngine && info.Length() >= 1 && info[0].IsNumber())
+        ? liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()) : nullptr;
+    obj.Set("inputLevel", s ? (double) s->getInputLevel() : 0.0);
+    obj.Set("inputPeak",  s ? (double) s->getInputPeak()  : 0.0);
+    obj.Set("outputLevel", 0.0);
+    obj.Set("outputPeak", 0.0);
+    return obj;
+}
+
 static Napi::Value ResetPeaks(const Napi::CallbackInfo& info)
 {
     if (auto liveEngine = snapshotEngine()) liveEngine->resetPeaks();
@@ -1160,7 +1179,13 @@ static Napi::Value AddSource(const Napi::CallbackInfo& info)
     int channel = -1;  // default: mono mix of the first pair
     if (info.Length() > 0 && info[0].IsNumber())
         channel = info[0].As<Napi::Number>().Int32Value();
-    return Napi::Number::New(env, liveEngine->addSource(channel));
+    int deviceKey = 0;  // default: primary input device
+    if (info.Length() > 1 && info[1].IsNumber())
+    {
+        const int k = info[1].As<Napi::Number>().Int32Value();
+        if (k >= 0) deviceKey = k;  // negatives ignored → primary
+    }
+    return Napi::Number::New(env, liveEngine->addSource(channel, deviceKey));
 }
 
 // removeSource(sourceId) -> boolean. sources[0] cannot be removed.
@@ -1186,10 +1211,57 @@ static Napi::Value ListSources(const Napi::CallbackInfo& info)
         auto entry = Napi::Object::New(env);
         entry.Set("id", sources[i].id);
         entry.Set("inputChannel", sources[i].inputChannel);
+        entry.Set("deviceKey", sources[i].deviceKey);
         entry.Set("active", sources[i].active);
         arr.Set((uint32_t) i, entry);
     }
     return arr;
+}
+
+// listInputDevices() -> [{ typeName, name }]. Every available capture device the
+// renderer can bind to an additional engine input via bindInputDevice. Null on a
+// missing engine.
+static Napi::Value ListInputDevices(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return env.Null();
+    const auto devices = liveEngine->getBindableInputDevices();
+    auto arr = Napi::Array::New(env);
+    uint32_t n = 0;
+    for (const auto& d : devices)
+    {
+        auto entry = Napi::Object::New(env);
+        entry.Set("typeName", d.typeName.toStdString());
+        entry.Set("name", d.name.toStdString());
+        arr.Set(n++, entry);
+    }
+    return arr;
+}
+
+// bindInputDevice(deviceKey, deviceName) -> "" on success, else an error string.
+// Opens an ADDITIONAL physical input device (deviceKey 1..N) so sources created
+// with addSource(channel, deviceKey) capture from it at its own clock.
+static Napi::Value BindInputDevice(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine) return Napi::String::New(env, "no engine");
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsString())
+        return Napi::String::New(env, "bindInputDevice(deviceKey:number, deviceName:string)");
+    const int deviceKey = info[0].As<Napi::Number>().Int32Value();
+    const std::string name = info[1].As<Napi::String>().Utf8Value();
+    return Napi::String::New(env, liveEngine->bindInputDevice(deviceKey, name).toStdString());
+}
+
+// unbindInputDevice(deviceKey) -> boolean. Stops + releases the extra device.
+static Napi::Value UnbindInputDevice(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 1 || !info[0].IsNumber())
+        return Napi::Boolean::New(env, false);
+    return Napi::Boolean::New(env, liveEngine->unbindInputDevice(info[0].As<Napi::Number>().Int32Value()));
 }
 
 // setSourceInputChannel(sourceId, channel)
@@ -1199,6 +1271,23 @@ static Napi::Value SetSourceInputChannel(const Napi::CallbackInfo& info)
     if (liveEngine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsNumber())
         if (SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()))
             s->setInputChannel(info[1].As<Napi::Number>().Int32Value());
+    return info.Env().Undefined();
+}
+
+// setSourceVerifierOffset(sourceId, seconds) — per-source capture-latency
+// correction the user dials in for an extra input device (the residual offset
+// between that device's path and the primary's; not auto-measurable on JACK).
+// Positive seconds DELAYS this source's scoring playhead, negative ADVANCES it.
+static Napi::Value SetSourceVerifierOffset(const Napi::CallbackInfo& info)
+{
+    auto liveEngine = snapshotEngine();
+    if (liveEngine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsNumber())
+    {
+        const double sec = info[1].As<Napi::Number>().DoubleValue();
+        if (std::isfinite(sec))
+            if (SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()))
+                s->setVerifierUserOffset(sec);
+    }
     return info.Env().Undefined();
 }
 
@@ -2934,6 +3023,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
 
     // Metering
     exports.Set("getLevels", Napi::Function::New(env, GetLevels));
+    exports.Set("getSourceLevels", Napi::Function::New(env, GetSourceLevels));
     exports.Set("resetPeaks", Napi::Function::New(env, ResetPeaks));
 
     // Pitch detection
@@ -2949,7 +3039,11 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     exports.Set("addSource", Napi::Function::New(env, AddSource));
     exports.Set("removeSource", Napi::Function::New(env, RemoveSource));
     exports.Set("listSources", Napi::Function::New(env, ListSources));
+    exports.Set("listInputDevices", Napi::Function::New(env, ListInputDevices));
+    exports.Set("bindInputDevice", Napi::Function::New(env, BindInputDevice));
+    exports.Set("unbindInputDevice", Napi::Function::New(env, UnbindInputDevice));
     exports.Set("setSourceInputChannel", Napi::Function::New(env, SetSourceInputChannel));
+    exports.Set("setSourceVerifierOffset", Napi::Function::New(env, SetSourceVerifierOffset));
     exports.Set("setSourceMonitorMute", Napi::Function::New(env, SetSourceMonitorMute));
     exports.Set("setSourceChart", Napi::Function::New(env, SetSourceChart));
     exports.Set("scoreSourceChord", Napi::Function::New(env, ScoreSourceChord));
