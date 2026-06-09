@@ -222,14 +222,23 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         return pendingDeviceSave;
     }
 
-    function saveAppliedDeviceSettings(overrides = {}) {
-        if (!lastAppliedDeviceSettings) return Promise.resolve(null);
-        const settings = {
-            ...cloneDeviceSettings(lastAppliedDeviceSettings),
-            ...overrides,
-        };
-        rememberAppliedDeviceSettings(settings);
-        return saveDeviceSettings(settings);
+    async function saveAppliedDeviceSettings(overrides = {}) {
+        if (lastAppliedDeviceSettings) {
+            const settings = {
+                ...cloneDeviceSettings(lastAppliedDeviceSettings),
+                ...overrides,
+            };
+            rememberAppliedDeviceSettings(settings);
+            return saveDeviceSettings(settings);
+        }
+        // No applied device this session (no saved config, or saved config
+        // probe was incompatible). Preserve any previously-persisted device
+        // selection and only update the override keys (e.g. monitorMute) so
+        // user-toggleable prefs survive a restart even before Apply lands.
+        // Do NOT update lastAppliedDeviceSettings — isDeviceFormApplied()
+        // must keep returning false until an actual Apply succeeds.
+        const base = (await loadDeviceSettings()) || captureDeviceSettings();
+        return saveDeviceSettings({ ...cloneDeviceSettings(base), ...overrides });
     }
 
     async function loadDeviceSettings() {
@@ -793,7 +802,15 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             setSelectValueIfPresent(sampleRateSelect, saved.sampleRate);
             setSelectValueIfPresent(bufferSizeSelect, saved.bufferSize);
             setSelectValueIfPresent(inputChannelSelect, saved.inputChannel);
-            if (saved.monitorMute !== undefined) monitorMuteCheckbox.checked = saved.monitorMute;
+            if (saved.monitorMute !== undefined) {
+                monitorMuteCheckbox.checked = saved.monitorMute;
+                // Push to the engine immediately so the native state matches the
+                // UI even when the device probe below fails (incompatible saved
+                // config). Otherwise the AudioEngine stays at its `monitorMuted{true}`
+                // default while the checkbox says false → UI lies.
+                try { await api.setMonitorMute(saved.monitorMute); }
+                catch (e) { console.warn('[audio-engine] setMonitorMute restore failed:', e); }
+            }
 
             // Respect refreshDeviceOptions's fail-closed verdict: if the
             // probe didn't explicitly confirm compatible=true, skip the
@@ -820,7 +837,6 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                 if (ok) {
                     const inputChannel = parseInt(inputChannelSelect.value);
                     if (Number.isFinite(inputChannel)) await api.setInputChannel(inputChannel);
-                    if (saved.monitorMute !== undefined) await api.setMonitorMute(saved.monitorMute);
                     await api.startAudio();
                     audioRunning = true;
                     toggleBtn.textContent = 'Stop';
@@ -3816,20 +3832,50 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     // Called by clearChainForNewSong (IIFE 1) and the preload below.
     window._aeBeginChainRebuildGuard = function () { aeSetMonitorMuteSuppressed(true); };
 
+    const MONITOR_MUTE_HINT_DISMISSED_KEY = 'slopsmith-monitor-mute-hint-dismissed';
     function showMonitorMuteHint() {
+        try { if (localStorage.getItem(MONITOR_MUTE_HINT_DISMISSED_KEY) === '1') return; } catch (_) {}
         let toast = document.getElementById('monitor-mute-hint');
         if (!toast) {
             toast = document.createElement('div');
             toast.id = 'monitor-mute-hint';
-            toast.style.cssText = 'position:fixed;top:60px;right:20px;z-index:9999;max-width:320px;padding:10px 16px;border-radius:8px;background:rgba(180,83,9,0.95);color:white;font-size:12px;font-weight:600;cursor:pointer;transition:opacity 0.5s;';
-            toast.title = 'Click to dismiss';
-            toast.addEventListener('click', () => toast.remove());
+            toast.style.cssText = 'position:fixed;top:60px;right:20px;z-index:9999;max-width:320px;padding:10px 16px;border-radius:8px;background:rgba(180,83,9,0.95);color:white;font-size:12px;font-weight:600;transition:opacity 0.5s;pointer-events:auto;';
+
+            const msg = document.createElement('div');
+            msg.textContent = 'Monitor mute is on and no tone is loaded — add an amp/VST or load a preset to hear a processed tone.';
+            msg.style.marginBottom = '8px';
+            toast.appendChild(msg);
+
+            const actions = document.createElement('div');
+            actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;';
+            const mkBtn = (label, onClick) => {
+                const b = document.createElement('button');
+                // Explicit type='button' — HTML defaults to 'submit', which
+                // would trigger form submission if this toast ever lands
+                // inside a form ancestor.
+                b.type = 'button';
+                b.textContent = label;
+                b.style.cssText = 'background:rgba(255,255,255,0.15);border:0;color:white;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;';
+                b.addEventListener('click', onClick);
+                return b;
+            };
+            actions.appendChild(mkBtn('Dismiss', () => toast.remove()));
+            actions.appendChild(mkBtn("Don't show again", () => {
+                try { localStorage.setItem(MONITOR_MUTE_HINT_DISMISSED_KEY, '1'); } catch (_) {}
+                toast.remove();
+            }));
+            toast.appendChild(actions);
             document.body.appendChild(toast);
         }
-        toast.textContent = 'Monitor mute is on and no tone is loaded — add an amp/VST or load a preset to hear a processed tone.';
         toast.style.opacity = '1';
+        toast.style.pointerEvents = 'auto';
         clearTimeout(toast._timer);
-        toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 6000);
+        toast._timer = setTimeout(() => {
+            toast.style.opacity = '0';
+            // Drop pointer-events with the fade so the invisible container can't
+            // swallow clicks in the top-right corner of the app afterwards.
+            toast.style.pointerEvents = 'none';
+        }, 6000);
     }
 
     // Run once the rebuild has settled: if a real chain exists, restore normal
