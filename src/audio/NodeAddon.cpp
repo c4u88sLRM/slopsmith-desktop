@@ -59,6 +59,22 @@ static std::shared_ptr<AudioEngine> snapshotEngine()
     return engine;
 }
 
+// Validate a JS source-id argument and return the live source, or nullptr if it is
+// missing / not a Number / not a FINITE INTEGER / out of range. The TS bridge already
+// validates, but the addon must fail soft on its own: Int32Value() silently coerces
+// NaN/Infinity into a valid index (NaN -> 0), which would let a malformed id hit a
+// real source (e.g. the default source 0). getSource() does the final
+// [0, kMaxSources) + active check; the 4096 guard keeps the cast well-defined.
+static SourceChain* getValidatedSource(AudioEngine* eng, const Napi::CallbackInfo& info, size_t argIndex)
+{
+    if (eng == nullptr || argIndex >= info.Length() || ! info[argIndex].IsNumber())
+        return nullptr;
+    const double raw = info[argIndex].As<Napi::Number>().DoubleValue();
+    if (! std::isfinite(raw) || raw != std::floor(raw) || raw < 0.0 || raw > 4096.0)
+        return nullptr;
+    return eng->getSource((int) raw);
+}
+
 static std::shared_ptr<VSTHost> vstHost;
 static std::mutex vstHostMutex;
 
@@ -698,7 +714,7 @@ static Napi::Value GetSourceLevels(const Napi::CallbackInfo& info)
     auto obj = Napi::Object::New(env);
     auto liveEngine = snapshotEngine();
     SourceChain* s = (liveEngine && info.Length() >= 1 && info[0].IsNumber())
-        ? liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()) : nullptr;
+        ? getValidatedSource(liveEngine.get(), info, 0) : nullptr;
     obj.Set("inputLevel", s ? (double) s->getInputLevel() : 0.0);
     obj.Set("inputPeak",  s ? (double) s->getInputPeak()  : 0.0);
     obj.Set("outputLevel", 0.0);
@@ -1159,7 +1175,7 @@ static Napi::Value ScoreSourceChord(const Napi::CallbackInfo& info)
     };
     if (!liveEngine || info.Length() < 2 || !info[0].IsNumber() || !info[1].IsObject())
         return noRequestFailure();
-    SourceChain* target = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    SourceChain* target = getValidatedSource(liveEngine.get(), info, 0);
     if (!target) return noRequestFailure();
     return scoreChordCore(env, info[1].As<Napi::Object>(), target);
 }
@@ -1269,7 +1285,7 @@ static Napi::Value SetSourceInputChannel(const Napi::CallbackInfo& info)
 {
     auto liveEngine = snapshotEngine();
     if (liveEngine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsNumber())
-        if (SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()))
+        if (SourceChain* s = getValidatedSource(liveEngine.get(), info, 0))
             s->setInputChannel(info[1].As<Napi::Number>().Int32Value());
     return info.Env().Undefined();
 }
@@ -1285,7 +1301,7 @@ static Napi::Value SetSourceVerifierOffset(const Napi::CallbackInfo& info)
     {
         const double sec = info[1].As<Napi::Number>().DoubleValue();
         if (std::isfinite(sec))
-            if (SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()))
+            if (SourceChain* s = getValidatedSource(liveEngine.get(), info, 0))
                 s->setVerifierUserOffset(sec);
     }
     return info.Env().Undefined();
@@ -1296,7 +1312,7 @@ static Napi::Value SetSourceMonitorMute(const Napi::CallbackInfo& info)
 {
     auto liveEngine = snapshotEngine();
     if (liveEngine && info.Length() >= 2 && info[0].IsNumber() && info[1].IsBoolean())
-        if (SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()))
+        if (SourceChain* s = getValidatedSource(liveEngine.get(), info, 0))
             s->setMonitorMute(info[1].As<Napi::Boolean>().Value());
     return info.Env().Undefined();
 }
@@ -1308,7 +1324,7 @@ static Napi::Value GetSourceRawAudioFrame(const Napi::CallbackInfo& info)
     auto liveEngine = snapshotEngine();
     if (!liveEngine || info.Length() < 1 || !info[0].IsNumber())
         return Napi::Float32Array::New(env, 0);
-    SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    SourceChain* s = getValidatedSource(liveEngine.get(), info, 0);
     int numSamples = 4096;
     if (info.Length() > 1 && info[1].IsNumber())
         numSamples = info[1].As<Napi::Number>().Int32Value();
@@ -1330,7 +1346,7 @@ static Napi::Value GetSourcePitchDetection(const Napi::CallbackInfo& info)
     auto obj = Napi::Object::New(env);
     auto liveEngine = snapshotEngine();
     SourceChain* s = (liveEngine && info.Length() >= 1 && info[0].IsNumber())
-        ? liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()) : nullptr;
+        ? getValidatedSource(liveEngine.get(), info, 0) : nullptr;
     if (s)
     {
         auto det = s->getActiveDetection();
@@ -1359,7 +1375,7 @@ static Napi::Value GetSourceRawPitchDetection(const Napi::CallbackInfo& info)
     auto obj = Napi::Object::New(env);
     auto liveEngine = snapshotEngine();
     SourceChain* s = (liveEngine && info.Length() >= 1 && info[0].IsNumber())
-        ? liveEngine->getSource(info[0].As<Napi::Number>().Int32Value()) : nullptr;
+        ? getValidatedSource(liveEngine.get(), info, 0) : nullptr;
     if (s)
     {
         auto det = s->getRawPitchDetection();
@@ -1389,7 +1405,7 @@ static Napi::Value GetSourceNoteVerdicts(const Napi::CallbackInfo& info)
     auto liveEngine = snapshotEngine();
     if (!liveEngine || info.Length() < 1 || !info[0].IsNumber())
         return env.Null();
-    SourceChain* s = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    SourceChain* s = getValidatedSource(liveEngine.get(), info, 0);
     if (!s) return env.Null();
 
     if (info.Length() >= 3 && info[1].IsNumber() && info[2].IsBoolean())
@@ -1572,7 +1588,7 @@ static Napi::Value SetSourceChart(const Napi::CallbackInfo& info)
     auto liveEngine = snapshotEngine();
     if (!liveEngine || info.Length() < 2 || !info[0].IsNumber() || !info[1].IsObject())
         return Napi::Boolean::New(env, false);
-    SourceChain* target = liveEngine->getSource(info[0].As<Napi::Number>().Int32Value());
+    SourceChain* target = getValidatedSource(liveEngine.get(), info, 0);
     if (!target) return Napi::Boolean::New(env, false);
     return setChartCore(env, info[1].As<Napi::Object>(), target);
 }
