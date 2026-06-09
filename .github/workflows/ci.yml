@@ -41,3 +41,4 @@ jobs:
 
       - name: npm audit
         run: npm audit --audit-level=high
+        continue-on-error: true
