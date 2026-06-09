@@ -6,6 +6,7 @@ set(AUDIO_SOURCES
     NoiseGate.cpp
     TonePolish.cpp
     AudioEngine.cpp
+    SourceChain.cpp
     SignalChain.cpp
     VSTHost.cpp
     NAMProcessor.cpp
