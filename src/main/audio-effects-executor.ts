@@ -337,8 +337,14 @@ function validatePlan(request: unknown): { ok: true; plan: ValidPlan; presetJson
     });
 
     const nativeStageIds = stages.filter((stage) => stage.native).map((stage) => stage.stageId);
+    const seenSegmentIds = new Set<string>();
     const segments: ValidSegment[] = asArray(planInput.segments).slice(0, MAX_SEGMENTS).map((segment, index) => {
         const item = asRecord(segment) || {};
+        // segmentId is the public lookup key; activateSegment() resolves it with Array.find,
+        // so a duplicate would make the later segment unreachable. Reject the plan instead.
+        const segmentId = safeId(item.segmentId ?? item.toneKey ?? item.id ?? `segment-${index}`, `segment-${index}`);
+        if (seenSegmentIds.has(segmentId)) errors.push(`Audio-effects chain plan has a duplicate segmentId: ${segmentId}`);
+        seenSegmentIds.add(segmentId);
         const rawStageBypass = asRecord(item.stageBypass) || asRecord(item.stageBypasses) || asRecord(item.bypassByStage) || {};
         const stageBypass: Record<string, boolean> = {};
         for (const [stageId, bypassed] of Object.entries(rawStageBypass)) {
@@ -346,7 +352,7 @@ function validatePlan(request: unknown): { ok: true; plan: ValidPlan; presetJson
             if (nativeStageIds.includes(safeStageId)) stageBypass[safeStageId] = safeBool(bypassed, false);
         }
         return {
-            segmentId: safeId(item.segmentId ?? item.toneKey ?? item.id ?? `segment-${index}`, `segment-${index}`),
+            segmentId,
             stageIds: asArray(item.stageIds ?? item.stages).map((value) => safeId(value, '')).filter((value) => nativeStageIds.includes(value)),
             stageBypass,
         };
@@ -509,7 +515,20 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
             });
         }
 
-        const slots = chainSlots(nativeAudio);
+        let slots: Dict[];
+        try {
+            slots = chainSlots(nativeAudio);
+        } catch (error) {
+            const rollbackApplied = await restorePreset(nativeAudio, rollbackPreset);
+            if (options.preloadMute?.enabled) schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, 0, () => restoreVersion === preloadRestoreVersion);
+            return safeOutcome('failed', 'Native chain-state lookup threw', {
+                routeKey: validation.plan.routeKey,
+                providerId: validation.plan.providerId,
+                planId: validation.plan.planId,
+                error: bounded(error instanceof Error ? error.message : String(error)),
+                rollbackApplied,
+            });
+        }
         const stageSlots = new Map<string, number>();
         const stageKinds = new Map<string, string>();
         nativeStages.forEach((stage, index) => {
@@ -517,6 +536,20 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
             if (slotId >= 0) stageSlots.set(stage.stageId, slotId);
             stageKinds.set(stage.stageId, stage.kind);
         });
+        // Every native stage must map to a real slot; an incomplete mapping would report the load
+        // as handled while later stage operations silently return no-target. Roll back instead.
+        if (stageSlots.size !== nativeStages.length) {
+            const rollbackApplied = await restorePreset(nativeAudio, rollbackPreset);
+            if (options.preloadMute?.enabled) schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, 0, () => restoreVersion === preloadRestoreVersion);
+            return safeOutcome('degraded', 'Native slot mapping was incomplete and was rolled back', {
+                routeKey: validation.plan.routeKey,
+                providerId: validation.plan.providerId,
+                planId: validation.plan.planId,
+                stageCount: nativeStages.length,
+                slotsMapped: stageSlots.size,
+                rollbackApplied,
+            });
+        }
 
         const route: RouteState = {
             routeKey: validation.plan.routeKey,

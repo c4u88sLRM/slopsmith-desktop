@@ -92,6 +92,78 @@ test('audio-effects executor validates and loads a trusted chain plan without le
     assert.equal(encoded.includes('asset:pre'), false);
 });
 
+test('audio-effects executor rejects a plan with duplicate segmentIds', async () => {
+    const { createAudioEffectsExecutor } = loadExecutorModule();
+    const native = {
+        loadPreset: async () => ({ success: true, slotsLoaded: 2 }),
+        getChainState: () => [{ id: 10 }, { id: 11 }],
+    };
+    const executor = createAudioEffectsExecutor(() => native);
+    const namPath = tempAsset('.nam');
+    const irPath = tempAsset('.wav');
+    const loaded = await executor.loadChainPlan({
+        authorization: 'playback-session',
+        plan: plan({ segments: [
+            { segmentId: 'lead', stageIds: ['pre'] },
+            { segmentId: 'lead', stageIds: ['cab'] },
+        ] }),
+        assets: {
+            'asset:pre': { kind: 'nam', path: namPath, safeName: 'pre' },
+            'asset:cab': { kind: 'ir', path: irPath, safeName: 'cab' },
+        },
+    });
+    assert.equal(loaded.outcome, 'failed');
+    assert.equal(JSON.stringify(loaded.payload.errors).includes('duplicate segmentId'), true);
+});
+
+test('audio-effects executor returns failed (with rollback) when native chain-state lookup throws', async () => {
+    const { createAudioEffectsExecutor } = loadExecutorModule();
+    const native = {
+        savePreset: () => 'previous',
+        loadPreset: async () => ({ success: true, slotsLoaded: 2 }),
+        getChainState: () => { throw new Error('native chain-state boom'); },
+    };
+    const executor = createAudioEffectsExecutor(() => native);
+    const namPath = tempAsset('.nam');
+    const irPath = tempAsset('.wav');
+    const loaded = await executor.loadChainPlan({
+        authorization: 'playback-session',
+        plan: plan(),
+        assets: {
+            'asset:pre': { kind: 'nam', path: namPath, safeName: 'pre' },
+            'asset:cab': { kind: 'ir', path: irPath, safeName: 'cab' },
+        },
+    });
+    assert.equal(loaded.outcome, 'failed');
+    assert.equal(loaded.payload.rollbackApplied, true);
+    // The route must not be registered when the lookup failed.
+    assert.equal(executor.inspectRoute('desktop-main').outcome, 'no-target');
+});
+
+test('audio-effects executor rolls back to degraded when native slot mapping is incomplete', async () => {
+    const { createAudioEffectsExecutor } = loadExecutorModule();
+    const native = {
+        savePreset: () => 'previous',
+        loadPreset: async () => ({ success: true, slotsLoaded: 2 }),
+        // loadPreset reports both stages loaded, but the chain state only maps one valid slot.
+        getChainState: () => [{ id: 10 }, { id: -1 }],
+    };
+    const executor = createAudioEffectsExecutor(() => native);
+    const namPath = tempAsset('.nam');
+    const irPath = tempAsset('.wav');
+    const loaded = await executor.loadChainPlan({
+        authorization: 'playback-session',
+        plan: plan(),
+        assets: {
+            'asset:pre': { kind: 'nam', path: namPath, safeName: 'pre' },
+            'asset:cab': { kind: 'ir', path: irPath, safeName: 'cab' },
+        },
+    });
+    assert.equal(loaded.outcome, 'degraded');
+    assert.equal(loaded.payload.slotsMapped, 1);
+    assert.equal(executor.inspectRoute('desktop-main').outcome, 'no-target');
+});
+
 test('audio-effects executor owns load mute, route gain, start, and release', async () => {
     const { createAudioEffectsExecutor } = loadExecutorModule();
     const calls = [];
