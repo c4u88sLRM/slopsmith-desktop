@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import { app } from 'electron';
 import { isDebugEnabled, getDebugLogPath } from './debug-log';
 import { initVstCrashGuard, armSentinel, disarmSentinel, armEditorSentinel } from './vst-crash-guard';
+import { createAudioEffectsExecutor } from './audio-effects-executor';
 
 type AudioModule = Record<string, (...args: any[]) => any>;
 
@@ -127,6 +128,65 @@ function normalizeDeviceOptions(
     };
 }
 
+type DeviceConfigPayload = {
+    inputType: string;
+    inputDevice: string;
+    outputType: string;
+    outputDevice: string;
+    sampleRate: number;
+    bufferSize: number;
+};
+
+function normalizeDeviceConfigPayload(payload: unknown): DeviceConfigPayload {
+    const record = asRecord(payload) || {};
+    const inputType = String(record.inputType ?? record.type ?? '');
+    const sampleRate = Number(record.sampleRate);
+    const bufferSize = Number(record.bufferSize);
+    return {
+        inputType,
+        inputDevice: String(record.inputDevice ?? record.input ?? ''),
+        outputType: String(record.outputType ?? record.type ?? inputType),
+        outputDevice: String(record.outputDevice ?? record.output ?? ''),
+        sampleRate: Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 48000,
+        bufferSize: Number.isFinite(bufferSize) && bufferSize > 0 ? bufferSize : 256,
+    };
+}
+
+function normalizeDeviceConfigResult(result: unknown, fallbackError = '') {
+    if (typeof result === 'boolean') {
+        return {
+            ok: result,
+            error: result ? '' : fallbackError,
+            duplex: true,
+            sampleRate: 0,
+            inputBlockSize: 0,
+            outputBlockSize: 0,
+        };
+    }
+    const record = asRecord(result);
+    if (!record) {
+        return {
+            ok: false,
+            error: fallbackError || 'Native audio device call returned an unsupported result',
+            duplex: true,
+            sampleRate: 0,
+            inputBlockSize: 0,
+            outputBlockSize: 0,
+        };
+    }
+    const sampleRate = Number(record.sampleRate);
+    const inputBlockSize = Number(record.inputBlockSize);
+    const outputBlockSize = Number(record.outputBlockSize);
+    return {
+        ok: record.ok === true,
+        error: String(record.error ?? fallbackError ?? ''),
+        duplex: record.duplex !== false,
+        sampleRate: Number.isFinite(sampleRate) ? sampleRate : 0,
+        inputBlockSize: Number.isFinite(inputBlockSize) ? inputBlockSize : 0,
+        outputBlockSize: Number.isFinite(outputBlockSize) ? outputBlockSize : 0,
+    };
+}
+
 function getAudioSettingsPath(): string {
     return path.join(app.getPath('userData'), 'slopsmith-audio-settings.json');
 }
@@ -189,6 +249,7 @@ function loadNativeAddon(): AudioModule | null {
 
 export function initAudioBridge(): void {
     audio = loadNativeAddon();
+    const audioEffects = createAudioEffectsExecutor(() => audio);
 
     if (audio) {
         // Redirect native stderr to the debug log before init() runs — that's
@@ -297,6 +358,35 @@ export function initAudioBridge(): void {
                 probeError = e instanceof Error ? e.message : String(e);
                 console.warn(`[audio] probeDeviceOptions threw: ${probeError}`);
             }
+            const normalized = normalizeDeviceOptions(options, {
+                type: String(inputType || ''),
+                inputType: String(inputType || ''),
+                outputType: String(outputType || ''),
+                input: String(inputName || ''),
+                output: String(outputName || ''),
+                error: probeError,
+                compatible: false,
+            });
+            const looksLikeLegacyOverload = normalized.output === outputType;
+            if (isDual && looksLikeLegacyOverload) {
+                try {
+                    const legacyOptions = audio.probeDeviceOptions(inputType, inputName, outputName);
+                    return normalizeDeviceOptions(legacyOptions, {
+                        type: String(inputType || ''),
+                        inputType: String(inputType || ''),
+                        outputType: String(outputType || inputType || ''),
+                        input: String(inputName || ''),
+                        output: String(outputName || ''),
+                        error: '',
+                        compatible: false,
+                    });
+                } catch (e: unknown) {
+                    const legacyError = e instanceof Error ? e.message : String(e);
+                    console.warn(`[audio] legacy probeDeviceOptions fallback threw: ${legacyError}`);
+                    return { ...normalized, error: normalized.error || legacyError };
+                }
+            }
+            return normalized;
         } else {
             probeError = 'Native audio addon not available';
         }
@@ -350,10 +440,34 @@ export function initAudioBridge(): void {
                 const bs = Number(payload.bufferSize);
                 if (Number.isFinite(sr) && sr > 0) payload.sampleRate = sr;
                 if (Number.isFinite(bs) && bs > 0) payload.bufferSize = bs;
-                return audio.setDevice(payload);
+                const normalizedPayload = normalizeDeviceConfigPayload(payload);
+                try {
+                    return normalizeDeviceConfigResult(audio.setDevice(normalizedPayload));
+                } catch (e: unknown) {
+                    const objectError = e instanceof Error ? e.message : String(e);
+                    console.warn(`[audio] setDevice object call threw: ${objectError}; retrying legacy device call`);
+                    if (normalizedPayload.inputType !== normalizedPayload.outputType) {
+                        return normalizeDeviceConfigResult(false, objectError);
+                    }
+                    try {
+                        return normalizeDeviceConfigResult(
+                            audio.setDevice(
+                                normalizedPayload.inputDevice,
+                                normalizedPayload.outputDevice,
+                                normalizedPayload.sampleRate,
+                                normalizedPayload.bufferSize,
+                            ),
+                            objectError,
+                        );
+                    } catch (legacyError: unknown) {
+                        const error = legacyError instanceof Error ? legacyError.message : String(legacyError);
+                        console.warn(`[audio] legacy setDevice fallback threw: ${error}`);
+                        return { ok: false, error: error || objectError, duplex: true };
+                    }
+                }
             }
             const [input, output, sampleRate, bufferSize] = args;
-            return audio.setDevice(input, output, sampleRate, bufferSize);
+            return normalizeDeviceConfigResult(audio.setDevice(input, output, sampleRate, bufferSize));
         } catch (e: unknown) {
             const error = e instanceof Error ? e.message : String(e);
             console.warn(`[audio] setDevice threw: ${error}`);
@@ -793,6 +907,38 @@ export function initAudioBridge(): void {
 
     ipcMain.handle('audio:setMultiBypass', (_event, changes: Array<{slotId: number, bypassed: boolean}>) => {
         return audio?.setMultiBypass(changes) ?? false;
+    });
+
+    // ── Audio-effects executor ─────────────────────────────────────────────
+
+    ipcMain.handle('audio-effects:loadChainPlan', async (_event, request: unknown) => {
+        vstSlotPaths.clear();
+        return await audioEffects.loadChainPlan(request);
+    });
+
+    ipcMain.handle('audio-effects:releaseRoute', async (_event, request: unknown) => {
+        vstSlotPaths.clear();
+        return await audioEffects.releaseRoute(request);
+    });
+
+    ipcMain.handle('audio-effects:inspectRoute', (_event, routeKey?: string) => {
+        return audioEffects.inspectRoute(routeKey);
+    });
+
+    ipcMain.handle('audio-effects:activateSegment', (_event, request: unknown) => {
+        return audioEffects.activateSegment(request);
+    });
+
+    ipcMain.handle('audio-effects:setStageBypass', (_event, request: unknown) => {
+        return audioEffects.setStageBypass(request);
+    });
+
+    ipcMain.handle('audio-effects:setStageParameter', (_event, request: unknown) => {
+        return audioEffects.setStageParameter(request);
+    });
+
+    ipcMain.handle('audio-effects:setRouteGain', (_event, request: unknown) => {
+        return audioEffects.setRouteGain(request);
     });
 }
 
