@@ -4,6 +4,9 @@ on:
   pull_request:
     branches: ['release/**']
   workflow_dispatch:
+  # Called by ship-ci.yml for PRs into main, so both run the identical
+  # check suite without duplicating job steps.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
