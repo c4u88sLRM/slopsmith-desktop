@@ -728,6 +728,16 @@ static Napi::Value ResetPeaks(const Napi::CallbackInfo& info)
     return info.Env().Undefined();
 }
 
+// Backing-track mix bus RMS level — the engine's per-block running RMS after
+// the backing volume fader but before the output-gain master. Returns 0.0 when
+// the engine is unavailable or no backing track is loaded. Reads an atomic so
+// it is safe to call from the JS thread without blocking the audio thread.
+static Napi::Value GetBackingLevel(const Napi::CallbackInfo& info)
+{
+    auto liveEngine = snapshotEngine();
+    return Napi::Number::New(info.Env(), liveEngine ? liveEngine->getBackingLevel() : 0.0f);
+}
+
 // ── Pitch Detection (polled) ──────────────────────────────────────────────────
 
 // Load the Basic Pitch ONNX model for the polyphonic ML note detector.
@@ -3041,6 +3051,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     exports.Set("getLevels", Napi::Function::New(env, GetLevels));
     exports.Set("getSourceLevels", Napi::Function::New(env, GetSourceLevels));
     exports.Set("resetPeaks", Napi::Function::New(env, ResetPeaks));
+    exports.Set("getBackingLevel", Napi::Function::New(env, GetBackingLevel));
 
     // Pitch detection
     exports.Set("getPitchDetection", Napi::Function::New(env, GetPitchDetection));

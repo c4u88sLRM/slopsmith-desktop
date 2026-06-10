@@ -236,6 +236,7 @@ const slopsmithDesktopApi = {
         getLevels: () => ipcRenderer.invoke('audio:getLevels'),
         getSourceLevels: (id: number) => ipcRenderer.invoke('audio:getSourceLevels', id),
         resetPeaks: () => ipcRenderer.invoke('audio:resetPeaks'),
+        getBackingLevel: (): Promise<number> => ipcRenderer.invoke('audio:getBackingLevel'),
 
         // Pitch detection (polled). Backed by the polyphonic ML detector
         // (Basic Pitch) when a model is loaded, else the YIN detector —

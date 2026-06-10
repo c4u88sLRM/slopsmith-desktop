@@ -1225,6 +1225,7 @@ void AudioEngine::stopAudio()
     for (int dk = 1; dk <= kMaxExtraInputDevices; ++dk)
         closeExtraInputDevice(dk - 1);
     audioRunning.store(false, std::memory_order_relaxed);
+    currentBackingLevel.store(0.0f);
 }
 
 // ── Backing Track ─────────────────────────────────────────────────────────────
@@ -1340,6 +1341,7 @@ void AudioEngine::stopBackingNoLock()
         backingStretch.reset();
         backingPlaying.store(false);
     }
+    currentBackingLevel.store(0.0f);
 }
 
 void AudioEngine::stopBacking()
@@ -1772,6 +1774,7 @@ void AudioEngine::audioDeviceStopped()
     }
     outputRingWriteIndex.store(0, std::memory_order_relaxed);
     outputRingReadIndex.store(0, std::memory_order_relaxed);
+    currentBackingLevel.store(0.0f);
 
     // Note on split-mode lifecycle: we deliberately do NOT detach the
     // output callback here. JUCE auto-restarts a transiently-stopped input
@@ -1919,8 +1922,27 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
             const int outSamples = renderBackingBlockLocked(numSamples);
             const float bVol = backingVolume.load();
             const int mixChannels = juce::jmin(numOutputChannels, 2);
+            float backingLevelSq = 0.0f;
             for (int ch = 0; ch < mixChannels; ++ch)
+            {
+                const float* const src = backingBuffer.getReadPointer(ch);
+                float sumSquares = 0.0f;
+                for (int i = 0; i < outSamples; ++i)
+                    sumSquares += src[i] * src[i];
+
+                const float channelRms = (outSamples > 0)
+                    ? std::sqrt(sumSquares / outSamples) * bVol
+                    : 0.0f;
+                backingLevelSq += channelRms * channelRms;
                 buffer.addFrom(ch, 0, backingBuffer, ch, 0, outSamples, bVol);
+            }
+            currentBackingLevel.store((mixChannels > 0)
+                ? std::sqrt(backingLevelSq / mixChannels)
+                : 0.0f);
+        }
+        else
+        {
+            currentBackingLevel.store(0.0f);
         }
 
         // Apply output gain
@@ -2529,8 +2551,30 @@ void AudioEngine::audioOutputCallback(const float* const* /*inputData*/,
             // Shared with the duplex path so the two callbacks can't drift.
             const int backingOut = renderBackingBlockLocked(numSamples);
             const float bVol = backingVolume.load();
+            // RMS, computed identically to the duplex path so getBackingLevel()
+            // reports the same metric regardless of which device clock is active.
+            // copyChannels is already capped at 2, so it doubles as the mix count.
+            float backingLevelSq = 0.0f;
             for (int ch = 0; ch < copyChannels; ++ch)
+            {
+                const float* const src = backingBuffer.getReadPointer(ch);
+                float sumSquares = 0.0f;
+                for (int i = 0; i < backingOut; ++i)
+                    sumSquares += src[i] * src[i];
+
+                const float channelRms = (backingOut > 0)
+                    ? std::sqrt(sumSquares / backingOut) * bVol
+                    : 0.0f;
+                backingLevelSq += channelRms * channelRms;
                 buffer.addFrom(ch, 0, backingBuffer, ch, 0, backingOut, bVol);
+            }
+            currentBackingLevel.store((copyChannels > 0)
+                ? std::sqrt(backingLevelSq / copyChannels)
+                : 0.0f);
+        }
+        else
+        {
+            currentBackingLevel.store(0.0f);
         }
     }
 

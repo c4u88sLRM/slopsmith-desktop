@@ -576,6 +576,16 @@ export function initAudioBridge(): void {
         audio?.resetPeaks();
     });
 
+    // Backing-track mix bus RMS level — reads the engine's per-block running RMS
+    // after the backing volume fader. typeof-guarded so a downlevel addon that
+    // predates getBackingLevel returns 0 instead of throwing (fail-soft per
+    // Constitution VII).
+    ipcMain.handle('audio:getBackingLevel', () => {
+        if (!audio || typeof audio.getBackingLevel !== 'function')
+            return 0;
+        return audio.getBackingLevel();
+    });
+
     // ── Pitch Detection ────────────────────────────────────────────────────
 
     ipcMain.handle('audio:getPitchDetection', () => {
