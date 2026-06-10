@@ -3,7 +3,9 @@ name: Build
 on:
   push:
     branches: [main]
-    tags: ['v*']
+  # Tagged releases are owned by release.yml — build.yml only verifies
+  # main + manual dispatch builds, so it must NOT trigger on tags (that
+  # would double-run the matrix and double-publish the GitHub Release).
   # PRs do not build automatically — every commit during review would
   # otherwise re-run the full 3-platform matrix. Trigger the matrix build
   # manually (Actions tab → Build → "Run workflow", pick the PR branch)
@@ -11,7 +13,18 @@ on:
   # Note: workflow_dispatch only allows selecting branches that exist in
   # this repository; it cannot target branches from contributor forks.
   # For fork PRs, the maintainer must merge to a local branch first.
+  #
+  # The slopsmith_ref input selects which slopsmith *core* ref to bundle.
+  # It defaults to `main` (matching the historical behaviour), but for a
+  # coherent release build the desktop release/vX.Y.Z branch should be
+  # built against the matching core branch — e.g. run this workflow on
+  # release/v0.3.0 with slopsmith_ref=release/v0.3.0.
   workflow_dispatch:
+    inputs:
+      slopsmith_ref:
+        description: "Slopsmith core ref (branch or tag) to bundle, e.g. release/v0.3.0. Defaults to main."
+        required: false
+        default: main
 
 jobs:
   build:
@@ -130,6 +143,12 @@ jobs:
         run: ./scripts/build-release.sh
         shell: bash
         env:
+          # Which slopsmith core ref to clone + bundle. Empty on push/tag
+          # events (the inputs context only carries values on
+          # workflow_dispatch), so fall back to main — preserving the
+          # historical default-branch behaviour. clone_slopsmith() in
+          # build-common.sh also defaults to main as a second safety net.
+          SLOPSMITH_REF: ${{ inputs.slopsmith_ref || 'main' }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -436,111 +455,7 @@ jobs:
           if-no-files-found: warn
           # Default retention (90 days) snowballed the org Actions storage cap
           # — a single matrix run uploads ~2.5 GB across the three platforms,
-          # and old builds piled up for months. Tag builds don't need long
-          # retention either: the `release` job downloads and attaches these
-          # to the GitHub Release within the same workflow run.
+          # and old builds piled up for months. These artifacts are only for
+          # verifying main + manual-dispatch builds (tagged releases are built
+          # and published by release.yml), so they don't need long retention.
           retention-days: 7
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      # Every release is published with prerelease=false, but only
-      # stable (bare vX.Y.Z) tags get make_latest=true. Reason:
-      #
-      # The Velopack JS SDK at our pinned version 0.0.1589-ga2c5a97
-      # routes any github.com URL through AutoSource → GithubSource,
-      # and AutoSource hardcodes the third constructor arg
-      # (`prerelease: false`). UpdateOptions has no Prerelease field,
-      # so there is no SDK-side override. If we tagged alpha/beta/rc as
-      # prerelease=true on GitHub, the in-app updater on those channels
-      # would silently see zero updates (verified live during the
-      # v0.2.9-alpha.102 validation: toggling the prerelease flag off
-      # made the release visible to the running app).
-      #
-      # Using make_latest=false on alpha/beta/rc tags keeps the GitHub
-      # UI's "Latest release" badge pinned to the most recent stable
-      # tag — humans browsing the repo still see stable as latest, even
-      # though the underlying release rows are all prerelease=false.
-      # Per the action-gh-release@v2 docs:
-      #   "Drafts and prereleases cannot be set as latest"
-      # so we can't use prerelease=true + make_latest=true together.
-      #
-      # Channel scoping for the auto-updater is independent of either
-      # flag — Velopack picks the right release by the channel-named
-      # manifest asset (releases.<channel>.json), iterating recent
-      # releases until it finds the matching channel.
-      #
-      # draft is intentionally NOT set — Velopack clients can't see
-      # draft releases either way.
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          # Explicitly select only real distributables:
-          # - Linux ships electron-builder .AppImage / .deb
-          # - Windows + macOS ship via Velopack (release/velopack/**):
-          #   MSI, *-osx.zip, *.nupkg, releases.<channel>.json
-          # win-unpacked/** and a bare *.exe glob are deliberately omitted —
-          # win-unpacked/ is for CI inspection only.
-          # No electron-builder *.dmg / *.zip globs: macOS is Velopack-only,
-          # so they would match nothing or duplicate the Velopack *-osx.zip.
-          #
-          # The velopack glob is `artifacts/**/velopack/**/*`, NOT
-          # `artifacts/**/release/velopack/**/*`. actions/upload-artifact@v4
-          # strips the longest common path prefix from upload inputs before
-          # archiving, so when the build job uploads both
-          # `release/win-unpacked/**` and `release/velopack/**`, the common
-          # prefix `release/` is stripped and files inside the artifact are
-          # rooted at `velopack/...` / `win-unpacked/...`. The old
-          # `**/release/velopack/**` glob never matched anything, which is
-          # why prior tagged releases shipped only Linux assets and the
-          # Windows + macOS Velopack feeds were silently empty (the in-app
-          # updater would 404 on releases.<channel>.json and report "no
-          # updates available").
-          files: |
-            artifacts/**/*.AppImage
-            artifacts/**/*.deb
-            artifacts/**/velopack/**/*
-          generate_release_notes: true
-          # All tags non-prerelease (Velopack SDK limitation, see the
-          # long comment above). Only stable tags become the GitHub
-          # "Latest release" — alpha/beta/rc are still visible to the
-          # in-app updater but won't be promoted in the repo UI.
-          prerelease: false
-          make_latest: ${{ (contains(github.ref_name, '-alpha.') || contains(github.ref_name, '-beta.') || contains(github.ref_name, '-rc.')) && 'false' || 'true' }}
-
-  # Mirror release version to slopsmith core
-  # Requires SLOPSMITH_SYNC_TOKEN secret
-  notify-slopsmith:
-    needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions: {}
-
-    steps:
-      - name: Dispatch VERSION sync to slopsmith
-        env:
-          GH_TOKEN: ${{ secrets.SLOPSMITH_SYNC_TOKEN }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          version="${REF_NAME#v}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag $REF_NAME is not vX.Y.Z — skipping slopsmith VERSION sync."
-            exit 0
-          fi
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::SLOPSMITH_SYNC_TOKEN secret is missing; cannot dispatch."
-            exit 1
-          fi
-          gh api -X POST repos/slopsmith/slopsmith/dispatches \
-            -f event_type=desktop-released \
-            -f "client_payload[version]=$version"
-          echo "Dispatched desktop-released event (version=$version) to slopsmith."

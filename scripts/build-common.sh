@@ -102,8 +102,13 @@ clone_slopsmith() {
 		rm -rf "$clone_dir"
 	fi
 
-	echo "Cloning Slopsmith repository..."
-	git clone --depth 1 https://github.com/slopsmith/slopsmith.git "$clone_dir"
+	# SLOPSMITH_REF selects the core branch/tag to bundle (set by the
+	# Build workflow's slopsmith_ref input). Defaults to main so local
+	# builds and the push/tag CI paths behave exactly as before.
+	# --branch accepts either a branch or a tag, both shallow-cloneable.
+	local slopsmith_ref="${SLOPSMITH_REF:-main}"
+	echo "Cloning Slopsmith repository (ref: ${slopsmith_ref})..."
+	git clone --depth 1 --branch "$slopsmith_ref" https://github.com/slopsmith/slopsmith.git "$clone_dir"
 
 	# Remove broken symlinks from plugins dir
 	find "$clone_dir/plugins" -maxdepth 1 -type l -delete 2>/dev/null || true
