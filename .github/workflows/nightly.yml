@@ -33,42 +33,6 @@ jobs:
         id: date
         run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-  build-core:
-    needs: setup
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Clone core at active branch
-        run: |
-          git clone --depth 1 --branch "${{ needs.setup.outputs.branch }}" \
-            https://github.com/slopsmith/slopsmith.git core
-          echo "Cloned slopsmith @ $(git -C core rev-parse --short HEAD) (${{ needs.setup.outputs.branch }})"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: core
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/slopsmith/slopsmith:nightly
-            ghcr.io/slopsmith/slopsmith:nightly-${{ needs.setup.outputs.date }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   build:
     needs: setup
     strategy:
