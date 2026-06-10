@@ -196,6 +196,9 @@ public:
     float getOutputLevel() const { return currentOutputLevel.load(); }
     float getInputPeak() const { return inputPeak.load(); }
     float getOutputPeak() const { return outputPeak.load(); }
+    // Running RMS of the backing-track mix bus after the volume fader, updated
+    // each audio block by the audio thread. Safe to call from any thread.
+    float getBackingLevel() const { return currentBackingLevel.load(); }
     void resetPeaks();
 
     // Latency
@@ -353,6 +356,11 @@ private:
     std::atomic<float> backingVolume{0.7f};
     std::atomic<float> currentInputLevel{0.0f};
     std::atomic<float> currentOutputLevel{0.0f};
+    // Per-block RMS of the backing-track mix bus, written by the audio thread
+    // and read on the main/JS thread via getBackingLevel(). Computed after the
+    // backing volume fader but before the output-gain master so VU meters reflect
+    // the track level independently of the post-mix master volume.
+    std::atomic<float> currentBackingLevel{0.0f};
     std::atomic<float> inputPeak{0.0f};
     std::atomic<float> outputPeak{0.0f};
     std::atomic<int> selectedInputChannel{-1}; // -1 = mono mix
