@@ -559,6 +559,28 @@ export async function startPython(): Promise<void> {
         pythonEnv.LOG_FILE = path.join(app.getPath('logs'), 'slopsmith-python.log');
     }
 
+    // Cap the library-scan worker pool to prevent memory exhaustion on
+    // low-RAM machines. The scan ProcessPoolExecutor (server.py) defaults to
+    // one worker per CPU core for CPU-bound PSARC AES decryption + metadata
+    // extraction; each spawned worker independently loads the lib stack and
+    // can transiently hold ~2 GiB while decrypting/parsing large PSARC
+    // entries. On a stock 8 GB M2 MacBook Air an uncapped 8-worker pool
+    // consumed ~7.7 GB, drove the macOS compressor to 5.7 GB, starved
+    // WindowServer, and triggered a userspace-watchdog kernel panic
+    // (WindowServer unresponsive for 208 s — panic-full-2026-06-08-134816).
+    //
+    // Read by server.py via SLOPSMITH_MAX_SCAN_WORKERS (slopsmith#761), which
+    // takes priority over the legacy SCAN_MAX_WORKERS Docker override.
+    // Formula: reserve 2 GiB for OS/kernel, allow ~2 GiB per worker, and cap
+    // at the physical CPU count and a hard ceiling of 4.
+    //   8 GB  → max(1, min(4, floor((8-2)/2)=3, cpus)) = 3
+    //   16 GB → max(1, min(4, floor((16-2)/2)=7, cpus)) = 4
+    //   4 GB  → max(1, min(4, floor((4-2)/2)=1, cpus)) = 1
+    const totalGiB = os.totalmem() / (1024 ** 3);
+    const workersByMemory = Math.floor((totalGiB - 2) / 2.0);
+    const maxScanWorkers = Math.max(1, Math.min(4, workersByMemory, os.cpus().length));
+    pythonEnv.SLOPSMITH_MAX_SCAN_WORKERS = String(maxScanWorkers);
+
     // Honour the "Audio Quality" preference: if the user has opted into the
     // high-quality FluidR3 soundfont and the file exists, point Python at it.
     // Otherwise fall through to the bundled GeneralUser GS via RESOURCESPATH.
