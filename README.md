@@ -70,10 +70,10 @@ Try these in order:
 > `/Applications/Slopsmith.app/Contents/MacOS/Slopsmith &>/dev/null &`, and save
 > it as an app).
 >
-> A fix that requests microphone access from Slopsmith itself on first launch —
-> so a normal double-click prompts correctly and registers *Slopsmith* in the
-> Microphone list — is on the way; once you're on a build that includes it,
-> none of the above is needed.
+> **Fixed in v0.3.0+:** Slopsmith now requests microphone access on startup so a
+> normal double-click prompts correctly and registers *Slopsmith* in the
+> Microphone list. If you are on v0.3.0 or later, none of the above workarounds
+> are needed.
 
 Thanks to the community members who diagnosed the workarounds above.
 
