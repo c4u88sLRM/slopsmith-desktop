@@ -13,6 +13,15 @@ import { getActiveSoundfontPath, getDesktopConfig } from './soundfont-manager';
 import { isDebugEnabled } from './debug-log';
 
 let pythonProcess: ChildProcess | null = null;
+// A backend that is being *gracefully* stopped (SIGTERM sent, async SIGKILL
+// timer pending) but isn't confirmed dead yet. restartPython() nulls
+// pythonProcess and waits ~1s before spawning the replacement, so for that
+// window (and until the old child's SIGTERM lands, up to the 5s timer) the
+// dying backend is reachable only here — an app quit in that window must be
+// able to force-kill it synchronously, or it orphans (its own async timer
+// can't fire once the Electron main process exits). Cleared on the child's
+// `close` (or when the graceful timer force-kills it).
+let stoppingPythonProcess: ChildProcess | null = null;
 // Use 18000+ to avoid conflicting with Docker Slopsmith on 8000. The renderer
 // loads from http://127.0.0.1:${serverPort}, so this is also the localStorage
 // origin — keeping it stable across launches is what stops origin-keyed UI /
@@ -559,6 +568,28 @@ export async function startPython(): Promise<void> {
         pythonEnv.LOG_FILE = path.join(app.getPath('logs'), 'slopsmith-python.log');
     }
 
+    // Cap the library-scan worker pool to prevent memory exhaustion on
+    // low-RAM machines. The scan ProcessPoolExecutor (server.py) defaults to
+    // one worker per CPU core for CPU-bound PSARC AES decryption + metadata
+    // extraction; each spawned worker independently loads the lib stack and
+    // can transiently hold ~2 GiB while decrypting/parsing large PSARC
+    // entries. On a stock 8 GB M2 MacBook Air an uncapped 8-worker pool
+    // consumed ~7.7 GB, drove the macOS compressor to 5.7 GB, starved
+    // WindowServer, and triggered a userspace-watchdog kernel panic
+    // (WindowServer unresponsive for 208 s — panic-full-2026-06-08-134816).
+    //
+    // Read by server.py via SLOPSMITH_MAX_SCAN_WORKERS (slopsmith#761), which
+    // takes priority over the legacy SCAN_MAX_WORKERS Docker override.
+    // Formula: reserve 2 GiB for OS/kernel, allow ~2 GiB per worker, and cap
+    // at the physical CPU count and a hard ceiling of 4.
+    //   8 GB  → max(1, min(4, floor((8-2)/2)=3, cpus)) = 3
+    //   16 GB → max(1, min(4, floor((16-2)/2)=7, cpus)) = 4
+    //   4 GB  → max(1, min(4, floor((4-2)/2)=1, cpus)) = 1
+    const totalGiB = os.totalmem() / (1024 ** 3);
+    const workersByMemory = Math.floor((totalGiB - 2) / 2.0);
+    const maxScanWorkers = Math.max(1, Math.min(4, workersByMemory, os.cpus().length));
+    pythonEnv.SLOPSMITH_MAX_SCAN_WORKERS = String(maxScanWorkers);
+
     // Honour the "Audio Quality" preference: if the user has opted into the
     // high-quality FluidR3 soundfont and the file exists, point Python at it.
     // Otherwise fall through to the bundled GeneralUser GS via RESOURCESPATH.
@@ -794,15 +825,34 @@ function killPythonTree(proc: ChildProcess, signal: NodeJS.Signals): void {
     }
 }
 
-export function stopPython(): void {
+// `immediate` (app quit): kill the backend group synchronously with SIGKILL
+// instead of the graceful SIGTERM + async force-kill timer. On quit the timer
+// can NEVER fire — the Electron main process exits the instant the synchronous
+// before-quit → shutdown() chain returns, so any pending setTimeout is dropped.
+// Worse, uvicorn's SIGTERM handler does a *graceful* shutdown that blocks on
+// in-flight requests (a library scan / sloppak conversion / demucs job can run
+// for minutes), so a plain SIGTERM would orphan the backend — and the RAM of
+// its loaded ML models — until the next launch's reaper (or forever, if the
+// user doesn't relaunch). SQLite's WAL makes an abrupt stop crash-safe, and the
+// user is closing the app, so abandoning in-flight work is the intended result.
+export function stopPython(immediate = false): void {
     // Capture the child being stopped. During restartPython the global
     // pythonProcess may already point at a new child by the time the
     // force-kill timer fires — SIGTERM/SIGKILL must hit the one being
     // stopped, never the replacement.
     const proc = pythonProcess;
-    if (!proc) return;
+    if (!proc) {
+        // No current backend — but a prior restart may have left one still
+        // gracefully shutting down. On quit, force-kill it so it can't orphan
+        // (its async SIGKILL timer won't fire once we exit).
+        if (immediate && stoppingPythonProcess) {
+            killPythonTree(stoppingPythonProcess, 'SIGKILL');
+            stoppingPythonProcess = null;
+        }
+        return;
+    }
 
-    console.log('[python] Stopping server...');
+    console.log(`[python] Stopping server...${immediate ? ' (immediate / app quit)' : ''}`);
 
     // The stop is intentional, so detach this child from module state now:
     //   - pythonProcess = null makes proc's own 'close'/'error' handlers
@@ -816,6 +866,21 @@ export function stopPython(): void {
     startupComplete = false;
     serverReady = false;
 
+    if (immediate) {
+        // Quit: also force-kill any *other* backend still gracefully stopping
+        // from a prior restart — its async timer can't fire once we exit.
+        if (stoppingPythonProcess && stoppingPythonProcess !== proc) {
+            killPythonTree(stoppingPythonProcess, 'SIGKILL');
+        }
+        stoppingPythonProcess = null;
+        killPythonTree(proc, 'SIGKILL');
+        return;
+    }
+
+    // Graceful stop: this child is dying but not yet reaped — track it so an
+    // app quit during the wait can still force-kill it synchronously.
+    stoppingPythonProcess = proc;
+
     let exited = false;
     let killTimeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -824,6 +889,7 @@ export function stopPython(): void {
     // the timer can't fire a SIGKILL at a since-reused PID's process group.
     proc.once('close', () => {
         exited = true;
+        if (stoppingPythonProcess === proc) stoppingPythonProcess = null;
         if (killTimeout) clearTimeout(killTimeout);
     });
 
@@ -835,6 +901,7 @@ export function stopPython(): void {
     // (exitCode/signalCode go non-null once it exits); signalling a stale,
     // possibly PID-reused process group otherwise.
     killTimeout = setTimeout(() => {
+        if (stoppingPythonProcess === proc) stoppingPythonProcess = null;
         if (exited || proc.exitCode !== null || proc.signalCode !== null) return;
         console.log('[python] Force killing...');
         killPythonTree(proc, 'SIGKILL');

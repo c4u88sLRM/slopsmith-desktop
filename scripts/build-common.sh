@@ -158,7 +158,6 @@ clone_slopsmith() {
 		masc0t/slopsmith-plugin-themes
 		masc0t/slopsmith-update-manager:update_manager
 		slopsmith/slopsmith-plugin-stem-mixer
-		OmikronApex/slopsmith-plugin-tuner
 		topkoa/slopsmith-plugin-guitar-theory
 		topkoa/slopsmith-plugin-sloppak-converter
 		topkoa/slopsmith-plugin-splitscreen
