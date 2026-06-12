@@ -251,6 +251,23 @@ if(ONNXRUNTIME_AVAILABLE)
                     "$<TARGET_FILE_DIR:slopsmith_audio>/"
             COMMENT "Staging ONNX Runtime providers_shared library next to slopsmith_audio.node")
     endif()
+
+    # macOS only: the prebuilt onnxruntime dylib bakes its absolute build-time
+    # extraction path into LC_ID_DYLIB, which the linker then copies into the
+    # addon as an absolute LC_LOAD_DYLIB. The @loader_path rpath set above is
+    # never consulted for an absolute load path, so the addon loads onnxruntime
+    # only on the build machine — everywhere else MlNoteDetector can't init and
+    # the engine silently falls back to YIN ("ML detection: OFF", slopsmith#818).
+    # Rewrite the install names to be @rpath-relative so the co-located runtime
+    # resolves on every Mac. Runs after staging so it rewrites the staged copy.
+    if(APPLE)
+        get_filename_component(_ort_runtime_name "${ONNXRUNTIME_RUNTIME_LIB}" NAME)
+        add_custom_command(TARGET slopsmith_audio POST_BUILD
+            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/fix-onnxruntime-install-names.sh"
+                    "$<TARGET_FILE:slopsmith_audio>"
+                    "${_ort_runtime_name}"
+            COMMENT "Normalising ONNX Runtime install names to @rpath (slopsmith#818)")
+    endif()
 else()
     target_compile_definitions(slopsmith_audio PRIVATE SLOPSMITH_ONNX_SUPPORT=0)
 endif()
