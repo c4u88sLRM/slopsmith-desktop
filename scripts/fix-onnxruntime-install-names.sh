@@ -43,7 +43,7 @@ resign() {
 # Discover the addon's current (absolute) reference to the runtime, if any.
 # Skip when it is already `@rpath/...` so re-runs / already-correct builds are
 # no-ops. Match the exact runtime filename to avoid touching unrelated entries.
-old_ref="$(otool -L "$node" | awk -v L="$libname" '$1 ~ L && $1 !~ /^@rpath\// {print $1; exit}')"
+old_ref="$(otool -L "$node" | awk -v L="$libname" 'index($1,L) && $1 !~ /^@rpath\// {print $1; exit}')"
 if [[ -n "${old_ref:-}" ]]; then
     install_name_tool -change "$old_ref" "@rpath/$libname" "$node"
     resign "$node"
@@ -70,7 +70,7 @@ if [[ -f "$providers" ]]; then
     if [[ "$cur_pid" != "@rpath/$prov_name" ]]; then
         install_name_tool -id "@rpath/$prov_name" "$providers"
     fi
-    prov_ref="$(otool -L "$providers" | awk -v L="$libname" '$1 ~ L && $1 !~ /^@rpath\// {print $1; exit}')"
+    prov_ref="$(otool -L "$providers" | awk -v L="$libname" 'index($1,L) && $1 !~ /^@rpath\// {print $1; exit}')"
     if [[ -n "${prov_ref:-}" ]]; then
         install_name_tool -change "$prov_ref" "@rpath/$libname" "$providers"
     fi
