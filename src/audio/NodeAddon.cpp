@@ -83,6 +83,19 @@ static std::shared_ptr<VSTHost> snapshotVstHost()
     std::lock_guard<std::mutex> lock(vstHostMutex);
     return vstHost;
 }
+
+static double loadSafeSampleRate(const AudioEngine& eng)
+{
+    const double sr = eng.getCurrentSampleRate();
+    return (std::isfinite(sr) && sr > 0.0) ? sr : 48000.0;
+}
+
+static int loadSafeBlockSize(const AudioEngine& eng)
+{
+    const int bs = eng.getCurrentBlockSize();
+    return bs > 0 ? bs : 256;
+}
+
 static std::thread juceMessageThread;
 static std::atomic<bool> juceRunning{false};
 static std::atomic<bool> alreadyShutDown{false};
@@ -2073,8 +2086,8 @@ public:
             return;
         }
 
-        const auto sr = engineKeeper->getCurrentSampleRate();
-        const auto bs = engineKeeper->getCurrentBlockSize();
+        const auto sr = loadSafeSampleRate(*engineKeeper);
+        const auto bs = loadSafeBlockSize(*engineKeeper);
         const auto path = juce::String(pluginPath_);
         VST_TRACE("LoadVSTWorker: path='%s' sr=%.0f bs=%d",
                   pluginPath_.c_str(), sr, bs);
@@ -2196,8 +2209,8 @@ static Napi::Value LoadVST(const Napi::CallbackInfo& info)
     bool sandboxRequired = false;
     auto processor = loadVstSandboxAware(
         juce::String(pluginPath),
-        liveEngine->getCurrentSampleRate(),
-        liveEngine->getCurrentBlockSize(),
+        loadSafeSampleRate(*liveEngine),
+        loadSafeBlockSize(*liveEngine),
         error, sandboxRequired);
 
     if (sandboxRequired && !processor)
@@ -2290,8 +2303,8 @@ public:
         auto liveEngine = snapshotEngine();
         if (!liveEngine) { slotId_ = -1; return; }
 
-        const auto sr = liveEngine->getCurrentSampleRate();
-        const auto bs = liveEngine->getCurrentBlockSize();
+        const auto sr = loadSafeSampleRate(*liveEngine);
+        const auto bs = loadSafeBlockSize(*liveEngine);
         auto processor = std::make_unique<IRLoader>();
         processor->setPlayConfigDetails(2, 2, sr, bs);
         processor->prepareToPlay(sr, bs);
@@ -2795,8 +2808,8 @@ public:
         // Clear existing chain
         liveEngine->getSignalChain().clear();
 
-        double sr = liveEngine->getCurrentSampleRate();
-        int bs = liveEngine->getCurrentBlockSize();
+        double sr = loadSafeSampleRate(*liveEngine);
+        int bs = loadSafeBlockSize(*liveEngine);
 
         for (auto& slotVar : *chainArray)
         {
