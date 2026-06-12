@@ -854,6 +854,12 @@ function installRendererPermissions(rendererPort: number): void {
 // renderer surfaces the missing-input state through the normal device UI.
 async function ensureMicrophoneAccess(): Promise<void> {
     if (process.platform !== 'darwin') return;
+    // Only run in a packaged app. NSMicrophoneUsageDescription is injected by
+    // electron-builder via extendInfo in package.json and is only present in
+    // the built .app bundle. Calling askForMediaAccess() without that Info.plist
+    // key in an unpackaged dev run (npm start / plain Electron.app) terminates
+    // the process instead of throwing — the try/catch does not catch it.
+    if (!app.isPackaged) return;
     try {
         const status = systemPreferences.getMediaAccessStatus('microphone');
         if (status === 'granted') return;
