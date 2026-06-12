@@ -53,6 +53,9 @@ cp "$SLOPSMITH_DIR/VERSION" "$BUNDLE_DIR/"
 cp -r "$SLOPSMITH_DIR/lib" "$BUNDLE_DIR/"
 rm -rf "$BUNDLE_DIR/lib/__pycache__"
 
+# Bundled content (progression paths, quests, shop definitions)
+[ -d "$SLOPSMITH_DIR/data" ] && cp -r "$SLOPSMITH_DIR/data" "$BUNDLE_DIR/"
+
 # Static assets — copy the whole directory. User-data dirs (art/, sloppak_cache/)
 # and generated audio_*.mp3 files are gitignored and won't exist in a clean checkout.
 cp -r "$SLOPSMITH_DIR/static/." "$BUNDLE_DIR/static/"
