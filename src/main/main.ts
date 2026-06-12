@@ -56,7 +56,7 @@ if (process.platform !== 'linux') {
 }
 // ──────────────────────────────────────────────────────────────────────────
 
-import { app, BrowserWindow, ipcMain, dialog, shell, session, crashReporter, powerSaveBlocker } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, session, crashReporter, powerSaveBlocker, systemPreferences } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync } from 'child_process';
@@ -832,6 +832,55 @@ function installRendererPermissions(rendererPort: number): void {
     });
 }
 
+// macOS microphone (TCC) gate. The JUCE engine captures guitar input through
+// a native CoreAudio input device (AudioEngine opens it during audio.init()),
+// NOT through the renderer's getUserMedia — so the Chromium media-permission
+// flow (installRendererPermissions / setPermissionRequestHandler) never fires
+// for it. On macOS a native CoreAudio input open is gated by TCC, and unless
+// the *main app process* has explicitly asked for microphone access the open
+// is silently denied: no prompt, a dead input gauge, and — because the engine
+// couples the input and output device open — no audio output either. That's
+// the reported "no sound and never asks for mic permission" bug; users worked
+// around it by launching the binary from Terminal, which makes Terminal the
+// responsible TCC process and forces the prompt.
+//
+// Requesting access here, from the bundle that actually carries
+// NSMicrophoneUsageDescription (resources entitlements + extendInfo), shows the
+// system prompt once and registers Slopsmith itself in System Settings →
+// Privacy & Security → Microphone. Must run BEFORE initAudioBridge() so the
+// grant is in place before the native engine opens the input device. No-op off
+// macOS (Windows/Linux don't gate capture this way), and best-effort: a denial
+// or a throw must not block startup — the engine still runs output-only and the
+// renderer surfaces the missing-input state through the normal device UI.
+async function ensureMicrophoneAccess(): Promise<void> {
+    if (process.platform !== 'darwin') return;
+    // Only run in a packaged app. NSMicrophoneUsageDescription is injected by
+    // electron-builder via extendInfo in package.json and is only present in
+    // the built .app bundle. Calling askForMediaAccess() without that Info.plist
+    // key in an unpackaged dev run (npm start / plain Electron.app) terminates
+    // the process instead of throwing — the try/catch does not catch it.
+    if (!app.isPackaged) return;
+    try {
+        const status = systemPreferences.getMediaAccessStatus('microphone');
+        if (status === 'granted') return;
+        if (status === 'denied' || status === 'restricted') {
+            // Already a hard 'denied'/'restricted' verdict — askForMediaAccess
+            // resolves false without re-prompting. Surface it so the log
+            // explains a silent input; the user must re-enable via System
+            // Settings (or `tccutil reset Microphone`).
+            console.warn(`[main] Microphone access is '${status}'; the OS will not re-prompt. ` +
+                'Enable Slopsmith under System Settings → Privacy & Security → Microphone.');
+            return;
+        }
+        // status === 'not-determined' → this triggers the one-time OS prompt.
+        const granted = await systemPreferences.askForMediaAccess('microphone');
+        console.log(`[main] Microphone access ${granted ? 'granted' : 'denied'} by user.`);
+    } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn(`[main] Microphone access request failed: ${msg}`);
+    }
+}
+
 async function startup(): Promise<void> {
     // Debug logging first so everything below is captured. SLOPSMITH_SANDBOX_DEBUG
     // gates the addon's VST_TRACE — flip it whenever debug is *requested*, even
@@ -860,6 +909,11 @@ async function startup(): Promise<void> {
 
     // Start Python server (Slopsmith backend)
     startPython();
+
+    // Prompt for macOS microphone access before the engine opens its native
+    // CoreAudio input device (see ensureMicrophoneAccess). Awaited so the TCC
+    // grant lands before initAudioBridge() → audio.init() touches the input.
+    await ensureMicrophoneAccess();
 
     // Initialize audio engine (JUCE native addon).
     initAudioBridge();
