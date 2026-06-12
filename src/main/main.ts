@@ -1102,7 +1102,13 @@ function shutdown(): void {
     syncPowerBlocker();
     updateManager.shutdown();
     shutdownAudio();
-    stopPython();
+    // shutdown() only runs on app quit (window-all-closed / before-quit), and
+    // the main process exits the moment this synchronous chain returns — so
+    // stop the backend SYNCHRONOUSLY (SIGKILL the group) rather than relying on
+    // stopPython()'s async force-kill timer, which would never fire and would
+    // leave a slow-to-exit uvicorn (graceful shutdown blocking on an in-flight
+    // scan / conversion / demucs job) orphaned, holding its ML-model RAM.
+    stopPython(/* immediate */ true);
 }
 
 // macOS: re-create window when dock icon is clicked

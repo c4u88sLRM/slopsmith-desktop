@@ -13,6 +13,15 @@ import { getActiveSoundfontPath, getDesktopConfig } from './soundfont-manager';
 import { isDebugEnabled } from './debug-log';
 
 let pythonProcess: ChildProcess | null = null;
+// A backend that is being *gracefully* stopped (SIGTERM sent, async SIGKILL
+// timer pending) but isn't confirmed dead yet. restartPython() nulls
+// pythonProcess and waits ~1s before spawning the replacement, so for that
+// window (and until the old child's SIGTERM lands, up to the 5s timer) the
+// dying backend is reachable only here — an app quit in that window must be
+// able to force-kill it synchronously, or it orphans (its own async timer
+// can't fire once the Electron main process exits). Cleared on the child's
+// `close` (or when the graceful timer force-kills it).
+let stoppingPythonProcess: ChildProcess | null = null;
 // Use 18000+ to avoid conflicting with Docker Slopsmith on 8000. The renderer
 // loads from http://127.0.0.1:${serverPort}, so this is also the localStorage
 // origin — keeping it stable across launches is what stops origin-keyed UI /
@@ -816,15 +825,34 @@ function killPythonTree(proc: ChildProcess, signal: NodeJS.Signals): void {
     }
 }
 
-export function stopPython(): void {
+// `immediate` (app quit): kill the backend group synchronously with SIGKILL
+// instead of the graceful SIGTERM + async force-kill timer. On quit the timer
+// can NEVER fire — the Electron main process exits the instant the synchronous
+// before-quit → shutdown() chain returns, so any pending setTimeout is dropped.
+// Worse, uvicorn's SIGTERM handler does a *graceful* shutdown that blocks on
+// in-flight requests (a library scan / sloppak conversion / demucs job can run
+// for minutes), so a plain SIGTERM would orphan the backend — and the RAM of
+// its loaded ML models — until the next launch's reaper (or forever, if the
+// user doesn't relaunch). SQLite's WAL makes an abrupt stop crash-safe, and the
+// user is closing the app, so abandoning in-flight work is the intended result.
+export function stopPython(immediate = false): void {
     // Capture the child being stopped. During restartPython the global
     // pythonProcess may already point at a new child by the time the
     // force-kill timer fires — SIGTERM/SIGKILL must hit the one being
     // stopped, never the replacement.
     const proc = pythonProcess;
-    if (!proc) return;
+    if (!proc) {
+        // No current backend — but a prior restart may have left one still
+        // gracefully shutting down. On quit, force-kill it so it can't orphan
+        // (its async SIGKILL timer won't fire once we exit).
+        if (immediate && stoppingPythonProcess) {
+            killPythonTree(stoppingPythonProcess, 'SIGKILL');
+            stoppingPythonProcess = null;
+        }
+        return;
+    }
 
-    console.log('[python] Stopping server...');
+    console.log(`[python] Stopping server...${immediate ? ' (immediate / app quit)' : ''}`);
 
     // The stop is intentional, so detach this child from module state now:
     //   - pythonProcess = null makes proc's own 'close'/'error' handlers
@@ -838,6 +866,21 @@ export function stopPython(): void {
     startupComplete = false;
     serverReady = false;
 
+    if (immediate) {
+        // Quit: also force-kill any *other* backend still gracefully stopping
+        // from a prior restart — its async timer can't fire once we exit.
+        if (stoppingPythonProcess && stoppingPythonProcess !== proc) {
+            killPythonTree(stoppingPythonProcess, 'SIGKILL');
+        }
+        stoppingPythonProcess = null;
+        killPythonTree(proc, 'SIGKILL');
+        return;
+    }
+
+    // Graceful stop: this child is dying but not yet reaped — track it so an
+    // app quit during the wait can still force-kill it synchronously.
+    stoppingPythonProcess = proc;
+
     let exited = false;
     let killTimeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -846,6 +889,7 @@ export function stopPython(): void {
     // the timer can't fire a SIGKILL at a since-reused PID's process group.
     proc.once('close', () => {
         exited = true;
+        if (stoppingPythonProcess === proc) stoppingPythonProcess = null;
         if (killTimeout) clearTimeout(killTimeout);
     });
 
@@ -857,6 +901,7 @@ export function stopPython(): void {
     // (exitCode/signalCode go non-null once it exits); signalling a stale,
     // possibly PID-reused process group otherwise.
     killTimeout = setTimeout(() => {
+        if (stoppingPythonProcess === proc) stoppingPythonProcess = null;
         if (exited || proc.exitCode !== null || proc.signalCode !== null) return;
         console.log('[python] Force killing...');
         killPythonTree(proc, 'SIGKILL');
