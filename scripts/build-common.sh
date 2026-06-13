@@ -131,10 +131,12 @@ clone_slopsmith() {
 		slopsmith/slopsmith-plugin-flappy-bend
 		slopsmith/slopsmith-plugin-fretboard
 		slopsmith/slopsmith-plugin-jumpingtab
+		slopsmith/slopsmith-plugin-keys-highway-3d
 		slopsmith/slopsmith-plugin-lyrics-karaoke
 		slopsmith/slopsmith-plugin-metronome
 		slopsmith/slopsmith-plugin-midi
 		slopsmith/slopsmith-plugin-multiplayer
+		slopsmith/slopsmith-plugin-musicxml-import
 		slopsmith/slopsmith-plugin-nam-tone
 		slopsmith/slopsmith-plugin-notedetect
 		slopsmith/slopsmith-plugin-piano
@@ -142,6 +144,7 @@ clone_slopsmith() {
 		slopsmith/slopsmith-plugin-profileimport
 		slopsmith/slopsmith-plugin-sectionmap
 		slopsmith/slopsmith-plugin-setlist
+		slopsmith/slopsmith-plugin-staffview
 		slopsmith/slopsmith-plugin-stepmode
 		slopsmith/slopsmith-plugin-studio
 		slopsmith/slopsmith-plugin-tabimport
