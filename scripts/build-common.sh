@@ -198,6 +198,19 @@ clone_slopsmith() {
 		fi
 	done
 
+	# Prune DANGLING symlinks anywhere in the cloned plugin tree. Some
+	# plugins commit build-only symlinks pointing at checkouts that don't
+	# ship in the repo (e.g. nam-rig-builder's vst/src/racks/DPF -> ../DPF,
+	# a local DPF-framework convenience link). Linux `cp` copies a dead link
+	# verbatim, but Windows `cp` aborts ("cannot create symbolic link ...:
+	# No such file or directory") and macOS electron-builder stat()s it and
+	# dies with ENOENT — both break the bundle. The existing top-level prune
+	# (-maxdepth 1, above) only covers core's plugins/ dir, not nested paths
+	# inside a cloned plugin, so sweep recursively here. `-xtype l` matches
+	# ONLY broken links, so valid in-repo symlinks (e.g. racks/_shared) are
+	# left intact.
+	find "$clone_dir/plugins" -xtype l -delete 2>/dev/null || true
+
 	export SLOPSMITH_DIR="$clone_dir"
 	echo "Cloned ${cloned} of ${total} plugins"
 	cd - >/dev/null
