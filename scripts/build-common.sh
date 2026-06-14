@@ -204,10 +204,15 @@ clone_slopsmith() {
 	# No such file or directory") and macOS electron-builder stat()s it and
 	# dies with ENOENT — both break the bundle. The existing top-level prune
 	# (-maxdepth 1, above) only covers core's plugins/ dir, not nested paths
-	# inside a cloned plugin, so sweep recursively here. `-xtype l` matches
-	# ONLY broken links, so valid in-repo symlinks (e.g. racks/_shared) are
-	# left intact.
-	find "$clone_dir/plugins" -xtype l -delete 2>/dev/null || true
+	# inside a cloned plugin, so sweep recursively here.
+	#
+	# Portability matters: GNU find's `-xtype l` would be ideal but BSD find
+	# (the macOS runner) has no `-xtype`, and with `2>/dev/null || true` it
+	# silently no-ops — leaving the dead link to crash electron-builder. So
+	# use the POSIX-portable form: `-type l` (a symlink) AND `! test -e` (its
+	# target doesn't resolve) = a broken link. Valid links (e.g. racks/_shared)
+	# resolve under `test -e` and are left intact.
+	find "$clone_dir/plugins" -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 
 	export SLOPSMITH_DIR="$clone_dir"
 	echo "Cloned ${cloned} of ${total} plugins"
