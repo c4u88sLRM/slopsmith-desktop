@@ -11,6 +11,26 @@
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
+SignalChain& SourceChain::getOrCreateChain(const std::string& routeKey)
+{
+    const juce::ScopedLock sl(chainsLock);
+    auto it = chains.find(routeKey);
+    if (it != chains.end()) return *it->second;
+    auto chain = std::make_unique<SignalChain>();
+    chain->prepare(sampleRate.load(std::memory_order_relaxed),
+                   currentBlockSize.load(std::memory_order_relaxed));
+    SignalChain& ref = *chain;
+    chains[routeKey] = std::move(chain);
+    return ref;
+}
+
+void SourceChain::clearChainForRoute(const std::string& routeKey)
+{
+    const juce::ScopedLock sl(chainsLock);
+    auto it = chains.find(routeKey);
+    if (it != chains.end()) it->second->clear();
+}
+
 void SourceChain::prepare(double sr, int blockSize)
 {
     // Reset the input rings so a stop→start cycle delivers a clean zero-padded
@@ -30,7 +50,20 @@ void SourceChain::prepare(double sr, int blockSize)
     if ((int) inputCaptureScratch.size() < blockSize)
         inputCaptureScratch.assign((size_t) blockSize, 0.0f);
 
-    signalChain.prepare(sr, blockSize);
+    currentBlockSize.store(blockSize, std::memory_order_relaxed);
+
+    // Pre-allocate 2-channel scratch buffers so multi-chain summing in processBlock
+    // doesn't allocate on the audio thread. 2 channels covers all current use cases
+    // (mono/stereo guitar); the avoidReallocating flag makes this a no-op if already
+    // large enough.
+    multiChainScratch.setSize(2, blockSize, false, true, true);
+    multiChainOutput.setSize(2, blockSize, false, true, true);
+
+    {
+        const juce::ScopedLock sl(chainsLock);
+        for (auto& [key, chain] : chains)
+            chain->prepare(sr, blockSize);
+    }
     pitchDetector.prepare(sr, blockSize);
     mlNoteDetector.prepare(sr, blockSize);
     noteVerifier.prepare(sr, blockSize);
@@ -40,7 +73,11 @@ void SourceChain::prepare(double sr, int blockSize)
 
 void SourceChain::releaseResources()
 {
-    signalChain.releaseResources();
+    {
+        const juce::ScopedLock sl(chainsLock);
+        for (auto& [key, chain] : chains)
+            chain->releaseResources();
+    }
     mlNoteDetector.stop();
     noteVerifier.stop();
     inputFrameRingWriteIndex.store(0, std::memory_order_relaxed);
@@ -207,10 +244,58 @@ void SourceChain::processBlock(const float* const* inputData, int numInputChanne
         }
     }
 
-    // Process through signal chain (VSTs, NAM, IR)
-    const bool hasProcessors = signalChain.getNumSlots() > 0;
-    juce::MidiBuffer midi;
-    signalChain.process(buffer, midi);
+    // Process through all route chains. "default" is the legacy single chain;
+    // additional keys support per-instrument isolated signal paths (e.g. jam-session
+    // NAM amp per musician slot). With one chain (the common case) we process
+    // in-place; with multiple chains we scratch-copy + sum, keeping each instrument's
+    // signal isolated. The chainsLock try-lock matches SignalChain's own try-lock
+    // pattern: if the N-API thread holds it (e.g. mid-rebuild), we skip silently for
+    // this block — the same glitch budget SignalChain already accepts.
+    int totalSlots = 0;
+    {
+        const juce::ScopedTryLock sl(chainsLock);
+        if (sl.isLocked())
+        {
+            for (auto& [key, chain] : chains)
+                totalSlots += chain->getNumSlots();
+
+            if (chains.size() <= 1)
+            {
+                // Fast path: single chain, process in-place.
+                juce::MidiBuffer midi;
+                if (!chains.empty())
+                    chains.begin()->second->process(buffer, midi);
+            }
+            else
+            {
+                // Multi-chain: each gets a copy of the pre-effect buffer and processes
+                // into its own scratch; we sum all scratch outputs into the buffer.
+                const int numCh = buffer.getNumChannels();
+                if (numCh > 0)
+                {
+                    // Ensure scratch buffers are big enough. avoidReallocating=true means
+                    // this is a no-op when already sized correctly.
+                    multiChainScratch.setSize(numCh, numSamples, false, true, true);
+                    multiChainOutput.setSize(numCh, numSamples, false, true, true);
+                    multiChainOutput.clear();
+
+                    for (auto& [key, chain] : chains)
+                    {
+                        for (int ch = 0; ch < numCh; ++ch)
+                            multiChainScratch.copyFrom(ch, 0, buffer, ch, 0, numSamples);
+                        juce::MidiBuffer midi;
+                        chain->process(multiChainScratch, midi);
+                        for (int ch = 0; ch < numCh; ++ch)
+                            multiChainOutput.addFrom(ch, 0, multiChainScratch, ch, 0, numSamples);
+                    }
+
+                    for (int ch = 0; ch < numCh; ++ch)
+                        buffer.copyFrom(ch, 0, multiChainOutput, ch, 0, numSamples);
+                }
+            }
+        }
+    }
+    const bool hasProcessors = totalSlots > 0;
 
     // Contain a divergent chain block before it reaches the IIR/gain/mix and the
     // output: a NAM/IR/VST can emit NaN/Inf or a runaway level (esp. on a live

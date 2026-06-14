@@ -32,6 +32,9 @@ type AudioEffectsNativeAudio = {
     setMonitorMuteSuppressed?: (suppressed: boolean) => Promise<unknown> | unknown;
     isMonitorMuted?: () => Promise<unknown> | unknown;
     startAudio?: () => Promise<unknown> | unknown;
+    // Multi-chain: per-route preset loading for isolated instrument signal paths.
+    loadPresetForRoute?: (sourceId: number, routeKey: string, presetJson: string) => Promise<unknown> | unknown;
+    clearChainForRoute?: (sourceId: number, routeKey: string) => unknown;
 };
 
 type NativeAudioGetter = () => AudioEffectsNativeAudio | null;
@@ -699,9 +702,86 @@ export function createAudioEffectsExecutor(getAudio: NativeAudioGetter) {
         return updateOutcome(route, safeOutcome('handled', 'Audio-effects segment activated', { route: safeRoute(route), segmentId, changedCount: changes.length }));
     }
 
+    // Load a chain plan into a specific route chain on a named source. Used by the
+    // jam-session plugin to assign per-musician signal paths (e.g. NAM amp per slot)
+    // on a source without touching other route chains on that source.
+    async function loadChainPlanForRoute(sourceId: number, routeKey: string, request: unknown): Promise<SafeOutcome> {
+        const nativeAudio = getAudio();
+        if (!nativeAudio || typeof nativeAudio.loadPresetForRoute !== 'function') {
+            return safeOutcome('unavailable', 'Native per-route preset loading is unavailable');
+        }
+        const input = asRecord(request) || {};
+        const options = parseLoadOptions(input.options ?? input.executorOptions ?? input.loadOptions);
+        const validation = validatePlan(request);
+        if (!validation.ok) {
+            return safeOutcome('failed', 'Audio-effects chain plan validation failed', { errors: validation.errors.map((error) => bounded(error)) });
+        }
+
+        const started = Date.now();
+        const restoreVersion = ++preloadRestoreVersion;
+        let previousMonitorMute: boolean | null = null;
+        if (options.preloadMute?.enabled) {
+            previousMonitorMute = await readMonitorMuted(nativeAudio);
+            await trySetGain(nativeAudio, 'chain', 0);
+            await trySetMonitorMute(nativeAudio, options.preloadMute.dryDuringLoad ? false : true);
+        }
+
+        let result: { success: boolean; slotsLoaded: number; error: string };
+        try {
+            result = normalizeLoadResult(await nativeAudio.loadPresetForRoute(sourceId, routeKey, validation.presetJson));
+        } catch (error) {
+            if (options.preloadMute?.enabled) schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, 0, () => restoreVersion === preloadRestoreVersion);
+            return safeOutcome('failed', 'Native per-route plan load threw', { error: bounded(error instanceof Error ? error.message : String(error)) });
+        }
+
+        const nativeStages = validation.plan.stages.filter((stage) => stage.native);
+        if (!result.success || result.slotsLoaded < nativeStages.length) {
+            if (options.preloadMute?.enabled) schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, 0, () => restoreVersion === preloadRestoreVersion);
+            return safeOutcome(result.success ? 'degraded' : 'failed', 'Native per-route plan load failed', {
+                sourceId,
+                routeKey,
+                stageCount: nativeStages.length,
+                slotsLoaded: result.slotsLoaded,
+                loadMs: Date.now() - started,
+                error: result.error,
+            });
+        }
+
+        const gainFailures = await applyGains(nativeAudio, options.gains, options.preloadMute?.enabled === true);
+        if (options.startAudio && typeof nativeAudio.startAudio === 'function') {
+            try { await nativeAudio.startAudio(); } catch (_) { /* best effort */ }
+        }
+        if (options.preloadMute?.enabled) {
+            schedulePreloadRestore(nativeAudio, previousMonitorMute, options.gains.chain ?? options.preloadMute.targetGain, options.preloadMute.holdMs, () => restoreVersion === preloadRestoreVersion);
+        }
+        return safeOutcome('handled', 'Audio-effects per-route chain plan loaded', {
+            sourceId,
+            routeKey,
+            stageCount: nativeStages.length,
+            slotsLoaded: result.slotsLoaded,
+            loadMs: Date.now() - started,
+            gainFailures,
+        });
+    }
+
+    async function releaseRouteChain(sourceId: number, routeKey: string): Promise<SafeOutcome> {
+        const nativeAudio = getAudio();
+        if (!nativeAudio || typeof nativeAudio.clearChainForRoute !== 'function') {
+            return safeOutcome('unavailable', 'Native per-route chain release is unavailable');
+        }
+        try {
+            nativeAudio.clearChainForRoute(sourceId, routeKey);
+        } catch (error) {
+            return safeOutcome('failed', 'Native per-route chain release threw', { sourceId, routeKey, error: bounded(error instanceof Error ? error.message : String(error)) });
+        }
+        return safeOutcome('handled', 'Per-route chain released', { sourceId, routeKey });
+    }
+
     return {
         loadChainPlan,
+        loadChainPlanForRoute,
         releaseRoute,
+        releaseRouteChain,
         inspectRoute,
         activateSegment,
         setStageBypass,

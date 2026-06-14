@@ -2698,6 +2698,18 @@ static Napi::Value SendMidiToSlot(const Napi::CallbackInfo& info)
         int value = info.Length() > 4 ? info[4].As<Napi::Number>().Int32Value() : 0;
         midiMsg = juce::MidiMessage::controllerEvent(channel, controller, value);
     }
+    else if (msgType == 2) // Note On
+    {
+        int note     = info[3].As<Napi::Number>().Int32Value();
+        int velocity = info.Length() > 4 ? info[4].As<Napi::Number>().Int32Value() : 64;
+        midiMsg = juce::MidiMessage::noteOn(channel, note, (juce::uint8) velocity);
+    }
+    else if (msgType == 3) // Note Off
+    {
+        int note     = info[3].As<Napi::Number>().Int32Value();
+        int velocity = info.Length() > 4 ? info[4].As<Napi::Number>().Int32Value() : 0;
+        midiMsg = juce::MidiMessage::noteOff(channel, note, (juce::uint8) velocity);
+    }
     else
         return Napi::Boolean::New(env, false);
 
@@ -2926,6 +2938,176 @@ static Napi::Value LoadPreset(const Napi::CallbackInfo& info)
     return deferred.Promise();
 }
 
+// ── Multi-chain: per-route preset loading ─────────────────────────────────────
+// loadPresetForRoute(sourceId, routeKey, presetJson) -> Promise<{success, slotsLoaded}>
+// Loads a preset into one named route chain on a specific source. Other route chains
+// on that source are untouched. Mirrors LoadPresetWorker but targets a per-route chain.
+
+class LoadPresetForRouteWorker : public Napi::AsyncWorker
+{
+public:
+    LoadPresetForRouteWorker(Napi::Env env, Napi::Promise::Deferred deferred,
+                              int sourceId, std::string routeKey, std::string json)
+        : Napi::AsyncWorker(env), deferred_(deferred),
+          sourceId_(sourceId), routeKey_(std::move(routeKey)), presetJson_(std::move(json)) {}
+
+    void Execute() override
+    {
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) { success_ = false; error_ = "No engine"; return; }
+
+        SourceChain* source = liveEngine->getSource(sourceId_);
+        if (!source) { success_ = false; error_ = "Invalid sourceId"; return; }
+
+        auto parsed = juce::JSON::parse(juce::String(presetJson_));
+        if (!parsed.isObject()) { success_ = false; error_ = "Invalid JSON"; return; }
+
+        auto* root = parsed.getDynamicObject();
+        if (!root) { success_ = false; error_ = "Invalid preset"; return; }
+
+        auto chainVar = root->getProperty("chain");
+        auto* chainArray = chainVar.getArray();
+        if (!chainArray) { success_ = false; error_ = "No chain array"; return; }
+
+        source->clearChainForRoute(routeKey_);
+        SignalChain& chain = source->getOrCreateChain(routeKey_);
+
+        double sr = loadSafeSampleRate(*liveEngine);
+        int bs = loadSafeBlockSize(*liveEngine);
+
+        for (auto& slotVar : *chainArray)
+        {
+            auto* slotObj = slotVar.getDynamicObject();
+            if (!slotObj) continue;
+
+            int type = (int)slotObj->getProperty("type");
+            auto name = slotObj->getProperty("name").toString();
+            auto path = slotObj->getProperty("path").toString();
+            bool bypassed = (bool)slotObj->getProperty("bypassed");
+            auto stateB64 = slotObj->getProperty("state").toString();
+
+            std::unique_ptr<juce::AudioProcessor> processor;
+
+            if (type == (int)ProcessorSlot::Type::VST && snapshotVstHost())
+            {
+                juce::String err;
+                bool sandboxRequired = false;
+                processor = loadVstSandboxAware(path, sr, bs, err, sandboxRequired);
+                if (!processor)
+                {
+                    fprintf(stderr, "[LoadPresetForRoute] VST load failed: %s (%s)\n",
+                            name.toRawUTF8(), err.toRawUTF8());
+                    continue;
+                }
+            }
+            else if (type == (int)ProcessorSlot::Type::NAM)
+            {
+                auto nam = std::make_unique<NAMProcessor>();
+                if (!nam->loadModel(juce::File(path)))
+                {
+                    fprintf(stderr, "[LoadPresetForRoute] NAM load failed: %s\n", path.toRawUTF8());
+                    continue;
+                }
+                processor = std::move(nam);
+            }
+            else if (type == (int)ProcessorSlot::Type::IR)
+            {
+                auto ir = std::make_unique<IRLoader>();
+                ir->setPlayConfigDetails(2, 2, sr, bs);
+                ir->prepareToPlay(sr, bs);
+                if (!ir->loadIR(juce::File(path)))
+                {
+                    fprintf(stderr, "[LoadPresetForRoute] IR load failed: %s\n", path.toRawUTF8());
+                    continue;
+                }
+                processor = std::move(ir);
+            }
+            else continue;
+
+            int slotId = chain.addProcessor(std::move(processor), (ProcessorSlot::Type)type, name, path);
+
+            if (bypassed && slotId >= 0)
+                chain.setBypass(slotId, true);
+
+            if (stateB64.isNotEmpty() && slotId >= 0)
+            {
+                juce::MemoryBlock state;
+                if (state.fromBase64Encoding(stateB64))
+                {
+                    auto* slot = const_cast<ProcessorSlot*>(chain.getSlot(slotId));
+                    if (slot) slot->setState(state);
+                }
+            }
+
+            slotsLoaded_++;
+        }
+
+        success_ = true;
+    }
+
+    void OnOK() override
+    {
+        auto obj = Napi::Object::New(Env());
+        obj.Set("success", success_);
+        obj.Set("slotsLoaded", slotsLoaded_);
+        if (!success_) obj.Set("error", error_);
+        deferred_.Resolve(obj);
+    }
+    void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    int sourceId_;
+    std::string routeKey_;
+    std::string presetJson_;
+    bool success_ = false;
+    std::string error_;
+    int slotsLoaded_ = 0;
+};
+
+static Napi::Value LoadPresetForRoute(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto deferred = Napi::Promise::Deferred::New(env);
+
+    auto reject = [&](const char* msg) {
+        auto obj = Napi::Object::New(env);
+        obj.Set("success", false);
+        obj.Set("error", msg);
+        deferred.Resolve(obj);
+        return deferred.Promise();
+    };
+
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 3)
+        return reject("No engine or missing arguments");
+    if (!info[0].IsNumber() || !info[1].IsString() || !info[2].IsString())
+        return reject("loadPresetForRoute(sourceId: number, routeKey: string, presetJson: string)");
+
+    const int sourceId = info[0].As<Napi::Number>().Int32Value();
+    auto routeKey = info[1].As<Napi::String>().Utf8Value();
+    auto json = info[2].As<Napi::String>().Utf8Value();
+
+    auto worker = new LoadPresetForRouteWorker(env, deferred, sourceId, std::move(routeKey), std::move(json));
+    worker->Queue();
+    return deferred.Promise();
+}
+
+static Napi::Value ClearChainForRoute(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    auto liveEngine = snapshotEngine();
+    if (!liveEngine || info.Length() < 2 || !info[0].IsNumber() || !info[1].IsString())
+        return Napi::Boolean::New(env, false);
+
+    SourceChain* source = getValidatedSource(liveEngine.get(), info, 0);
+    if (!source) return Napi::Boolean::New(env, false);
+
+    const auto routeKey = info[1].As<Napi::String>().Utf8Value();
+    source->clearChainForRoute(routeKey);
+    return Napi::Boolean::New(env, true);
+}
+
 static Napi::Value SetMultiBypass(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
@@ -3136,6 +3318,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     // Presets
     exports.Set("savePreset", Napi::Function::New(env, SavePreset));
     exports.Set("loadPreset", Napi::Function::New(env, LoadPreset));
+    exports.Set("loadPresetForRoute", Napi::Function::New(env, LoadPresetForRoute));
+    exports.Set("clearChainForRoute", Napi::Function::New(env, ClearChainForRoute));
     exports.Set("setMultiBypass", Napi::Function::New(env, SetMultiBypass));
 
     // Drain JUCE message thread + sandbox subprocesses before DLL unload, so a

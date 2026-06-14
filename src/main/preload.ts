@@ -414,6 +414,8 @@ const slopsmithDesktopApi = {
         setStageBypass: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageBypass', request),
         setStageParameter: (request: unknown) => ipcRenderer.invoke('audio-effects:setStageParameter', request),
         setRouteGain: (request: unknown) => ipcRenderer.invoke('audio-effects:setRouteGain', request),
+        loadChainPlanForRoute: (sourceId: number, routeKey: string, request: unknown) => ipcRenderer.invoke('audio-effects:loadChainPlanForRoute', sourceId, routeKey, request),
+        releaseRouteChain: (sourceId: number, routeKey: string) => ipcRenderer.invoke('audio-effects:releaseRouteChain', sourceId, routeKey),
     },
 
     // Plugin management

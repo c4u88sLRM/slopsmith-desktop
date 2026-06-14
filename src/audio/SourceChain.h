@@ -11,6 +11,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
 #include <vector>
 
 // SourceChain — one independent capture+detect+monitor chain for a single audio
@@ -65,11 +68,11 @@ public:
     // from audioDeviceAboutToStart. Kept narrow so behaviour is byte-identical.
     void prepareMonitorChain(double sr, int blockSize)
     {
-        signalChain.prepare(sr, blockSize);
+        getOrCreateChain("default").prepare(sr, blockSize);
         noiseGate.prepare(sr, blockSize);
         tonePolish.prepare(sr);
     }
-    void releaseMonitorChain() { signalChain.releaseResources(); }
+    void releaseMonitorChain() { getOrCreateChain("default").releaseResources(); }
 
     // ── Per-block processing (audio thread, RT-safe) ──────────────────────────
     // Build this source's mono signal from `inputData` (channel select / mono
@@ -83,8 +86,14 @@ public:
                       juce::AudioBuffer<float>& buffer, int effectiveOutputChannels,
                       int numSamples) noexcept;
 
+    // ── Multi-chain management ────────────────────────────────────────────────
+    // Returns the chain for routeKey, creating and preparing it on first access.
+    // "default" is the backward-compatible single-chain route.
+    SignalChain& getOrCreateChain(const std::string& routeKey);
+    void clearChainForRoute(const std::string& routeKey);
+
     // ── Accessors for the AudioEngine facade / NodeAddon ──────────────────────
-    SignalChain& getSignalChain() { return signalChain; }
+    SignalChain& getSignalChain() { return getOrCreateChain("default"); }
     PitchDetector& getPitchDetector() { return pitchDetector; }
     MlNoteDetector& getMlNoteDetector() { return mlNoteDetector; }
     bool loadNoteModel(const juce::File& modelFile) { return mlNoteDetector.loadModel(modelFile); }
@@ -173,13 +182,23 @@ private:
     const std::atomic<double>& sampleRate;
 
     // ── DSP units (moved verbatim from AudioEngine) ───────────────────────────
-    SignalChain signalChain;
+    // Per-route signal chains. "default" is the backward-compatible single chain;
+    // additional keys (e.g. musician slot names) are created by loadPresetForRoute.
+    std::map<std::string, std::unique_ptr<SignalChain>> chains;
+    mutable juce::CriticalSection chainsLock;
     PitchDetector pitchDetector;
     MlNoteDetector mlNoteDetector;
     NoiseGate noiseGate;
     TonePolish tonePolish;
     ChordScorer chordScorer;
     NoteVerifier noteVerifier;  // constructed with *this as the InputRingReader
+
+    // Stored so getOrCreateChain can prepare newly-created chains.
+    std::atomic<int> currentBlockSize{256};
+
+    // Pre-allocated scratch buffers for multi-chain summing (sized in prepare).
+    juce::AudioBuffer<float> multiChainScratch;
+    juce::AudioBuffer<float> multiChainOutput;
 
     // ── Per-source controls / metering ────────────────────────────────────────
     std::atomic<float> inputGain{1.0f};

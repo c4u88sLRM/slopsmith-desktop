@@ -1170,6 +1170,14 @@ export function initAudioBridge(): void {
     ipcMain.handle('audio-effects:setRouteGain', (_event, request: unknown) => {
         return audioEffects.setRouteGain(request);
     });
+
+    ipcMain.handle('audio-effects:loadChainPlanForRoute', async (_event, sourceId: unknown, routeKey: unknown, request: unknown) => {
+        return await audioEffects.loadChainPlanForRoute(sourceId as number, routeKey as string, request);
+    });
+
+    ipcMain.handle('audio-effects:releaseRouteChain', async (_event, sourceId: unknown, routeKey: unknown) => {
+        return await audioEffects.releaseRouteChain(sourceId as number, routeKey as string);
+    });
 }
 
 export function shutdownAudio(): void {
