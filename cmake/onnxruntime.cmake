@@ -13,7 +13,7 @@
 # Exports (cache/parent scope):
 #   ONNXRUNTIME_AVAILABLE     ON/OFF
 #   ONNXRUNTIME_INCLUDE_DIR   header directory
-#   ONNXRUNTIME_IMPORT_LIB    library to link against
+#   ONNXRUNTIME_IMPORT_LIB     library to link against
 #   ONNXRUNTIME_RUNTIME_LIB   shared lib that must sit next to slopsmith_audio.node
 
 # Plain variable, not a cache entry: the version is pinned in lock-step with
@@ -44,16 +44,27 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(_ort_ext "tgz")
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    
+    # Resolve cross-compilation target on Apple Silicon/Intel environments.
+    # CMAKE_SYSTEM_PROCESSOR reflects the host runner hardware, whereas
+    # CMAKE_OSX_ARCHITECTURES tells us what target binary slice we are building.
+    if(DEFINED CMAKE_OSX_ARCHITECTURES AND NOT "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "")
+        set(_mac_target_arch "${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        set(_mac_target_arch "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+
+    if(_mac_target_arch MATCHES "arm64|aarch64")
         set(_ort_asset "onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}")
         set(_ort_sha "b678fc3c2354c771fea4fba420edeccfba205140088334df801e7fc40e83a57a")
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x64")
+    elseif(_mac_target_arch MATCHES "x86_64|AMD64|x64")
         set(_ort_asset "onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}")
         set(_ort_sha "0f73006813af2a1a5d1723ed7dfb694fc629d15037124081bb61b7bf7d99fc78")
     else()
         set(_ort_ok OFF)
-        message(STATUS "ONNX Runtime: unsupported macOS arch '${CMAKE_SYSTEM_PROCESSOR}' — ML note detection disabled")
+        message(STATUS "ONNX Runtime: unsupported macOS arch '${_mac_target_arch}' — ML note detection disabled")
     endif()
+    
     set(_ort_import "libonnxruntime.dylib")
     set(_ort_runtime "libonnxruntime.${ONNXRUNTIME_VERSION}.dylib")
     set(_ort_providers "libonnxruntime_providers_shared.dylib")
@@ -76,6 +87,47 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 else()
     set(_ort_ok OFF)
     message(STATUS "ONNX Runtime: unsupported platform '${CMAKE_SYSTEM_NAME}' — ML note detection disabled")
+endif()
+
+# --- Obtain the runtime: explicit root override, or pinned fetch ----------
+set(_ort_root "")
+
+if(_ort_ok AND DEFINED SLOPSMITH_ONNXRUNTIME_ROOT)
+    if(EXISTS "${SLOPSMITH_ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h")
+        set(_ort_root "${SLOPSMITH_ONNXRUNTIME_ROOT}")
+        message(STATUS "ONNX Runtime: using prepopulated root ${_ort_root}")
+    else()
+        message(WARNING "SLOPSMITH_ONNXRUNTIME_ROOT='${SLOPSMITH_ONNXRUNTIME_ROOT}' "
+                        "has no include/onnxruntime_cxx_api.h — ignoring")
+    endif()
+endif()
+
+# Download + extract the prebuilt archive. Every failure mode here is SOFT —
+# offline machine, download error, hash mismatch, bad layout all just disable
+# ML detection (YIN fallback). Configure must never abort on this, so we use
+# file(DOWNLOAD) with a status check rather than FetchContent, which raises a
+# FATAL_ERROR when the archive can't be fetched.
+if(_ort_ok AND _ort_root STREQUAL "")
+    set(_ort_url     "${_ort_base}/${_ort_asset}.${_ort_ext}")
+    set(_ort_archive "${CMAKE_BINARY_DIR}/_deps/${_ort_asset}.${_ort_ext}")
+    set(_ort_extract "${CMAKE_BINARY_DIR}/_deps/onnxruntime")
+    set(_ort_header  "${_ort_extract}/${_ort_asset}/include/onnxruntime_cxx_api.h")
+
+    # On a clean build tree _deps does not exist yet — create it so the
+    # file(DOWNLOAD) below can open its destination file instead of failing
+    # and silently disabling ONNX support on every fresh configure.
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/_deps")
+
+    # Download — cached: a prior configure's archive with a matching hash is
+    # reused, so reconfigure / clean-tree rebuilds don't re-fetch.
+    set(_ort_have OFF)
+    if(EXISTS "${_ort_archive}")
+        file(SHA256 "${_ort_archive}" _ort_got)
+        if(_ort_got STREQUAL "${_ort_sha}")
+            set(_ort_have ON)
+        endif()
+    endif()
+    if(NOT _ort_    message(STATUS "ONNX Runtime: unsupported platform '${CMAKE_SYSTEM_NAME}' — ML note detection disabled")
 endif()
 
 # --- Obtain the runtime: explicit root override, or pinned fetch ----------
