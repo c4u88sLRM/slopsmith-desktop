@@ -33,9 +33,9 @@ jobs:
           - os: ubuntu-22.04
             platform: linux
             arch: x64
-          - os: macos-14
+          - os: macos-latest
             platform: mac
-            arch: arm64
+            arch: universal
           - os: windows-latest
             platform: win
             arch: x64
@@ -192,9 +192,9 @@ jobs:
             echo "::error::No Slopsmith.app found under release/mac*/ — macOS build produced no bundle."
             exit 1
           fi
-          ditto -c -k --sequesterRsrc --keepParent "$app" "release/Slopsmith-macos-arm64.zip"
-          echo "Zipped $app -> release/Slopsmith-macos-arm64.zip"
-          ls -lh release/Slopsmith-macos-arm64.zip
+          ditto -c -k --sequesterRsrc --keepParent "$app" "release/Slopsmith-macos-universal.zip"
+          echo "Zipped $app -> release/Slopsmith-macos-universal.zip"
+          ls -lh release/Slopsmith-macos-universal.zip
 
       # Velopack: derive update channel from tag name. Only runs for
       # tag pushes (refs/tags/v*) on win + mac — Linux still ships via
