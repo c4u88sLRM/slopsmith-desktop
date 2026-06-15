@@ -25,18 +25,22 @@ if [ ! -d "node_modules" ]; then
 fi
 
 # Detect architecture
-ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64)
-        CMAKE_ARCH="x64"
-        ;;
-    aarch64|arm64)
-        CMAKE_ARCH="arm64"
-        ;;
-    *)
-        CMAKE_ARCH="$ARCH"
-        ;;
-esac
+if [[ -z "${FORCE_ARCH:-}" ]]; then
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64)
+            CMAKE_ARCH="x64"
+            ;;
+        aarch64|arm64)
+            CMAKE_ARCH="arm64"
+            ;;
+        *)
+            CMAKE_ARCH="$ARCH"
+            ;;
+    esac
+else
+    CMAKE_ARCH="$FORCE_ARCH"
+fi
 
 # Linux: NeuralAmpModelerCore's A2 (slimmable) sources use
 # std::atomic<std::shared_ptr<...>>, a C++20 library feature that libstdc++ only
@@ -110,7 +114,7 @@ export npm_config_target_arch="$CMAKE_ARCH"
 # On Windows, cmake-js downloads headers to a different location
 # (C:\Users\...\.cmake-js) than on Unix systems.
 # To force cache clearing locally, set CLEAN_CMAKE_JS=1
-if [ "${CLEAN_CMAKE_JS:-}" = "1" ] || { [ -n "$CI" ] && [ -d "$HOME/.cmake-js" ]; }; then
+if [ "${CLEAN_CMAKE_JS:-}" = "1" ] || { [ -n "${CI:-}" ] && [ -d "$HOME/.cmake-js" ]; }; then
   echo "Clearing cmake-js cache..."
   rm -rf "$HOME/.cmake-js"
 fi
