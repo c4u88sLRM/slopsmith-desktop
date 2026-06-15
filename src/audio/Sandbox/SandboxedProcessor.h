@@ -151,7 +151,13 @@ private:
 
     bool initialise(juce::String& errorOut);
     void onControlEvent(const juce::String& event, const juce::var& data);
-    void teardown(const juce::String& reason);
+    // waitForCompletion: the destructor MUST pass true so it blocks until any
+    // in-flight teardown on another thread (watcher/disconnect) has fully run
+    // its closers — joining ioThread/watcher — before member destruction
+    // proceeds. Background callers (callbacks fired ON those threads) MUST pass
+    // false: they try_lock and bail, never block, or they'd deadlock against
+    // the winner's stop()/shutdown() joining them. See teardown() body.
+    void teardown(const juce::String& reason, bool waitForCompletion = false);
 
     SpawnConfig spawnConfig;
     juce::String spawnName;
@@ -180,6 +186,12 @@ private:
     // path that reaches them, even if destructor + watcher onExit fire
     // concurrently from different threads.
     std::atomic<bool> resourcesReleased{false};
+    // Serializes the teardown closer block. The destructor blocks on this so it
+    // cannot destroy `control`/`subprocess`/`audio` while a concurrent teardown
+    // (watcher/disconnect thread) is still inside their stop()/shutdown() —
+    // which was the EINVAL-from-noexcept-destructor abort. Background callers
+    // try_lock only (see teardown()).
+    std::mutex teardownMutex;
 
     std::unique_ptr<SubprocessHandle> subprocess;
     std::unique_ptr<ControlChannel> control;
@@ -232,6 +244,13 @@ void setCrashedPlugins(const juce::StringArray& pluginPaths);
 // releaseResources, so future LoadVST calls in this session route the
 // offending plugin to the out-of-process sandbox.
 void addCrashedPlugin(const juce::String& pluginPath);
+
+// True if `pluginPath` is on the runtime crash blocklist (matched
+// case-insensitively, same canonicalisation as shouldSandbox/addCrashedPlugin).
+// The loader consults this before falling back to an in-process load on a
+// sandbox-spawn failure: a plugin known to crash must NEVER load in-process
+// (that's the app-kill the blocklist exists to prevent).
+bool isCrashBlocklisted(const juce::String& pluginPath);
 
 // Resolve the path to slopsmith-vst-host.exe (sits next to the audio addon
 // .node). Returns a non-existent File if it can't be located. Exposed so the

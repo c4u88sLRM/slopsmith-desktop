@@ -13,6 +13,7 @@
  #error "ControlChannel_win.cpp is Windows-only; POSIX builds use ControlChannel_posix.cpp."
 #endif
 
+#include <system_error>
 #include <thread>
 
 #include "../VSTTrace.h"
@@ -112,7 +113,7 @@ bool ControlChannel::start(EventCallback evCb,
     return true;
 }
 
-void ControlChannel::stop()
+void ControlChannel::stop() noexcept
 {
     // Callback lifetime invariant: by the time stop() returns, both
     // `onEvent` and `onDisconnect` have been observed for the last time —
@@ -120,6 +121,12 @@ void ControlChannel::stop()
     // returned from its last dispatch (self-detach path; see below).
     // Owners therefore MUST call stop() before destroying any state
     // captured by-reference into onEvent/onDisconnect.
+    //
+    // Idempotent + never-throwing (mirrors the POSIX backend): ~ControlChannel
+    // may call this after a SandboxedProcessor teardown already did. Gate the
+    // one-shot signal/cancel on stopStarted, guard the join with joinable(),
+    // and swallow a racing double-join's std::system_error so it can't escape
+    // this noexcept body into a destructor (→ std::terminate).
     alive.store(false, std::memory_order_release);
 
     // Signal stop BEFORE CancelIoEx. The race we're guarding against is
@@ -127,29 +134,39 @@ void ControlChannel::stop()
     // ConnectNamedPipe — CancelIoEx would be a no-op there. With the
     // stop event signalled, the I/O thread's WaitForMultipleObjects exits
     // promptly regardless of whether the connect was ever started.
-    if (impl && impl->stopEvent != nullptr)
-        SetEvent(impl->stopEvent);
-
-    // CancelIoEx unblocks the I/O thread's pending read so it can exit. The
-    // handle must stay valid until the thread has returned — closing it
-    // first is a TOCTOU on the in-flight read.
-    if (impl && impl->pipe != INVALID_HANDLE_VALUE)
-        CancelIoEx(impl->pipe, nullptr);
-
-    if (ioThread.joinable())
+    if (!stopStarted.exchange(true, std::memory_order_acq_rel))
     {
-        if (std::this_thread::get_id() == ioThread.get_id())
+        if (impl && impl->stopEvent != nullptr)
+            SetEvent(impl->stopEvent);
+
+        // CancelIoEx unblocks the I/O thread's pending read so it can exit. The
+        // handle must stay valid until the thread has returned — closing it
+        // first is a TOCTOU on the in-flight read.
+        if (impl && impl->pipe != INVALID_HANDLE_VALUE)
+            CancelIoEx(impl->pipe, nullptr);
+    }
+
+    try
+    {
+        if (ioThread.joinable())
         {
-            // Self-stop: the I/O thread is unwinding through ioLoop /
-            // failWith / disconnect-callback / our caller into here.
-            // Detaching is the only choice (self-join deadlocks); the
-            // CancelIoEx + SetEvent above already shoved the I/O thread past
-            // any blocking syscall on the handles, so the window between
-            // detach and CloseHandle is just stack unwinding.
-            ioThread.detach();
+            if (std::this_thread::get_id() == ioThread.get_id())
+            {
+                // Self-stop: the I/O thread is unwinding through ioLoop /
+                // failWith / disconnect-callback / our caller into here.
+                // Detaching is the only choice (self-join deadlocks); the
+                // CancelIoEx + SetEvent above already shoved the I/O thread past
+                // any blocking syscall on the handles, so the window between
+                // detach and CloseHandle is just stack unwinding.
+                ioThread.detach();
+            }
+            else
+                ioThread.join();
         }
-        else
-            ioThread.join();
+    }
+    catch (const std::system_error&)
+    {
+        // Already joined/detached by a racing stop() — must not propagate.
     }
 
     if (impl && impl->pipe != INVALID_HANDLE_VALUE)

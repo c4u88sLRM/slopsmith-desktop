@@ -86,7 +86,11 @@ public:
     // or has not been called.
     juce::String getLastStartError() const { return lastStartError; }
 
-    void stop();
+    // Idempotent and never-throwing: ~ControlChannel calls stop(), and a
+    // SandboxedProcessor teardown may have already called it. A second call,
+    // or a join() on an already-joined thread, must be a no-op rather than
+    // throw std::system_error out of the noexcept destructor (→ std::terminate).
+    void stop() noexcept;
     bool isAlive() const noexcept { return alive.load(std::memory_order_acquire); }
 
     // Synchronous request/response. Returns the parsed result `juce::var`, or
@@ -155,6 +159,11 @@ private:
 
     std::mutex writeMutex;     // serialises outbound writes
     std::thread ioThread;
+    // One-shot guard for stop()'s side effects (self-pipe wake + socket
+    // shutdown). The thread-join below is separately guarded by joinable() so a
+    // second stop() (e.g. ~ControlChannel after teardown already stopped us) is
+    // a safe no-op.
+    std::atomic<bool> stopStarted{false};
     juce::String lastStartError;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ControlChannel)

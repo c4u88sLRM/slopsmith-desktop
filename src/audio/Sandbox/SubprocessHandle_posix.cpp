@@ -31,6 +31,8 @@
 #include <cstring>
 #include <spawn.h>
 #include <string>
+#include <sys/stat.h>
+#include <system_error>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -106,8 +108,29 @@ bool SubprocessHandle::startPosix(const juce::String& exePath,
         return false;
     }
     for (const auto& f : inherited)
-        if (rc == 0)
-            rc = posix_spawn_file_actions_adddup2(&actions, f.hostFd, f.childFd);
+    {
+        if (rc != 0)
+            break;
+        // Validate each host fd is actually open BEFORE handing it to
+        // posix_spawn. A closed/invalid source fd would make the child come up
+        // missing that dup2 target (the reported "fd 5 never inherited" symptom)
+        // and only surface as an opaque handshake timeout. fstat() here turns it
+        // into a precise, greppable error naming which child fd is bad.
+        struct stat st {};
+        if (f.hostFd < 0 || ::fstat(f.hostFd, &st) != 0)
+        {
+            errorOut = "inherited fd invalid before spawn: hostFd="
+                     + juce::String(f.hostFd) + " -> childFd="
+                     + juce::String(f.childFd)
+                     + " (" + juce::String(strerror(errno)) + ")";
+            VST_TRACE("SubprocessHandle.startPosix: %s", errorOut.toRawUTF8());
+            posix_spawn_file_actions_destroy(&actions);
+            return false;
+        }
+        VST_TRACE("SubprocessHandle.startPosix: inherit hostFd=%d -> childFd=%d "
+                  "(mode=0%o)", f.hostFd, f.childFd, (unsigned)st.st_mode);
+        rc = posix_spawn_file_actions_adddup2(&actions, f.hostFd, f.childFd);
+    }
     if (rc != 0)
     {
         errorOut = "posix_spawn_file_actions setup failed: "
@@ -209,19 +232,30 @@ void SubprocessHandle::shutdown(int timeoutMs)
             ::kill(impl->pid, SIGKILL);
     }
 
-    if (watcher.joinable())
+    // Guard the join so a racing double-shutdown (or a thread already reaped)
+    // can't throw std::system_error out into ~SubprocessHandle (noexcept) and
+    // abort. The joinable() check below already no-ops a second shutdown; the
+    // try/catch is the belt to its suspenders.
+    try
     {
-        if (std::this_thread::get_id() == watcher.get_id())
+        if (watcher.joinable())
         {
-            // Self-join would deadlock. Detaching is safe for the same reasons
-            // documented in the Windows backend: SandboxedProcessor::teardown
-            // drops the onCrash callback before calling shutdown(), and the
-            // watcher touches no member state after onExitCb beyond the atomic
-            // `running` store.
-            watcher.detach();
+            if (std::this_thread::get_id() == watcher.get_id())
+            {
+                // Self-join would deadlock. Detaching is safe for the same reasons
+                // documented in the Windows backend: SandboxedProcessor::teardown
+                // drops the onCrash callback before calling shutdown(), and the
+                // watcher touches no member state after onExitCb beyond the atomic
+                // `running` store.
+                watcher.detach();
+            }
+            else
+                watcher.join();
         }
-        else
-            watcher.join();
+    }
+    catch (const std::system_error&)
+    {
+        // Already joined/detached — nothing to wait on.
     }
     impl->pid = -1;
 }

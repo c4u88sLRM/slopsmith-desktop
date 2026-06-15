@@ -50,7 +50,9 @@ bool shouldSandbox(const juce::PluginDescription& desc)
     if (!path.getFileName().endsWithIgnoreCase(".vst3"))
         return false;
 
-    // Runtime crash blocklist — diagnostic tagging only under sandbox-by-default.
+    // Runtime crash blocklist — a plugin that crashed in-process before MUST
+    // always sandbox, and (checked first so it) overrides the env opt-out below:
+    // never force a known-crasher back in-process.
     {
         const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
         const auto canonical = path.getFullPathName();
@@ -60,6 +62,20 @@ bool shouldSandbox(const juce::PluginDescription& desc)
                       desc.fileOrIdentifier.toRawUTF8());
             return true;
         }
+    }
+
+    // Global opt-out: SLOPSMITH_VST_NO_SANDBOX loads every (non-blocklisted)
+    // VST3 in-process — the pre-sandbox 0.2.x behaviour. An escape hatch for
+    // users whose sandbox host binary is broken on their platform. Read once
+    // per process so the routing decision is stable across loads.
+    static const bool kNoSandbox =
+        juce::SystemStats::getEnvironmentVariable("SLOPSMITH_VST_NO_SANDBOX", {})
+            .trim().isNotEmpty();
+    if (kNoSandbox)
+    {
+        VST_TRACE("shouldSandbox: %s — SLOPSMITH_VST_NO_SANDBOX set, in-process",
+                  desc.fileOrIdentifier.toRawUTF8());
+        return false;
     }
 
     // Pre-seed filename match — diagnostic tagging only.
@@ -131,6 +147,16 @@ void addCrashedPlugin(const juce::String& pluginPath)
         VST_TRACE("addCrashedPlugin: %s appended to runtime crash blocklist",
                   canonical.toRawUTF8());
     }
+}
+
+bool isCrashBlocklisted(const juce::String& pluginPath)
+{
+    if (pluginPath.isEmpty()) return false;
+    // Same canonicalisation + lock as shouldSandbox/addCrashedPlugin so the
+    // fallback decision in loadVstSandboxAware matches the routing decision.
+    const auto canonical = juce::File(pluginPath).getFullPathName();
+    const std::lock_guard<std::mutex> lock(g_crashedPluginsMutex);
+    return g_crashedPlugins.contains(canonical, /*ignoreCase*/ true);
 }
 
 void setCrashedPlugins(const juce::StringArray& pluginPaths)

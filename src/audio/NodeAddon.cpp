@@ -1903,15 +1903,34 @@ static std::unique_ptr<juce::AudioProcessor> loadVstSandboxAware(
         juce::String sandboxErr;
         auto processor = slopsmith::sandbox::tryLoadSandboxed(
             probeDesc, sr, bs, sandboxErr);
-        if (!processor)
+        if (processor)
+            return processor;                 // sandbox spawned + handshook OK
+
+        // Sandbox declined or failed to spawn/handshake. A plugin that merely
+        // fails to SPAWN sandboxed (host binary missing, fd-inherit failure,
+        // handshake timeout) is an infrastructure problem, not a plugin crash —
+        // loading it in-process is strictly better than no plugin at all and
+        // matches the pre-0.3 behaviour. A plugin that CRASHED at runtime is on
+        // the crash blocklist; that must stay isolated, so refuse the fallback
+        // and surface the sandbox error instead (loading it in-process would
+        // reintroduce the very app-kill the blocklist exists to prevent).
+        if (slopsmith::sandbox::isCrashBlocklisted(probeDesc.fileOrIdentifier))
         {
-            error = "sandbox load failed: "
+            error = "sandbox load failed and plugin is on the crash blocklist "
+                    "(refusing in-process fallback): "
                   + (sandboxErr.isEmpty() ? juce::String("unknown error")
                                           : sandboxErr);
-            VST_TRACE("loadVstSandboxAware: sandbox path declined/failed: %s",
-                      sandboxErr.toRawUTF8());
+            VST_TRACE("loadVstSandboxAware: sandbox failed + blocklisted, no "
+                      "fallback: %s", sandboxErr.toRawUTF8());
+            return nullptr;
         }
-        return processor;
+
+        VST_TRACE("loadVstSandboxAware: sandbox failed (%s) — falling back to "
+                  "in-process load", sandboxErr.toRawUTF8());
+        // We're loading in-process now; it is no longer a hard sandbox
+        // requirement, so callers don't mis-report it as a sandbox-only plugin.
+        sandboxRequired = false;
+        // Fall through to the in-process tail below.
     }
 
    #if JUCE_MAC
