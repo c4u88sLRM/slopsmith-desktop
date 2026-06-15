@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 
@@ -161,32 +162,48 @@ bool ControlChannel::start(EventCallback evCb,
     return true;
 }
 
-void ControlChannel::stop()
+void ControlChannel::stop() noexcept
 {
     // See the Windows backend for the full callback-lifetime invariant: by the
     // time stop() returns the I/O thread has been joined (or detached on the
     // self-stop path) and onDisconnect has fired for the last time.
+    //
+    // Idempotent + never-throwing: ~ControlChannel calls this even after a
+    // SandboxedProcessor teardown already did. Gate the one-shot wake/shutdown
+    // on stopStarted, guard the join with joinable(), and never let a
+    // std::system_error (e.g. a racing double-join) escape this noexcept body.
     alive.store(false, std::memory_order_release);
 
     // Signal stop FIRST (self-pipe byte, never drained), then shutdown() the
     // socket so a blocked recv()/poll() on it also wakes. Ordering mirrors the
     // Windows SetEvent-before-CancelIoEx: the self-pipe covers the window
     // before the I/O thread has even reached its first poll().
-    if (impl && impl->stopPipe[1] >= 0)
+    if (!stopStarted.exchange(true, std::memory_order_acq_rel))
     {
-        const unsigned char b = 1;
-        ssize_t r = ::write(impl->stopPipe[1], &b, 1);
-        (void)r; // best-effort wake; a full self-pipe already means "stopping"
+        if (impl && impl->stopPipe[1] >= 0)
+        {
+            const unsigned char b = 1;
+            ssize_t r = ::write(impl->stopPipe[1], &b, 1);
+            (void)r; // best-effort wake; a full self-pipe already means "stopping"
+        }
+        if (impl && impl->fd >= 0)
+            ::shutdown(impl->fd, SHUT_RDWR);
     }
-    if (impl && impl->fd >= 0)
-        ::shutdown(impl->fd, SHUT_RDWR);
 
-    if (ioThread.joinable())
+    try
     {
-        if (std::this_thread::get_id() == ioThread.get_id())
-            ioThread.detach();   // self-stop: self-join would deadlock
-        else
-            ioThread.join();
+        if (ioThread.joinable())
+        {
+            if (std::this_thread::get_id() == ioThread.get_id())
+                ioThread.detach();   // self-stop: self-join would deadlock
+            else
+                ioThread.join();
+        }
+    }
+    catch (const std::system_error&)
+    {
+        // Already joined/detached by a racing stop(), or the thread is gone —
+        // nothing to wait on. Must not propagate out of this noexcept function.
     }
 
     if (impl)

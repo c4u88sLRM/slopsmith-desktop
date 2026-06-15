@@ -28,7 +28,12 @@ SandboxedProcessor::~SandboxedProcessor()
     // callback before teardown so it doesn't fire — consumers reasonably
     // assume onCrash means "the sandbox died unexpectedly".
     setOnCrash(nullptr);
-    teardown("destructor");
+    // waitForCompletion=true: block until any concurrent teardown (on the
+    // watcher/disconnect thread) has finished its closers before we destroy
+    // the channel members below — otherwise ~ControlChannel could destroy the
+    // mutex/thread while the other thread is still inside control->stop(),
+    // throwing std::system_error(EINVAL) out of a noexcept destructor → abort.
+    teardown("destructor", /*waitForCompletion=*/true);
 }
 
 void SandboxedProcessor::setOnCrash(CrashCallback cb)
@@ -358,7 +363,7 @@ bool SandboxedProcessor::initialise(juce::String& errorOut)
     return true;
 }
 
-void SandboxedProcessor::teardown(const juce::String& reason)
+void SandboxedProcessor::teardown(const juce::String& reason, bool waitForCompletion)
 {
     alive.exchange(false, std::memory_order_acq_rel);
     // Clear the editor-open bit too: if the sandbox dies while the editor
@@ -383,15 +388,45 @@ void SandboxedProcessor::teardown(const juce::String& reason)
 
     // The closers themselves are individually idempotent, but running them
     // concurrently from the destructor and the subprocess-exit watcher races
-    // on CloseHandle. Gate the whole block on a single-fire latch.
-    bool expected = false;
-    if (resourcesReleased.compare_exchange_strong(expected, true,
-                                                  std::memory_order_acq_rel))
+    // on CloseHandle / on joining-and-destroying the channel threads. Two
+    // guards work together:
+    //   * resourcesReleased — single-fire latch so the closers run exactly once.
+    //   * teardownMutex      — serializes the closer region so a teardown that
+    //                          does NOT win the latch still can't return (and,
+    //                          for the destructor, proceed to destroy members)
+    //                          until the winner's stop()/shutdown() — which join
+    //                          ioThread + watcher — have fully returned.
+    //
+    // Only the destructor (waitForCompletion=true) may BLOCK on teardownMutex:
+    // it is never a thread that the winner's joins wait on. Callbacks fired on
+    // the ioThread (disconnectCb) or watcher (onExitCb) pass false and only
+    // try_lock — if they blocked while the winner's control->stop()/
+    // subprocess->shutdown() tried to join *them*, that would deadlock.
+    auto runClosersOnce = [this]
     {
-        if (control)    control->stop();
-        if (subprocess) subprocess->shutdown(1500);
-        if (audio)      audio->close();
+        bool expected = false;
+        if (resourcesReleased.compare_exchange_strong(expected, true,
+                                                      std::memory_order_acq_rel))
+        {
+            if (control)    control->stop();
+            if (subprocess) subprocess->shutdown(1500);
+            if (audio)      audio->close();
+        }
+    };
+
+    if (waitForCompletion)
+    {
+        std::lock_guard<std::mutex> tdLock(teardownMutex);
+        runClosersOnce();
     }
+    else if (teardownMutex.try_lock())
+    {
+        std::lock_guard<std::mutex> tdLock(teardownMutex, std::adopt_lock);
+        runClosersOnce();
+    }
+    // else: a concurrent teardown holds the lock and is running (or has run)
+    // the closers. This is a background-thread caller, so it does not destroy
+    // members — returning without waiting is safe and avoids the deadlock above.
 
     if (cb) cb(reason);
 }

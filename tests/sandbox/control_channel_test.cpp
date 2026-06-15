@@ -202,6 +202,37 @@ void testPeerClosedDetected()
     CHECK(pair.hostDisconnectReason == ControlChannel::kReasonPeerClosed);
 }
 
+// Regression for the 0.2.9 VST-sandbox app-kill: stop() must be idempotent and
+// never throw when called more than once on the same channel. In production
+// SandboxedProcessor::teardown calls control->stop() once, then ~ControlChannel
+// calls stop() AGAIN at member destruction — a second, sequential call. The
+// original code re-ran the self-pipe write + an unconditional join path on that
+// second call; a racing/already-joined thread surfaced std::system_error(EINVAL)
+// ("thread::join failed" / "mutex lock failed") out of the noexcept destructor →
+// std::terminate. The fix gates the one-shot side effects on `stopStarted`,
+// guards the join with joinable(), and swallows std::system_error so a second
+// stop() is a clean no-op. (Concurrency between the two calls is prevented one
+// layer up by SandboxedProcessor::teardownMutex, not here — stop()'s own
+// contract is sequential idempotency.)
+void testRepeatedStopIsSafe()
+{
+    std::printf("test: repeated stop() is an idempotent, non-throwing no-op\n");
+    ChannelPair pair;
+    REQUIRE(pair.ok);
+
+    // First stop() on the live channel joins the ioThread.
+    pair.host.stop();
+    CHECK(!pair.host.isAlive());
+
+    // Further sequential stop()s (mirroring ~ControlChannel after teardown
+    // already stopped us) must not throw / abort — the bug's exact path.
+    pair.host.stop();
+    pair.host.stop();
+    CHECK(!pair.host.isAlive());
+    std::printf("  (survived three sequential stops)\n");
+    // ChannelPair's destructor calls host.stop() a fourth time — also fine.
+}
+
 } // namespace
 
 int main()
@@ -213,6 +244,7 @@ int main()
     testPostNoReply();
     testManyRequests();
     testPeerClosedDetected();
+    testRepeatedStopIsSafe();
     std::printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

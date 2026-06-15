@@ -39,6 +39,9 @@
 #else
  #include <cstdlib>    // getenv, std::_Exit
  #include <unistd.h>   // getpid
+ #include <cerrno>     // errno (inherited-fd fstat diagnostics)
+ #include <cstring>    // strerror
+ #include <sys/stat.h> // fstat (verify inherited fds 3/4/5 actually arrived)
 #endif
 
 #if JUCE_LINUX
@@ -1628,6 +1631,31 @@ int main(int argc, char** argv)
              parsed.pluginPath.toRawUTF8(),
              parsed.controlFd, parsed.audio.shmFd, parsed.audio.sandboxAudioFd,
              parsed.sampleRate, parsed.maxBlock, parsed.channels);
+
+    // Verify each inherited fd actually arrived BEFORE we try to use it. The
+    // "fd 5 (audio-shm) never inherited" symptom otherwise surfaces only as an
+    // opaque shm-open failure (return 3) with no way to tell a truly-missing fd
+    // from a mapping/magic/size mismatch. fstat each handoff fd and log the
+    // verdict; emit a distinct, greppable line per missing fd so a macOS repro
+    // pinpoints the inheritance failure precisely.
+    {
+        const struct { const char* name; int fd; } handoff[] = {
+            { "control", parsed.controlFd },
+            { "audio-evt", parsed.audio.sandboxAudioFd },
+            { "audio-shm", parsed.audio.shmFd },
+        };
+        for (const auto& h : handoff)
+        {
+            struct stat sbuf {};
+            if (h.fd < 0 || ::fstat(h.fd, &sbuf) != 0)
+                hostLogf("inherited-fd MISSING: %s fd=%d (%s) — parent did not "
+                         "hand off this fd", h.name, h.fd,
+                         std::strerror(errno));
+            else
+                hostLogf("inherited-fd OK: %s fd=%d mode=0%o", h.name, h.fd,
+                         (unsigned)sbuf.st_mode);
+        }
+    }
 #endif
 
     HostState st;
