@@ -129,6 +129,7 @@ clone_slopsmith() {
 		slopsmith/slopsmith-plugin-drums
 		slopsmith/slopsmith-plugin-editor
 		slopsmith/slopsmith-plugin-flappy-bend
+		slopsmith/slopsmith-plugin-strum-fighter
 		slopsmith/slopsmith-plugin-fretboard
 		slopsmith/slopsmith-plugin-jumpingtab
 		slopsmith/slopsmith-plugin-keys-highway-3d
