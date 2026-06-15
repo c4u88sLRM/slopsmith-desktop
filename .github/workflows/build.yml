@@ -22,7 +22,7 @@ jobs:
             arch: x64
           - os: macos-14
             platform: mac
-            arch: arm64
+            arch: universal
           - os: windows-latest
             platform: win
             arch: x64
@@ -41,9 +41,9 @@ jobs:
           NODE_VERSION=$(node -p "require('./.build-config.json').versions.node")
           PYTHON_VERSION=$(node -p "require('./.build-config.json').versions.python")
           DOTNET_VERSION=$(node -p "require('./.build-config.json').versions.dotnet")
-          echo "node=$NODE_VERSION" >> $GITHUB_OUTPUT
-          echo "python=$PYTHON_VERSION" >> $GITHUB_OUTPUT
-          echo "dotnet=$DOTNET_VERSION" >> $GITHUB_OUTPUT
+          echo "node=${NODE_VERSION}" >> $GITHUB_OUTPUT
+          echo "python=${PYTHON_VERSION}" >> $GITHUB_OUTPUT
+          echo "dotnet=${DOTNET_VERSION}" >> $GITHUB_OUTPUT
           echo "Node ${NODE_VERSION}, Python ${PYTHON_VERSION}, .NET ${DOTNET_VERSION}"
 
       - uses: actions/setup-node@v4
@@ -54,78 +54,51 @@ jobs:
         with:
           python-version: ${{ steps.config.outputs.python }}
 
-      - name: Install .NET SDK
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ steps.config.outputs.dotnet }}
 
-      - name: Install Ninja (Linux)
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build libasound2-dev libjack-jackd2-dev
-
-      - name: Install Ninja & Tools (macOS)
+      - name: Setup macOS code signing certificates
         if: matrix.platform == 'mac'
-        run: brew install ninja dylibbundler ffmpeg fluid-synth speex vgmstream
-
-      - name: Install Ninja & Tools (Windows)
-        if: matrix.platform == 'win'
-        run: choco install ninja
-
-      - name: Install npm dependencies
-        run: npm install
-
-      - name: Bundle application assets
-        id: bundle
-        shell: bash
         env:
-          SLOPSMITH_REF: ${{ github.event.inputs.slopsmith_ref || 'main' }}
-        run: |
-          echo "Bundling Slopsmith assets with core ref: ${SLOPSMITH_REF}"
-          npm run bundle
-
-      - name: Compile typescript
-        run: npm run build:ts
-
-      - name: Configure macOS signing certificate
-        if: matrix.platform == 'mac' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
-          security create-keychain -p build-password build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p build-password build.keychain
-          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k build-password build.keychain
-          rm certificate.p12
-
-      - name: Packaging application
-        env:
-          APP_BUILD_DATE: ${{ needs.setup.outputs.date }}
-          CSC_IDENTITY_AUTO_DISCOVERY: false
-        run: |
-          if [ "${{ matrix.platform }}" = "mac" ]; then
-            npm run dist -- --mac --universal
-          else
-            npm run dist -- --${{ matrix.platform }} --${{ matrix.arch }}
+          if [ -z "$APPLE_CERTIFICATE_P12_BASE64" ]; then
+            echo "Signing certificate secret is missing. Skipping keychain setup."
+            exit 0
           fi
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+
+      - name: Run build system dispatcher
+        env:
+          SLOPSMITH_REF: ${{ github.event.inputs.slopsmith_ref }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_FOR_PULL_REQUEST: true
+        run: ./scripts/build-release.sh
 
       - name: Zip macOS app for tester distribution (non-tag)
         if: matrix.platform == 'mac' && !startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           set -euo pipefail
-          app=$(ls -d release/mac*/Slopsmith.app 2>/dev/null | head -n1 || true)
-          if [[ -z "${app:-}" || ! -d "$app" ]]; then
-            echo "::error::No Slopsmith.app found under release/mac*/ — macOS build produced no bundle."
+          app="release/mac/Slopsmith.app"
+          if [[ ! -d "$app" ]]; then
+            echo "::error::No Slopsmith.app found under release/mac/ — macOS build produced no bundle."
             exit 1
           fi
-          ditto -c -k --sequesterRsrc --keepParent "$app" "release/Slopsmith-macos-universal.zip"
-          echo "Zipped $app -> release/Slopsmith-macos-universal.zip"
-          ls -lh "release/Slopsmith-macos-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "release/Slopsmith-macos-${{ matrix.arch }}.zip"
+          echo "Zipped $app -> release/Slopsmith-macos-${{ matrix.arch }}.zip"
+          ls -lh "release/Slopsmith-macos-${{ matrix.arch }}.zip"
 
       - name: Derive Velopack channel
         id: velopack_channel
@@ -140,24 +113,14 @@ jobs:
             base="${base%%-*}"
             channel=dev
             version="${base}-dev.${GITHUB_RUN_NUMBER}"
+            echo "Forcing manifest version to manual build signature: ${version}"
+            npm version "$version" --allow-same-version --no-git-tag-version
           else
-            tag="${GITHUB_REF#refs/tags/v}"
-            if [[ "$tag" == *"-alpha"* ]]; then
-              channel=alpha
-            elif [[ "$tag" == *"-beta"* ]]; then
-              channel=beta
-            elif [[ "$tag" == *"-rc"* ]]; then
-              channel=rc
-            else
-              channel=stable
-            fi
-            version="$tag"
+            channel=stable
           fi
           echo "channel=${channel}" >> $GITHUB_OUTPUT
-          echo "version=${version}" >> $GITHUB_OUTPUT
-          echo "Using Velopack channel: ${channel}, version: ${version}"
 
-      - name: Package Windows installer (Velopack)
+      - name: Package Windows Installer via Velopack
         if: >-
           (startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'win')
           || (github.event_name == 'workflow_dispatch' && matrix.platform == 'win')
@@ -165,21 +128,21 @@ jobs:
         run: |
           set -euo pipefail
           dotnet tool restore
+          echo "Compiling setup release packages via Velopack..."
           dotnet vpk pack \
-            --packId "Slopsmith" \
-            --packVersion "${{ steps.velopack_channel.outputs.version }}" \
-            --packDir "release/win-unpacked" \
-            --mainExe "Slopsmith.exe" \
-            --outputDir "release/velopack" \
-            --channel "${{ steps.velopack_channel.outputs.channel }}"
+              --packId "Slopsmith" \
+              --packVersion "$(node -p "require('./package.json').version")" \
+              --packDir "release/win-unpacked" \
+              --mainExe "Slopsmith.exe" \
+              --outputDir "release/velopack" \
+              --channel "${{ steps.velopack_channel.outputs.channel }}"
 
       - name: Clean up signing keychain
         if: always() && matrix.platform == 'mac'
         run: |
           security delete-keychain build.keychain 2>/dev/null || true
 
-      - name: Upload build artifacts (non-tag)
-        if: "!startsWith(github.ref, 'refs/tags/v')"
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: slopsmith-${{ matrix.platform }}-${{ matrix.arch }}
@@ -187,15 +150,6 @@ jobs:
             release/*.AppImage
             release/*.deb
             release/*.zip
-          if-no-files-found: error
-
-      - name: Upload release artifacts (tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}
-          path: |
-            release/*.AppImage
-            release/*.deb
-            release/velopack/*
+            release/*.dmg
+            release/velopack/**/*
           if-no-files-found: error
