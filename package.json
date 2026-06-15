@@ -37,9 +37,13 @@
     },
     "files": [
       "dist/**/*",
+      "package.json",
       "build/Release/*.node",
       "build/Release/libonnxruntime*",
-      "build/Release/onnxruntime*.dll"
+      "build/Release/onnxruntime*.dll",
+      "build/Release/slopsmith-vst-scan",
+      "build/Release/slopsmith-vst-host",
+      "build/Release/slopsmith-vst-host.exe"
     ],
     "extraResources": [
       {
@@ -82,7 +86,10 @@
     "asarUnpack": [
       "build/Release/*.node",
       "build/Release/libonnxruntime*",
-      "build/Release/onnxruntime*.dll"
+      "build/Release/onnxruntime*.dll",
+      "build/Release/slopsmith-vst-scan",
+      "build/Release/slopsmith-vst-host",
+      "build/Release/slopsmith-vst-host.exe"
     ],
     "linux": {
       "target": [
@@ -90,17 +97,11 @@
         "deb"
       ],
       "category": "Audio",
-      "icon": "resources/icons",
-      "files": [
-        "build/Release/slopsmith-vst-host"
-      ],
-      "asarUnpack": [
-        "build/Release/slopsmith-vst-host"
-      ]
+      "icon": "resources/icons"
     },
     "mac": {
       "target": [
-        "dir"
+        "universal"
       ],
       "category": "public.app-category.music",
       "icon": "resources/icons/icon.icns",
@@ -112,26 +113,18 @@
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Slopsmith needs microphone access for guitar input and note detection."
       },
-      "files": [
-        "build/Release/slopsmith-vst-scan",
-        "build/Release/slopsmith-vst-host"
-      ],
-      "asarUnpack": [
-        "build/Release/slopsmith-vst-scan",
-        "build/Release/slopsmith-vst-host"
+      "x64ArchFiles": [
+        "**/Contents/Resources/bin/**",
+        "**/Contents/Resources/python/**",
+        "**/build/Release/slopsmith-vst-scan",
+        "**/build/Release/slopsmith-vst-host"
       ]
     },
     "win": {
       "target": [
         "dir"
       ],
-      "icon": "resources/icons/icon.ico",
-      "files": [
-        "build/Release/slopsmith-vst-host.exe"
-      ],
-      "asarUnpack": [
-        "build/Release/slopsmith-vst-host.exe"
-      ]
+      "icon": "resources/icons/icon.ico"
     }
   },
   "dependencies": {
