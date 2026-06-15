@@ -13,16 +13,13 @@ jobs:
       date: ${{ steps.date.outputs.date }}
 
     steps:
-      # Find the most recently created release/v* branch by sorting version
-      # strings. Falls back to main if no release branch exists (quiet window
-      # between a release shipping and the next branch being cut).
       - name: Find active release branch
         id: branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           branch=$(gh api "repos/${{ github.repository }}/git/matching-refs/heads/release/v" \
-            --jq '[.[].ref | ltrimstr("refs/heads/")] | sort_by(capture("release/v(?<major>\\d+)\\.(?<minor>\\d+)") | [.major, .minor] | map(tonumber)) | last // empty' 2>/dev/null || echo "")
+            --jq '[.[].ref | ltrimstr("refs/heads/")] | sort | last // empty' 2>/dev/null || echo "")
           if [[ -z "$branch" ]]; then
             branch="main"
           fi
@@ -33,8 +30,21 @@ jobs:
         id: date
         run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-  build:
+  build-core:
     needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Clone core at active branch
+        run: |
+          git clone --depth 1 --branch "${{ needs.setup.outputs.branch }}" \
+            https://github.com/${{ github.repository_owner }}/slopsmith.git slopsmith-core
+
+  build:
+    needs: [setup, build-core]
     strategy:
       fail-fast: false
       matrix:
@@ -50,6 +60,8 @@ jobs:
             arch: x64
 
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -75,51 +87,40 @@ jobs:
         with:
           python-version: ${{ steps.config.outputs.python }}
 
-      # macOS: import signing cert so build-macos.sh can codesign the .app.
-      # The nightly .app is signed but not notarized — testers clear Gatekeeper with
-      #   xattr -dr com.apple.quarantine Slopsmith.app
-      # Same graceful fallback as release.yml: no-op when secrets are absent.
-      - name: Import Apple signing certificate
-        if: matrix.platform == 'mac'
-        env:
-          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      - name: Install Ninja (Linux)
+        if: matrix.platform == 'linux'
         run: |
-          set -euo pipefail
-          if [[ -z "${APPLE_CERTIFICATE_P12_BASE64:-}" ]]; then
-              echo "APPLE_CERTIFICATE_P12_BASE64 not set — skipping (unsigned build)"
-              exit 0
-          fi
-          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -lut 21600 build.keychain
-          security list-keychains -d user -s build.keychain login.keychain-db
-          security import "$RUNNER_TEMP/cert.p12" -k build.keychain \
-              -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list \
-              -S apple-tool:,apple:,codesign: \
-              -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          rm -f "$RUNNER_TEMP/cert.p12"
-          security find-identity -v -p codesigning build.keychain | grep -q "Developer ID Application"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libasound2-dev libjack-jackd2-dev
 
-      - name: Build
-        run: ./scripts/build-release.sh
+      - name: Install Ninja & Tools (macOS)
+        if: matrix.platform == 'mac'
+        run: brew install ninja dylibbundler ffmpeg fluid-synth speex vgmstream
+
+      - name: Install Ninja (Windows)
+        if: matrix.platform == 'win'
+        run: choco install ninja
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Bundle application assets
         shell: bash
-        env:
-          # Bundle core from the same active release branch the nightly is
-          # built from (and that build-core pushes the Docker image from).
-          # Without this, build-common.sh defaults to core `main`, so the
-          # nightly installers would bundle a different core ref than the
-          # nightly Docker image and the desktop checkout.
-          SLOPSMITH_REF: ${{ needs.setup.outputs.branch }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # No notarization for nightlies — testers use xattr -dr com.apple.quarantine
-          CSC_FOR_PULL_REQUEST: "true"
+        run: npm run bundle
 
-      # macOS: zip the .app for tester distribution (same as release.yml non-tag path).
+      - name: Compile typescript
+        run: npm run build:ts
+
+      - name: Packaging application
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: |
+          if [ "${{ matrix.platform }}" = "mac" ]; then
+            npm run dist -- --mac --universal
+          else
+            npm run dist -- --${{ matrix.platform }} --${{ matrix.arch }}
+          fi
+
       - name: Zip macOS app
         if: matrix.platform == 'mac'
         shell: bash
@@ -130,17 +131,14 @@ jobs:
             echo "::error::No Slopsmith.app found under release/mac*/"
             exit 1
           fi
-          ditto -c -k --sequesterRsrc --keepParent "$app" "release/Slopsmith-macos-arm64.zip"
-          echo "Zipped $app -> release/Slopsmith-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "release/Slopsmith-macos-universal.zip"
+          echo "Zipped $app -> release/Slopsmith-macos-universal.zip"
 
-      # Windows: electron-builder's `dir` target leaves win-unpacked/ with no
-      # packaged installer (Velopack is skipped for nightlies). Zip the directory
-      # so testers can download and extract, then launch Slopsmith.exe directly.
       - name: Zip win-unpacked
         if: matrix.platform == 'win'
         shell: pwsh
         run: |
-          Compress-Archive -Path release\win-unpacked\* -DestinationPath release\Slopsmith-windows-x64.zip
+          Compress-Archive -Path release\win-unpacked\\* -DestinationPath release\Slopsmith-windows-x64.zip
           Write-Host "Zipped win-unpacked -> release\Slopsmith-windows-x64.zip"
 
       - name: Clean up signing keychain
@@ -156,6 +154,4 @@ jobs:
             release/*.AppImage
             release/*.deb
             release/*.zip
-            build/Release/*.pdb
-          if-no-files-found: warn
-          retention-days: 7
+          if-no-files-found: error
