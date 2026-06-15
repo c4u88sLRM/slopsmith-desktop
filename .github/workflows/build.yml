@@ -217,7 +217,7 @@ jobs:
         # produced no usable Windows artifact — win-unpacked/ isn't uploaded
         # and Velopack only ran on tags, so testers got just .pdb symbols.
         # macOS dispatch stays Velopack-free (it already uploads a tester .zip
-        # from the "Zip macOS app" step), so we don't add an unsigned-update
+        # from the "Zip macOS app" step above), so we don't add an unsigned-update
         # mac pack here.
         if: >-
           (startsWith(github.ref, 'refs/tags/v') && matrix.platform != 'linux')
@@ -366,7 +366,7 @@ jobs:
       # path ending in .app as a prebuilt bundle. A non-.app folder
       # would instead trigger auto-bundle mode (which also needs
       # --icon). electron-builder's "dir" target writes the bundle to
-      # release/mac-arm64/Slopsmith.app on the arm64 runner.
+      # release/mac-universal/Slopsmith.app on the unified runner.
       - name: Velopack pack (macOS)
         if: matrix.platform == 'mac' && steps.velopack_channel.outputs.channel != ''
         shell: bash
@@ -388,8 +388,8 @@ jobs:
             vpk pack \
               --packId Slopsmith \
               --packVersion "${{ steps.velopack_channel.outputs.version }}" \
-              --channel "osx-arm64-${{ steps.velopack_channel.outputs.channel }}" \
-              --packDir release/mac-arm64/Slopsmith.app \
+              --channel "osx-universal-${{ steps.velopack_channel.outputs.channel }}" \
+              --packDir release/mac-universal/Slopsmith.app \
               -o release/velopack
           else
             # vpk notarizes through a notarytool *credential profile*, not
@@ -410,8 +410,8 @@ jobs:
             vpk pack \
               --packId Slopsmith \
               --packVersion "${{ steps.velopack_channel.outputs.version }}" \
-              --channel "osx-arm64-${{ steps.velopack_channel.outputs.channel }}" \
-              --packDir release/mac-arm64/Slopsmith.app \
+              --channel "osx-universal-${{ steps.velopack_channel.outputs.channel }}" \
+              --packDir release/mac-universal/Slopsmith.app \
               -o release/velopack \
               --signAppIdentity "$APPLE_SIGNING_IDENTITY" \
               --notaryProfile "velopack-notary"
